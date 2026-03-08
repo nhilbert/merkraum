@@ -1,17 +1,23 @@
 # Merkraum
 
-Personal knowledge memory for AI agents. A self-hosted knowledge graph with semantic search, belief tracking, and MCP integration.
+Auditable knowledge memory for AI agents. Know what your AI believes — and prove it.
 
-## What it does
+## Why Merkraum
 
-Merkraum gives your AI agent (Claude, ChatGPT, Cursor) a persistent, structured memory:
+AI agents accumulate knowledge but can't explain what they know or why they changed their mind. When your compliance officer asks "what does your AI believe about customer X, and when did that change?" — most memory systems have no answer.
 
-- **Knowledge graph** (Neo4j) — entities, relationships, typed connections
-- **Semantic search** (Qdrant + FastEmbed) — find knowledge by meaning, not keywords
-- **Belief tracking** — confidence scores, contradiction detection, supersession
-- **Fixed schema** — 10 node types, 16 relationship types, auditable and explainable
-- **MCP native** — works with any MCP-compatible client
-- **No cloud required** — everything runs locally via Docker
+Merkraum gives your AI agent a structured, inspectable knowledge graph where every fact has provenance, every belief has a confidence score, and contradictions surface instead of hiding.
+
+## Core capabilities
+
+- **Belief tracking** — confidence scores, contradiction detection, belief supersession. Your AI doesn't silently overwrite knowledge — it reasons about change.
+- **Fixed schema** — 10 node types, 16 relationship types. Every operation is traceable and auditable. No open-vocabulary chaos.
+- **Contradiction detection** — typed relationships (CONTRADICTS, SUPERSEDES, SUPPORTS) make epistemic conflicts explicit, not implicit.
+- **Full audit trail** — every knowledge operation logged with who, what, when, and why. Built for environments where traceability matters.
+- **EU-hosted** — AWS Frankfurt (eu-central-1). Data never leaves the EU. GDPR Art. 17 (right to deletion) built in. No CLOUD Act exposure.
+- **Self-hosted option** — everything runs locally via Docker Compose. Own your knowledge infrastructure.
+- **MCP compatible** — works with Claude, Cursor, ChatGPT, and any MCP-compatible client.
+- **Graph dreaming** — periodic consolidation discovers patterns and strengthens connections while your agent is idle.
 
 ## Quick start
 
@@ -56,13 +62,11 @@ That's it. Start asking your agent to remember things.
 | `get_graph_stats` | Node and edge counts by type |
 | `health_check` | Verify Neo4j and Qdrant connectivity |
 
-## Node types
+## Schema
 
-Person, Organization, Project, Concept, Regulation, Event, Belief, Artifact, Interview, Quote
+**Node types**: Person, Organization, Project, Concept, Regulation, Event, Belief, Artifact, Interview, Quote
 
-## Relationship types
-
-SUPPORTS, CONTRADICTS, COMPLEMENTS, SUPERSEDES, EXTENDS, REFINES, CREATED_BY, AFFILIATED_WITH, APPLIES, IMPLEMENTS, PARTICIPATED_IN, PRODUCES, REFERENCES, TEMPORAL, MENTIONS, PART_OF
+**Relationship types**: SUPPORTS, CONTRADICTS, COMPLEMENTS, SUPERSEDES, EXTENDS, REFINES, CREATED_BY, AFFILIATED_WITH, APPLIES, IMPLEMENTS, PARTICIPATED_IN, PRODUCES, REFERENCES, TEMPORAL, MENTIONS, PART_OF
 
 ## Configuration
 
@@ -131,4 +135,4 @@ Business Source License 1.1 (BSL 1.1). Free for personal and non-commercial use.
 
 ---
 
-Built by [Supervision Rheinland](https://merkraum.de) | Powered by the Viable System Model
+Built by [Supervision Rheinland](https://merkraum.de) | Grounded in Stafford Beer's Viable System Model
