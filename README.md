@@ -120,6 +120,11 @@ python merkraum_mcp_server.py --transport http
 python merkraum_mcp_server.py
 ```
 
+## Documentation
+
+- [Architecture](docs/architecture.md) — dual-store design, schema, graph dreaming
+- [Belief Tracking](docs/belief-tracking.md) — developer guide for epistemic belief tracking
+
 ## License
 
 Business Source License 1.1 (BSL 1.1). Free for personal and non-commercial use. See LICENSE for details.
