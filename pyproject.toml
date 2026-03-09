@@ -1,0 +1,55 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "merkraum"
+version = "1.0.0"
+description = "Auditable knowledge memory for AI agents. Belief tracking, contradiction detection, and full audit trail via MCP."
+readme = "README.md"
+license = "BSL-1.1"
+requires-python = ">=3.10"
+authors = [
+    { name = "Supervision Rheinland", email = "info@merkraum.de" },
+]
+keywords = [
+    "mcp",
+    "knowledge-graph",
+    "ai-agent",
+    "belief-tracking",
+    "contradiction-detection",
+    "neo4j",
+    "qdrant",
+    "model-context-protocol",
+    "audit-trail",
+    "memory",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Database :: Database Engines/Servers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "fastmcp>=2.0.0",
+    "neo4j>=5.0.0",
+    "qdrant-client>=1.7.0",
+    "fastembed>=0.3.0",
+]
+
+[project.urls]
+Homepage = "https://merkraum.de"
+Repository = "https://github.com/nhilbert/merkraum"
+Documentation = "https://github.com/nhilbert/merkraum/tree/main/docs"
+Issues = "https://github.com/nhilbert/merkraum/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+include = [
+    "merkraum_mcp_server.py",
+    "merkraum_backend.py",
+]
