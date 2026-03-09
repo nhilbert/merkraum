@@ -70,7 +70,7 @@ That's it. Start asking your agent to remember things.
 
 ## Configuration
 
-Copy `merkraum_env_local.template` to `.env` to customize:
+Copy `.env.example` to `.env` to customize:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -115,7 +115,7 @@ Claude / Cursor / ChatGPT
 docker compose -f docker-compose.yml up neo4j qdrant -d
 
 # Install Python dependencies
-pip install -r requirements-merkraum.txt
+pip install -r requirements.txt
 
 # Run MCP server directly
 python merkraum_mcp_server.py --transport http
