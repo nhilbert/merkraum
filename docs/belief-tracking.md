@@ -13,7 +13,7 @@ Merkraum treats knowledge claims as **beliefs** — propositions with confidence
 - Track which beliefs have been *superseded* by newer information
 - Audit the *origin* of any belief (when it was created, from what source)
 
-No other agent memory system currently offers these as user-facing primitives.
+Few agent memory systems expose these as user-facing primitives. Merkraum's approach is distinguished by its fixed schema discipline and explicit graph edges (CONTRADICTS, SUPERSEDES) that make epistemic changes auditable — not just tracked internally.
 
 ## Creating Beliefs
 
@@ -286,15 +286,17 @@ The agent's belief set evolves from scattered observations to coherent, high-con
 
 ## Comparison with Other Approaches
 
-| Feature | Merkraum | Mem0 | Plain RAG |
-|---------|----------|------|-----------|
-| Contradiction detection | Automatic (LLM + graph) | None | None |
-| Confidence tracking | Per-belief (0.0-1.0) | None | None |
-| Belief lifecycle | 5 states + transitions | None | None |
-| Supersession | SUPERSEDES edge, old belief deactivated | Silent overwrite | Duplicate entries |
-| Audit trail | Full provenance (cycle, source, timestamp) | Limited | None |
-| Memory consolidation | Graph dreaming | None | None |
-| Schema discipline | Fixed (10 types, 16 relationships) | Open vocabulary (drift) | N/A |
+| Feature | Merkraum | Hindsight | Mem0 | Plain RAG |
+|---------|----------|-----------|------|-----------|
+| Contradiction detection | Automatic (LLM + graph edges) | Confidence decay (alpha-formula) | LLM-mediated (26% gain) | None |
+| Confidence tracking | Per-belief (0.0-1.0) | Per-opinion (alpha-updated) | None | None |
+| Belief lifecycle | 5 states + transitions | Active/decayed | None | None |
+| Supersession | Explicit SUPERSEDES edge | Implicit (confidence overwrite) | Silent overwrite | Duplicate entries |
+| Audit trail | Full provenance (cycle, source, timestamp) | Limited (PostgreSQL log) | Limited | None |
+| Memory consolidation | Graph dreaming (replay + consolidation) | None | None | None |
+| Schema discipline | Fixed (10 types, 16 relationships) | Open vocabulary | Open vocabulary (drift) | N/A |
+| Graph traversal | Native Cypher (Neo4j) | PostgreSQL queries | Neo4j (open-vocab) | N/A |
+| Regulatory readiness | EU AI Act Art. 13 compatible | No explicit compliance | No explicit compliance | None |
 
 ---
 

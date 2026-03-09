@@ -1,16 +1,32 @@
 # Merkraum Architecture
 
-*A dual-store knowledge graph with belief tracking and neuroscience-inspired memory consolidation for AI agents.*
+*Auditable knowledge memory for AI agents — designed for environments where traceability matters.*
 
-## The Problem
+## Why Auditability
 
-AI agents built on Large Language Models are stateless between sessions. Without persistent external memory, each invocation begins with amnesia. Vector stores (RAG) solve retrieval but not reasoning:
+AI agents are accumulating knowledge at scale. In regulated industries — finance, insurance, healthcare, public sector — the question is no longer "can my AI remember?" but **"can I prove what it knows and how it changed its mind?"**
+
+The EU AI Act (effective August 2, 2026) requires transparency and traceability for high-risk AI systems. The Product Liability Directive (PLD 2024/2853, transposition by December 9, 2026) places AI software under strict product liability for the first time since 1989. GDPR Article 17 demands the right to deletion.
+
+Most agent memory systems — vector stores, key-value caches, even graph-enhanced retrievers — were built for accuracy, not accountability. They can answer "what's relevant?" but not "when did you learn this, what did you believe before, and why did that change?"
+
+Merkraum was designed from the ground up for **auditable knowledge**:
+
+- Every knowledge operation has provenance (who, what, when, why)
+- Contradictions surface as explicit graph edges, not hidden overwrites
+- Belief lifecycle state (active → contradicted → superseded) is inspectable
+- A fixed schema prevents the unbounded drift that makes open-vocabulary systems unqueryable
+
+## The Technical Problem
+
+AI agents built on LLMs are stateless between sessions. Without persistent external memory, each invocation begins with amnesia. Vector stores (RAG) solve retrieval but not reasoning:
 
 1. **No causal reasoning.** Semantic similarity is not structural relationship. An agent can't traverse from a regulation through its organizational impact to the consulting engagement that addresses it.
 2. **No contradiction detection.** When new information conflicts with existing knowledge, a vector store treats both as valid entries with high cosine similarity.
 3. **No temporal validity.** Knowledge has a shelf life. Vector stores lack the machinery to manage belief lifecycle.
+4. **No audit trail.** When a downstream decision is questioned, there is no way to trace back to the knowledge state that informed it.
 
-## Why Not Mem0?
+## Why Not Just Mem0?
 
 We started with [Mem0](https://github.com/mem0ai/mem0), an established memory layer for AI agents (23,000+ GitHub stars). After deploying it against real operational data, the results were unusable:
 
@@ -20,6 +36,8 @@ We started with [Mem0](https://github.com/mem0ai/mem0), an established memory la
 
 **Root cause:** Open-vocabulary LLM extraction without schema constraints produces unbounded schema drift. This is architectural, not incidental. Apple's ODKE+ research confirms: ontology-guided extraction achieves 98.8% precision; unconstrained extraction cannot achieve usable precision at scale.
 
+For audit purposes, this is disqualifying. You cannot prove what an AI knows if the knowledge representation is itself inconsistent.
+
 ## The Solution: Fixed Schema + Dual Store
 
 Merkraum enforces a fixed schema at extraction time:
@@ -27,7 +45,7 @@ Merkraum enforces a fixed schema at extraction time:
 - **10 node types:** Person, Organization, Project, Concept, Regulation, Event, Belief, Artifact, Interview, Quote
 - **16 relationship types:** SUPPORTS, CONTRADICTS, COMPLEMENTS, SUPERSEDES, EXTENDS, REFINES, CREATED_BY, AFFILIATED_WITH, APPLIES, IMPLEMENTS, PARTICIPATED_IN, PRODUCES, REFERENCES, TEMPORAL, MENTIONS, PART_OF
 
-The type system was derived from organizational cybernetics requirements but is general enough for most knowledge domains.
+The type system was derived from organizational cybernetics requirements but is general enough for most knowledge domains. Every operation against the graph uses these types — no exceptions, no drift.
 
 ### Dual-Store Architecture
 
@@ -49,7 +67,7 @@ The type system was derived from organizational cybernetics requirements but is 
          └──────────┘    └──────────┘
 ```
 
-- **Neo4j** handles structural relationships, graph traversal, and Cypher queries
+- **Neo4j** handles structural relationships, graph traversal, and Cypher queries. Native graph storage means relationships are first-class citizens, not afterthoughts.
 - **Qdrant** (with FastEmbed) handles semantic similarity search — no external API keys needed
 - Queries hit both stores: semantic search finds relevant content, graph traversal reveals structural context
 
@@ -64,6 +82,7 @@ Vector search and graph traversal answer fundamentally different questions:
 | "What contradicts X?" | Cannot | Native |
 | "What superseded X?" | Cannot | Native |
 | "What changed since last week?" | Difficult | Native (temporal edges) |
+| "Prove this decision trail" | Cannot | Native (provenance chain) |
 
 Using both gives agents both retrieval quality and reasoning capability.
 
@@ -77,6 +96,8 @@ Every knowledge claim in Merkraum can become a **Belief** — a first-class node
 - **Contradiction detection**: When a new belief conflicts with an existing one, both are linked with a CONTRADICTS edge and flagged for resolution
 
 This means an agent can ask: "What do I believe about X? How confident am I? Has anything contradicted this?"
+
+For a detailed developer guide, see [Belief Tracking](belief-tracking.md).
 
 ### Belief Lifecycle
 
@@ -116,6 +137,24 @@ Inspired by neuroscience research on memory consolidation (McClelland et al., O'
 3. **Reflection** (analogous to Default Mode Network): Structural health analysis — orphan detection, hub over-centralization, schema discipline
 
 These operations run periodically and produce measurable improvements in graph coherence.
+
+## Competitive Landscape
+
+Merkraum exists in a rapidly evolving agent memory space. Key differences from major alternatives:
+
+| Capability | Merkraum | Hindsight | Mem0 | ChatGPT Memory |
+|-----------|----------|-----------|------|----------------|
+| **Audit trail** | Full provenance (source, cycle, timestamp) | PostgreSQL log | Limited | None |
+| **Contradiction detection** | Explicit CONTRADICTS edges | Alpha-formula decay | LLM-mediated | None |
+| **Schema discipline** | Fixed (10 types, 16 rels) | Open vocabulary | Open vocabulary | Proprietary |
+| **Graph traversal** | Native Cypher (Neo4j) | PostgreSQL | Neo4j (open-vocab) | None |
+| **Self-hosted** | Docker Compose, no cloud needed | Docker | Docker | Cloud only |
+| **EU data residency** | Frankfurt (eu-central-1) | US-based | Configurable | US/Global |
+| **Regulatory readiness** | EU AI Act, GDPR Art. 17 | None explicit | None explicit | None |
+| **Memory consolidation** | Graph dreaming | None | None | None |
+| **License** | BSL 1.1 | MIT | Apache 2.0 | Proprietary |
+
+Merkraum's defensible position: **auditability + EU sovereignty + fixed schema discipline + graph dreaming**. Belief tracking per se is a shared capability — it's the combination with regulatory readiness and structural discipline that differentiates.
 
 ## MCP Integration
 
