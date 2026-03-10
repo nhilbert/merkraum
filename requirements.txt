@@ -1,7 +1,8 @@
-# Merkraum MCP Server — Python dependencies
-# v1.0 — Z1150 (2026-03-08)
+# Merkraum MCP Server + REST API — Python dependencies
+# v1.1 — SUP-94
 
 fastmcp>=2.0.0
 neo4j>=5.0.0
 qdrant-client>=1.7.0
 fastembed>=0.3.0
+flask>=3.0.0
