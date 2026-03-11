@@ -134,6 +134,7 @@ python merkraum_mcp_server.py
 - [Belief Tracking](docs/belief-tracking.md) — developer guide for epistemic belief tracking
 - [Compliance Guide](docs/compliance-guide.md) — EU AI Act, PLD, GDPR compliance mapping
 - [EpistBench](docs/benchmark.md) — epistemological memory benchmark (baseline results)
+- [Security Review (2026-03)](docs/security-review-2026-03.md) — detailed application security assessment and remediation roadmap
 
 ## License
 
