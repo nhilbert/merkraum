@@ -579,7 +579,8 @@ class TestBackendAdapterInterface(unittest.TestCase):
             "connect", "close", "is_healthy",
             "write_entities", "write_relationships", "query_nodes",
             "traverse", "get_beliefs", "get_stats", "delete_project_data",
-            "vector_search", "vector_upsert",
+            "update_node", "delete_node", "add_relationship", "delete_relationship",
+            "merge_nodes", "vector_search", "vector_upsert", "vector_delete",
         ]
         for method in required:
             self.assertTrue(hasattr(Neo4jQdrantAdapter, method),
@@ -829,6 +830,92 @@ class TestUpdateBeliefInterface(unittest.TestCase):
     def test_update_belief_in_adapters(self):
         self.assertTrue(hasattr(Neo4jQdrantAdapter, "update_belief"))
         self.assertTrue(hasattr(Neo4jPineconeAdapter, "update_belief"))
+
+
+class TestGraphMutationOperations(unittest.TestCase):
+    """Smoke tests for new node/relationship mutation methods."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.tx = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        self.session.begin_transaction.return_value = self.tx
+        self.adapter.vector_upsert = MagicMock(return_value=True)
+        self.adapter.vector_delete = MagicMock(return_value=True)
+
+    def test_add_relationship_invalid_type(self):
+        result = self.adapter.add_relationship("A", "B", "BAD", project_id="p")
+        self.assertFalse(result["ok"])
+
+    def test_delete_relationship_not_found(self):
+        rec = {"rels": []}
+        mock_result = MagicMock()
+        mock_result.single.return_value = rec
+        self.tx.run.return_value = mock_result
+        result = self.adapter.delete_relationship("A", "B", "SUPPORTS", project_id="p")
+        self.assertFalse(result["ok"])
+
+    def test_delete_node_not_found(self):
+        mock_result = MagicMock()
+        mock_result.single.return_value = None
+        self.tx.run.return_value = mock_result
+        result = self.adapter.delete_node("Missing", project_id="p")
+        self.assertFalse(result["ok"])
+
+    def test_update_node_not_found(self):
+        mock_result = MagicMock()
+        mock_result.single.return_value = None
+        self.tx.run.return_value = mock_result
+        result = self.adapter.update_node("Missing", project_id="p", updates={"summary": "x"})
+        self.assertFalse(result["ok"])
+
+    def test_merge_nodes_same_name_rejected(self):
+        result = self.adapter.merge_nodes("A", "A", project_id="p")
+        self.assertFalse(result["ok"])
+
+    def test_merge_nodes_same_name_with_node_ids_succeeds(self):
+        self.adapter._ensure_project_node_ids = MagicMock(return_value=None)
+
+        keep_props = {"name": "A", "summary": "keep", "node_id": "keep-1"}
+        remove_props = {"name": "A", "summary": "remove", "node_id": "remove-1"}
+
+        class _FakeResult:
+            def __init__(self, single_value=None, data_value=None):
+                self._single = single_value
+                self._data = data_value
+
+            def single(self):
+                return self._single
+
+            def data(self):
+                return self._data if self._data is not None else ([] if self._single is None else [self._single])
+
+        def _run(query, **kwargs):
+            if "node_id: $node_id" in query and "RETURN labels(n)[0] AS node_type" in query:
+                node_id = kwargs.get("node_id")
+                if node_id == "keep-1":
+                    return _FakeResult({"node_type": "Concept", "node_props": keep_props})
+                if node_id == "remove-1":
+                    return _FakeResult({"node_type": "Concept", "node_props": remove_props})
+                return _FakeResult(None)
+            if "node_id: $keep_id" in query and "RETURN labels(n)[0] AS node_type" in query:
+                return _FakeResult({"node_type": "Concept", "node_props": keep_props})
+            return _FakeResult(None)
+
+        self.tx.run.side_effect = _run
+
+        result = self.adapter.merge_nodes(
+            "A",
+            "A",
+            project_id="p",
+            keep_node_id="keep-1",
+            remove_node_id="remove-1",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result.get("keep_node_id"), "keep-1")
+        self.assertEqual(result.get("remove_node_id"), "remove-1")
 
 
 if __name__ == "__main__":

@@ -149,6 +149,42 @@ class BackendAdapter(ABC):
         """
 
     @abstractmethod
+    def update_node(self, name: str, project_id: str = "default",
+                    updates: Optional[dict] = None,
+                    new_name: Optional[str] = None,
+                    actor: str = "api") -> dict:
+        """Update a node and keep history/audit metadata."""
+
+    @abstractmethod
+    def delete_node(self, name: str, project_id: str = "default",
+                    actor: str = "api") -> dict:
+        """Delete a node and its relationships with history/audit metadata."""
+
+    @abstractmethod
+    def add_relationship(self, source: str, target: str, rel_type: str,
+                         project_id: str = "default",
+                         reason: str = "",
+                         confidence: float = 0.7,
+                         actor: str = "api") -> dict:
+        """Create or update a relationship between two existing nodes."""
+
+    @abstractmethod
+    def delete_relationship(self, source: str, target: str, rel_type: str,
+                            project_id: str = "default",
+                            actor: str = "api") -> dict:
+        """Delete a relationship between two nodes."""
+
+    @abstractmethod
+    def merge_nodes(self, keep_name: str, remove_name: str,
+                    project_id: str = "default",
+                    keep_type: Optional[str] = None,
+                    remove_type: Optional[str] = None,
+                    keep_node_id: Optional[str] = None,
+                    remove_node_id: Optional[str] = None,
+                    actor: str = "api") -> dict:
+        """Merge remove_name into keep_name with history/audit metadata."""
+
+    @abstractmethod
     def get_usage(self, project_id: str = "default") -> dict:
         """Get usage metrics for a project.
 
@@ -169,6 +205,11 @@ class BackendAdapter(ABC):
                       project_id: str = "default",
                       namespace: Optional[str] = None) -> bool:
         """Upsert a vector with text embedding. Returns success."""
+
+    @abstractmethod
+    def vector_delete(self, vector_id: str, project_id: str = "default",
+                      namespace: Optional[str] = None) -> bool:
+        """Delete a vector by ID. Returns success."""
 
 
 class Neo4jBaseAdapter(BackendAdapter):
@@ -213,6 +254,100 @@ class Neo4jBaseAdapter(BackendAdapter):
             logger.error("Neo4j connection failed: %s", e)
             raise
 
+    def _operation_id(self) -> str:
+        from uuid import uuid4
+        return uuid4().hex
+
+    def _vector_id_for_node(self, project_id: str, name: str,
+                            node_type: Optional[str] = None,
+                            node_id: Optional[str] = None) -> str:
+        if node_id:
+            return f"{project_id}:{node_id}"
+        if node_type:
+            return f"{project_id}:{node_type}:{name}"
+        return f"{project_id}:{name}"
+
+    def _vector_text_for_node(self, name: str, summary: str) -> str:
+        return f"{name}: {summary or ''}".strip()
+
+    def _log_operation(self, tx, op_id: str, op_type: str, actor: str,
+                       project_id: str, payload: dict,
+                       before_state: Optional[dict] = None,
+                       after_state: Optional[dict] = None,
+                       status: str = "committed"):
+        tx.run(
+            """
+            CREATE (op:OperationLog {
+                id: $id,
+                type: $type,
+                actor: $actor,
+                project_id: $project_id,
+                payload_json: $payload_json,
+                before_json: $before_json,
+                after_json: $after_json,
+                status: $status,
+                created_at: $now
+            })
+            """,
+            id=op_id,
+            type=op_type,
+            actor=actor,
+            project_id=project_id,
+            payload_json=json.dumps(payload, ensure_ascii=True),
+            before_json=json.dumps(before_state, ensure_ascii=True)
+            if before_state is not None else None,
+            after_json=json.dumps(after_state, ensure_ascii=True)
+            if after_state is not None else None,
+            status=status,
+            now=datetime.now(timezone.utc).isoformat(),
+        )
+
+    def _log_history(self, tx, op_id: str, entity_name: str, project_id: str,
+                     action: str, snapshot: dict, actor: str):
+        tx.run(
+            """
+            CREATE (:HistoryLog {
+                operation_id: $operation_id,
+                entity_name: $entity_name,
+                project_id: $project_id,
+                action: $action,
+                actor: $actor,
+                snapshot_json: $snapshot_json,
+                created_at: $now
+            })
+            """,
+            operation_id=op_id,
+            entity_name=entity_name,
+            project_id=project_id,
+            action=action,
+            actor=actor,
+            snapshot_json=json.dumps(snapshot, ensure_ascii=True),
+            now=datetime.now(timezone.utc).isoformat(),
+        )
+
+    def _ensure_project_node_ids(self, project_id: str):
+        """Backfill stable node_id for legacy nodes missing it."""
+        with self._driver.session() as session:
+            records = session.run(
+                """
+                MATCH (n {project_id: $pid})
+                WHERE n.node_id IS NULL
+                RETURN n.name AS name, labels(n)[0] AS node_type
+                """,
+                pid=project_id,
+            )
+            for rec in records:
+                name = rec.get("name") or ""
+                node_type = rec.get("node_type") or "Concept"
+                node_id = _string_to_uuid(f"{project_id}:{node_type}:{name}")
+                session.run(
+                    f"MATCH (n:{node_type} {{project_id: $pid, name: $name}}) "
+                    "SET n.node_id = $node_id",
+                    pid=project_id,
+                    name=name,
+                    node_id=node_id,
+                )
+
     def write_entities(self, entities, source_cycle, source_type="extraction",
                        project_id="default", node_limit=None):
         if node_limit is not None and entities:
@@ -231,6 +366,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                     node_type = ent.get("node_type", "Concept")
                     if node_type not in NODE_TYPES:
                         continue
+                    node_id = _string_to_uuid(f"{project_id}:{node_type}:{ent['name']}")
                     params = dict(
                         name=ent["name"],
                         summary=ent.get("summary", ""),
@@ -238,6 +374,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                         source_cycle=source_cycle,
                         source_type=source_type,
                         project_id=project_id,
+                        node_id=node_id,
                     )
                     if node_type == "Belief":
                         params["confidence"] = ent.get("confidence", 0.7)
@@ -249,9 +386,10 @@ class Neo4jBaseAdapter(BackendAdapter):
                                 n.updated_at = $now, n.source_cycle = $source_cycle,
                                 n.source_type = $source_type, n.active = true,
                                 n.status = 'active', n.confidence = $confidence,
-                                n.project_id = $project_id
+                                n.project_id = $project_id, n.node_id = $node_id
                             ON MATCH SET
                                 n.summary = $summary, n.updated_at = $now,
+                                n.node_id = coalesce(n.node_id, $node_id),
                                 n.confidence = CASE WHEN $confidence > n.confidence
                                     THEN $confidence ELSE n.confidence END
                             """,
@@ -265,10 +403,11 @@ class Neo4jBaseAdapter(BackendAdapter):
                                 n.summary = $summary, n.created_at = $now,
                                 n.updated_at = $now, n.source_cycle = $source_cycle,
                                 n.source_type = $source_type,
-                                n.project_id = $project_id
+                                n.project_id = $project_id, n.node_id = $node_id
                             ON MATCH SET
                                 n.summary = CASE WHEN size($summary) > size(coalesce(n.summary, ''))
                                     THEN $summary ELSE n.summary END,
+                                n.node_id = coalesce(n.node_id, $node_id),
                                 n.updated_at = $now
                             """,
                             **params,
@@ -342,20 +481,23 @@ class Neo4jBaseAdapter(BackendAdapter):
         return written
 
     def query_nodes(self, node_type=None, project_id="default", limit=100):
+        self._ensure_project_node_ids(project_id)
         results = []
         with self._driver.session() as session:
             if node_type and node_type in NODE_TYPES:
                 cypher = f"""
                 MATCH (n:{node_type} {{project_id: $pid}})
                 RETURN n.name AS name, n.summary AS summary,
-                       labels(n)[0] AS type, n.created_at AS created
+                       labels(n)[0] AS type, n.created_at AS created,
+                       n.node_id AS node_id, n.confidence AS confidence
                 ORDER BY n.updated_at DESC LIMIT $limit
                 """
             else:
                 cypher = """
                 MATCH (n {project_id: $pid})
                 RETURN n.name AS name, n.summary AS summary,
-                       labels(n)[0] AS type, n.created_at AS created
+                       labels(n)[0] AS type, n.created_at AS created,
+                       n.node_id AS node_id, n.confidence AS confidence
                 ORDER BY n.updated_at DESC LIMIT $limit
                 """
             records = session.run(cypher, pid=project_id, limit=limit)
@@ -365,6 +507,8 @@ class Neo4jBaseAdapter(BackendAdapter):
                     "summary": rec["summary"],
                     "type": rec["type"],
                     "created": rec["created"],
+                    "node_id": rec.get("node_id"),
+                    "confidence": rec.get("confidence"),
                 })
         return results
 
@@ -540,6 +684,540 @@ class Neo4jBaseAdapter(BackendAdapter):
                     "error": f"Belief '{name}' not found in project '{project_id}'"}
 
         return {"updated": True, "name": name, "changes": changes}
+
+    def add_relationship(self, source, target, rel_type, project_id="default",
+                         reason="", confidence=0.7,
+                         source_type=None, target_type=None,
+                         actor="api"):
+        if rel_type not in RELATIONSHIP_TYPES:
+            return {"ok": False, "error": f"Invalid relationship type: {rel_type}"}
+        now = datetime.now(timezone.utc).isoformat()
+        op_id = self._operation_id()
+        with self._driver.session() as session:
+            tx = session.begin_transaction()
+            try:
+                source_label = source_type if source_type in NODE_TYPES else None
+                target_label = target_type if target_type in NODE_TYPES else None
+                source_clause = f":{source_label}" if source_label else ""
+                target_clause = f":{target_label}" if target_label else ""
+                cypher = f"""
+                MATCH (a{source_clause} {{name: $source, project_id: $pid}})
+                MATCH (b{target_clause} {{name: $target, project_id: $pid}})
+                MERGE (a)-[r:{rel_type}]->(b)
+                ON CREATE SET
+                    r.created_at = $now,
+                    r.updated_at = $now,
+                    r.reason = $reason,
+                    r.confidence = $confidence,
+                    r.active = true
+                ON MATCH SET
+                    r.updated_at = $now,
+                    r.reason = CASE WHEN size($reason) > 0 THEN $reason ELSE r.reason END,
+                    r.confidence = CASE WHEN $confidence > r.confidence THEN $confidence ELSE r.confidence END
+                RETURN a.name AS source, b.name AS target, properties(r) AS rel_props
+                """
+                rec = tx.run(
+                    cypher,
+                    source=source,
+                    target=target,
+                    pid=project_id,
+                    now=now,
+                    reason=reason,
+                    confidence=max(0.0, min(1.0, float(confidence))),
+                ).single()
+                if not rec:
+                    tx.rollback()
+                    return {"ok": False, "error": "Source or target node not found"}
+
+                payload = {
+                    "source": source,
+                    "target": target,
+                    "type": rel_type,
+                    "reason": reason,
+                    "confidence": confidence,
+                }
+                self._log_history(tx, op_id, f"{source}->{target}:{rel_type}", project_id,
+                                  "add_relationship", payload, actor)
+                self._log_operation(tx, op_id, "add_relationship", actor, project_id,
+                                    payload=payload, after_state=payload)
+                tx.commit()
+                return {"ok": True, "operation_id": op_id, "relationship": payload}
+            except Exception as exc:
+                tx.rollback()
+                return {"ok": False, "error": str(exc)}
+
+    def delete_relationship(self, source, target, rel_type, project_id="default",
+                            source_type=None, target_type=None, actor="api"):
+        if rel_type not in RELATIONSHIP_TYPES:
+            return {"ok": False, "error": f"Invalid relationship type: {rel_type}"}
+        op_id = self._operation_id()
+        with self._driver.session() as session:
+            tx = session.begin_transaction()
+            try:
+                source_label = source_type if source_type in NODE_TYPES else None
+                target_label = target_type if target_type in NODE_TYPES else None
+                source_clause = f":{source_label}" if source_label else ""
+                target_clause = f":{target_label}" if target_label else ""
+                if rel_type in SYMMETRIC_TYPES:
+                    cypher = f"""
+                    MATCH (a{source_clause} {{project_id: $pid}})-[r:{rel_type}]-(b{target_clause} {{project_id: $pid}})
+                    WHERE ((a.name = $source AND b.name = $target)
+                        OR (a.name = $target AND b.name = $source))
+                    WITH collect({{source: startNode(r).name, target: endNode(r).name,
+                                   type: type(r), props: properties(r)}}) AS rels,
+                         collect(r) AS rel_edges
+                    FOREACH (x IN rel_edges | DELETE x)
+                    RETURN rels
+                    """
+                else:
+                    cypher = f"""
+                    MATCH (a{source_clause} {{name: $source, project_id: $pid}})-[r:{rel_type}]->
+                          (b{target_clause} {{name: $target, project_id: $pid}})
+                    WITH collect({{source: startNode(r).name, target: endNode(r).name,
+                                   type: type(r), props: properties(r)}}) AS rels,
+                         collect(r) AS rel_edges
+                    FOREACH (x IN rel_edges | DELETE x)
+                    RETURN rels
+                    """
+                rec = tx.run(cypher, source=source, target=target, pid=project_id).single()
+                rels = rec["rels"] if rec else []
+                if not rels:
+                    tx.rollback()
+                    return {"ok": False, "error": "Relationship not found"}
+
+                payload = {"source": source, "target": target, "type": rel_type}
+                self._log_history(tx, op_id, f"{source}->{target}:{rel_type}", project_id,
+                                  "delete_relationship", {"deleted": rels}, actor)
+                self._log_operation(tx, op_id, "delete_relationship", actor, project_id,
+                                    payload=payload, before_state={"relationships": rels})
+                tx.commit()
+                return {"ok": True, "operation_id": op_id, "deleted": len(rels)}
+            except Exception as exc:
+                tx.rollback()
+                return {"ok": False, "error": str(exc)}
+
+    def delete_node(self, name, project_id="default", node_type=None, actor="api"):
+        op_id = self._operation_id()
+        vector_deleted = False
+        before_state = None
+        node_type = "Concept"
+        with self._driver.session() as session:
+            tx = session.begin_transaction()
+            try:
+                label = node_type if node_type in NODE_TYPES else None
+                label_clause = f":{label}" if label else ""
+                rec = tx.run(
+                    f"""
+                    MATCH (n{label_clause} {{name: $name, project_id: $pid}})
+                    OPTIONAL MATCH (n)-[r]-(m {{project_id: $pid}})
+                    RETURN labels(n)[0] AS node_type,
+                           properties(n) AS node_props,
+                           collect(CASE WHEN r IS NULL THEN NULL ELSE {
+                               source: startNode(r).name,
+                               target: endNode(r).name,
+                               type: type(r),
+                               props: properties(r)
+                           } END) AS rels
+                    """,
+                    name=name,
+                    pid=project_id,
+                ).single()
+                if not rec or rec["node_props"] is None:
+                    tx.rollback()
+                    return {"ok": False, "error": f"Node '{name}' not found"}
+
+                node_type = rec["node_type"] or "Concept"
+                before_state = {
+                    "node": rec["node_props"],
+                    "node_type": node_type,
+                    "relationships": [x for x in (rec["rels"] or []) if x],
+                }
+
+                tx.run(
+                    f"MATCH (n{label_clause} {{name: $name, project_id: $pid}}) DETACH DELETE n",
+                    name=name,
+                    pid=project_id,
+                )
+
+                node_id = before_state.get("node", {}).get("node_id")
+                vector_id = self._vector_id_for_node(project_id, name, node_type=node_type, node_id=node_id)
+                if not self.vector_delete(vector_id, project_id=project_id):
+                    tx.rollback()
+                    return {"ok": False, "error": "Vector delete failed; graph rollback applied"}
+                vector_deleted = True
+
+                self._log_history(tx, op_id, name, project_id, "delete_node", before_state, actor)
+                self._log_operation(tx, op_id, "delete_node", actor, project_id,
+                                    payload={"name": name}, before_state=before_state)
+                tx.commit()
+                return {"ok": True, "operation_id": op_id, "deleted": name}
+            except Exception as exc:
+                tx.rollback()
+                if vector_deleted and before_state:
+                    node_props = before_state.get("node", {})
+                    self.vector_upsert(
+                        self._vector_id_for_node(project_id, name, node_type=old_type,
+                                                 node_id=old_node.get("node_id")),
+                        self._vector_text_for_node(name, node_props.get("summary", "")),
+                        {
+                            "name": name,
+                            "node_type": node_type,
+                            "source": "api_rollback",
+                        },
+                        project_id=project_id,
+                    )
+                return {"ok": False, "error": str(exc)}
+
+    def update_node(self, name, project_id="default", updates=None, new_name=None,
+                    node_type=None, actor="api"):
+        updates = dict(updates or {})
+        updates.pop("project_id", None)
+        updates.pop("created_at", None)
+        op_id = self._operation_id()
+        before_state = None
+        after_name = name
+        node_type = "Concept"
+        vector_upserted = False
+        old_vector_deleted = False
+        with self._driver.session() as session:
+            tx = session.begin_transaction()
+            try:
+                label = node_type if node_type in NODE_TYPES else None
+                label_clause = f":{label}" if label else ""
+                before = tx.run(
+                    f"""
+                    MATCH (n{label_clause} {{name: $name, project_id: $pid}})
+                    RETURN labels(n)[0] AS node_type, properties(n) AS node_props
+                    """,
+                    name=name,
+                    pid=project_id,
+                ).single()
+                if not before or before["node_props"] is None:
+                    tx.rollback()
+                    return {"ok": False, "error": f"Node '{name}' not found"}
+
+                before_state = {"node_type": before["node_type"], "node": before["node_props"]}
+
+                if new_name:
+                    exists = tx.run(
+                        f"MATCH (n{label_clause} {{name: $new_name, project_id: $pid}}) RETURN n LIMIT 1",
+                        new_name=new_name,
+                        pid=project_id,
+                    ).single()
+                    if exists:
+                        tx.rollback()
+                        return {"ok": False, "error": f"Node '{new_name}' already exists"}
+                    updates["name"] = new_name
+
+                updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+                rec = tx.run(
+                    f"""
+                    MATCH (n{label_clause} {{name: $name, project_id: $pid}})
+                    SET n += $updates
+                    RETURN labels(n)[0] AS node_type, properties(n) AS node_props
+                    """,
+                    name=name,
+                    pid=project_id,
+                    updates=updates,
+                ).single()
+
+                after_props = rec["node_props"]
+                after_name = after_props.get("name", name)
+                node_type = rec["node_type"] or "Concept"
+                summary = after_props.get("summary", "")
+                after_node_id = after_props.get("node_id")
+                before_node_id = before_state.get("node", {}).get("node_id") if before_state else None
+                vector_id_new = self._vector_id_for_node(project_id, after_name, node_type=node_type,
+                                                        node_id=after_node_id)
+                metadata = {
+                    "name": after_name,
+                    "node_type": node_type,
+                    "source": "api_update",
+                }
+                ok = self.vector_upsert(
+                    vector_id_new,
+                    self._vector_text_for_node(after_name, summary),
+                    metadata,
+                    project_id=project_id,
+                )
+                if not ok:
+                    tx.rollback()
+                    return {"ok": False, "error": "Vector upsert failed; graph rollback applied"}
+                vector_upserted = True
+
+                if after_name != name:
+                    vector_id_old = self._vector_id_for_node(project_id, name, node_type=node_type,
+                                                            node_id=before_node_id)
+                    if not self.vector_delete(vector_id_old, project_id=project_id):
+                        tx.rollback()
+                        return {"ok": False, "error": "Vector rename cleanup failed; graph rollback applied"}
+                    old_vector_deleted = True
+
+                after_state = {"node_type": node_type, "node": after_props}
+                self._log_history(tx, op_id, after_name, project_id, "update_node", {
+                    "before": before_state,
+                    "after": after_state,
+                }, actor)
+                self._log_operation(tx, op_id, "update_node", actor, project_id,
+                                    payload={"name": name, "new_name": new_name, "updates": updates},
+                                    before_state=before_state,
+                                    after_state=after_state)
+                tx.commit()
+                return {"ok": True, "operation_id": op_id, "node": after_state}
+            except Exception as exc:
+                tx.rollback()
+                if vector_upserted:
+                    self.vector_delete(
+                        self._vector_id_for_node(project_id, after_name, node_type=node_type,
+                                                 node_id=after_node_id),
+                        project_id=project_id,
+                    )
+                if old_vector_deleted and before_state:
+                    old_node = before_state.get("node", {})
+                    old_type = before_state.get("node_type", "Concept")
+                    self.vector_upsert(
+                        self._vector_id_for_node(project_id, name, node_type=old_type,
+                                                 node_id=old_node.get("node_id")),
+                        self._vector_text_for_node(name, old_node.get("summary", "")),
+                        {
+                            "name": name,
+                            "node_type": old_type,
+                            "source": "api_rollback",
+                        },
+                        project_id=project_id,
+                    )
+                return {"ok": False, "error": str(exc)}
+
+    def merge_nodes(self, keep_name, remove_name, project_id="default",
+                    keep_type=None, remove_type=None,
+                    keep_node_id=None, remove_node_id=None,
+                    actor="api"):
+        # With IDs provided, same-name merges are valid. Without IDs, require type disambiguation.
+        if keep_node_id and remove_node_id and keep_node_id == remove_node_id:
+            return {"ok": False, "error": "keep_node_id and remove_node_id must differ"}
+        if (not keep_node_id and not remove_node_id and keep_name == remove_name and
+                (not keep_type or not remove_type or keep_type == remove_type)):
+            return {
+                "ok": False,
+                "error": "keep_name and remove_name must differ unless keep_type/remove_type disambiguate or node IDs are provided",
+            }
+
+        op_id = self._operation_id()
+        now = datetime.now(timezone.utc).isoformat()
+        before_state = None
+        resolved_keep_type = keep_type or "Concept"
+        resolved_remove_type = remove_type or "Concept"
+        keep_vector_upserted = False
+        remove_vector_deleted = False
+        keep_props = None
+        keep_id = keep_node_id
+        remove_id = remove_node_id
+
+        self._ensure_project_node_ids(project_id)
+        with self._driver.session() as session:
+            tx = session.begin_transaction()
+            try:
+                def _resolve_merge_node(name, node_type, node_id, role):
+                    label = node_type if node_type in NODE_TYPES else None
+                    clause = f":{label}" if label else ""
+                    if node_id:
+                        rec = tx.run(
+                            f"MATCH (n{clause} {{node_id: $node_id, project_id: $pid}}) "
+                            "RETURN labels(n)[0] AS node_type, properties(n) AS node_props",
+                            node_id=node_id,
+                            pid=project_id,
+                        ).single()
+                        if not rec:
+                            return None, f"{role} node not found for node_id={node_id}"
+                        return rec, None
+
+                    rows = tx.run(
+                        f"MATCH (n{clause} {{name: $name, project_id: $pid}}) "
+                        "RETURN labels(n)[0] AS node_type, properties(n) AS node_props "
+                        "LIMIT 2",
+                        name=name,
+                        pid=project_id,
+                    ).data()
+                    if not rows:
+                        return None, f"{role} node not found"
+                    if len(rows) > 1:
+                        return None, (
+                            f"{role} node lookup is ambiguous for name='{name}'. "
+                            "Provide node_id (and optionally node_type)."
+                        )
+                    return rows[0], None
+
+                keep_rec, keep_err = _resolve_merge_node(keep_name, keep_type, keep_node_id, "keep")
+                remove_rec, remove_err = _resolve_merge_node(remove_name, remove_type, remove_node_id, "remove")
+                if not keep_rec or not remove_rec:
+                    tx.rollback()
+                    return {"ok": False, "error": keep_err or remove_err or "Both nodes must exist to merge"}
+
+                resolved_keep_type = keep_rec["node_type"] or "Concept"
+                resolved_remove_type = remove_rec["node_type"] or "Concept"
+                keep_props = keep_rec["node_props"]
+                remove_props = remove_rec["node_props"]
+                keep_id = keep_props.get("node_id")
+                remove_id = remove_props.get("node_id")
+                if not keep_id or not remove_id:
+                    tx.rollback()
+                    return {"ok": False, "error": "Both nodes must have node_id to merge"}
+                if keep_id == remove_id:
+                    tx.rollback()
+                    return {"ok": False, "error": "Cannot merge a node into itself"}
+
+                before_state = {
+                    "keep": keep_props,
+                    "remove": remove_props,
+                }
+
+                keep_clause_resolved = f":{resolved_keep_type}"
+                remove_clause_resolved = f":{resolved_remove_type}"
+
+                for rel_type in RELATIONSHIP_TYPES:
+                    tx.run(
+                        f"""
+                        MATCH (drop{remove_clause_resolved} {{node_id: $remove_id, project_id: $pid}})-[r:{rel_type}]->
+                              (dst {{project_id: $pid}})
+                        WHERE dst.node_id <> $keep_id
+                        MATCH (keep{keep_clause_resolved} {{node_id: $keep_id, project_id: $pid}})
+                        MERGE (keep)-[nr:{rel_type}]->(dst)
+                        ON CREATE SET nr += properties(r), nr.created_at = coalesce(r.created_at, $now), nr.updated_at = $now
+                        ON MATCH SET nr += properties(r), nr.updated_at = $now
+                        """,
+                        keep_id=keep_id,
+                        remove_id=remove_id,
+                        pid=project_id,
+                        now=now,
+                    )
+                    tx.run(
+                        f"""
+                        MATCH (src {{project_id: $pid}})-[r:{rel_type}]->
+                              (drop{remove_clause_resolved} {{node_id: $remove_id, project_id: $pid}})
+                        WHERE src.node_id <> $keep_id
+                        MATCH (keep{keep_clause_resolved} {{node_id: $keep_id, project_id: $pid}})
+                        MERGE (src)-[nr:{rel_type}]->(keep)
+                        ON CREATE SET nr += properties(r), nr.created_at = coalesce(r.created_at, $now), nr.updated_at = $now
+                        ON MATCH SET nr += properties(r), nr.updated_at = $now
+                        """,
+                        keep_id=keep_id,
+                        remove_id=remove_id,
+                        pid=project_id,
+                        now=now,
+                    )
+
+                tx.run(
+                    f"""
+                    MATCH (keep{keep_clause_resolved} {{node_id: $keep_id, project_id: $pid}})
+                    MATCH (drop{remove_clause_resolved} {{node_id: $remove_id, project_id: $pid}})
+                    SET keep.summary = CASE
+                        WHEN size(coalesce(drop.summary, '')) > size(coalesce(keep.summary, ''))
+                        THEN drop.summary ELSE keep.summary END,
+                        keep.updated_at = $now
+                    """,
+                    keep_id=keep_id,
+                    remove_id=remove_id,
+                    pid=project_id,
+                    now=now,
+                )
+
+                tx.run(
+                    f"MATCH (n{remove_clause_resolved} {{node_id: $remove_id, project_id: $pid}}) DETACH DELETE n",
+                    remove_id=remove_id,
+                    pid=project_id,
+                )
+
+                keep_after = tx.run(
+                    f"MATCH (n{keep_clause_resolved} {{node_id: $keep_id, project_id: $pid}}) "
+                    "RETURN labels(n)[0] AS node_type, properties(n) AS node_props",
+                    keep_id=keep_id,
+                    pid=project_id,
+                ).single()
+
+                keep_props = keep_after["node_props"]
+                resolved_keep_type = keep_after["node_type"] or resolved_keep_type
+                keep_name = keep_props.get("name", keep_name)
+
+                vec_ok = self.vector_upsert(
+                    self._vector_id_for_node(project_id, keep_name,
+                                             node_type=resolved_keep_type,
+                                             node_id=keep_props.get("node_id")),
+                    self._vector_text_for_node(keep_name, keep_props.get("summary", "")),
+                    {"name": keep_name, "node_type": resolved_keep_type, "source": "api_merge"},
+                    project_id=project_id,
+                )
+                if not vec_ok:
+                    tx.rollback()
+                    return {"ok": False, "error": "Vector upsert failed; graph rollback applied"}
+                keep_vector_upserted = True
+
+                if not self.vector_delete(
+                    self._vector_id_for_node(project_id, remove_name,
+                                             node_type=resolved_remove_type,
+                                             node_id=before_state.get("remove", {}).get("node_id")),
+                    project_id=project_id,
+                ):
+                    tx.rollback()
+                    return {"ok": False, "error": "Vector delete for merged node failed; graph rollback applied"}
+                remove_vector_deleted = True
+
+                after_state = {"keep": keep_props, "removed": remove_name}
+                self._log_history(tx, op_id, keep_name, project_id, "merge_nodes", {
+                    "before": before_state,
+                    "after": after_state,
+                }, actor)
+                self._log_operation(tx, op_id, "merge_nodes", actor, project_id,
+                                    payload={
+                                        "keep_name": keep_name,
+                                        "remove_name": remove_name,
+                                        "keep_node_id": keep_id,
+                                        "remove_node_id": remove_id,
+                                        "keep_type": resolved_keep_type,
+                                        "remove_type": resolved_remove_type,
+                                    },
+                                    before_state=before_state,
+                                    after_state=after_state)
+
+                tx.commit()
+                return {
+                    "ok": True,
+                    "operation_id": op_id,
+                    "merged_into": keep_name,
+                    "removed": remove_name,
+                    "keep_node_id": keep_id,
+                    "remove_node_id": remove_id,
+                }
+            except Exception as exc:
+                tx.rollback()
+                if keep_vector_upserted and before_state:
+                    old_keep = before_state.get("keep", {})
+                    self.vector_upsert(
+                        self._vector_id_for_node(project_id, keep_name,
+                                                 node_type=resolved_keep_type,
+                                                 node_id=old_keep.get("node_id")),
+                        self._vector_text_for_node(keep_name, old_keep.get("summary", "")),
+                        {
+                            "name": keep_name,
+                            "node_type": resolved_keep_type,
+                            "source": "api_rollback",
+                        },
+                        project_id=project_id,
+                    )
+                if remove_vector_deleted and before_state:
+                    old_remove = before_state.get("remove", {})
+                    self.vector_upsert(
+                        self._vector_id_for_node(project_id, remove_name,
+                                                 node_type=resolved_remove_type,
+                                                 node_id=old_remove.get("node_id")),
+                        self._vector_text_for_node(remove_name, old_remove.get("summary", "")),
+                        {
+                            "name": remove_name,
+                            "node_type": resolved_remove_type,
+                            "source": "api_rollback",
+                        },
+                        project_id=project_id,
+                    )
+                return {"ok": False, "error": str(exc)}
 
 
 class Neo4jQdrantAdapter(Neo4jBaseAdapter):
@@ -718,6 +1396,22 @@ class Neo4jQdrantAdapter(Neo4jBaseAdapter):
             logger.warning("Qdrant upsert failed: %s", e)
             return False
 
+    def vector_delete(self, vector_id, project_id="default", namespace=None):
+        if not self._qdrant:
+            return False
+        collection = self._get_collection_name(project_id, namespace)
+        try:
+            from qdrant_client import models
+            point_id = _string_to_uuid(vector_id)
+            self._qdrant.delete(
+                collection_name=collection,
+                points_selector=models.PointIdsList(points=[point_id]),
+            )
+            return True
+        except Exception as e:
+            logger.warning("Qdrant delete failed: %s", e)
+            return False
+
 
 class Neo4jPineconeAdapter(Neo4jBaseAdapter):
     """Concrete adapter wrapping Neo4j + Pinecone (managed/cloud).
@@ -859,6 +1553,31 @@ class Neo4jPineconeAdapter(Neo4jBaseAdapter):
             return True
         except Exception as e:
             logger.warning("Pinecone upsert failed: %s", e)
+            return False
+
+    def vector_delete(self, vector_id, project_id="default", namespace=None):
+        if not self._pinecone_host or not self._pinecone_api_key:
+            return False
+        ns = namespace or "knowledge"
+        try:
+            headers = {
+                "Api-Key": self._pinecone_api_key,
+                "Content-Type": "application/json",
+            }
+            body = json.dumps({
+                "ids": [vector_id],
+                "namespace": ns,
+            })
+            req = urllib.request.Request(
+                f"https://{self._pinecone_host}/vectors/delete",
+                data=body.encode(),
+                headers=headers,
+            )
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                json.loads(resp.read())
+            return True
+        except Exception as e:
+            logger.warning("Pinecone delete failed: %s", e)
             return False
 
     def _embed_text(self, text):

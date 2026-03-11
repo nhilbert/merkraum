@@ -107,8 +107,10 @@ def _get_all_edges(adp, project_id: str, limit: int = 1000) -> list:
         records = session.run(
             """
             MATCH (a {project_id: $pid})-[r]->(b {project_id: $pid})
-            RETURN a.name AS source, b.name AS target, type(r) AS type,
-                   r.confidence AS confidence, r.reason AS reason
+            RETURN a.name AS source_name, b.name AS target_name,
+                   labels(a)[0] AS source_type, labels(b)[0] AS target_type,
+                   a.node_id AS source_node_id, b.node_id AS target_node_id,
+                   type(r) AS type, r.confidence AS confidence, r.reason AS reason
             LIMIT $limit
             """,
             pid=project_id,
@@ -117,8 +119,12 @@ def _get_all_edges(adp, project_id: str, limit: int = 1000) -> list:
         for rec in records:
             edges.append(
                 {
-                    "source": rec["source"],
-                    "target": rec["target"],
+                    "source_name": rec["source_name"],
+                    "target_name": rec["target_name"],
+                    "source_type": rec["source_type"],
+                    "target_type": rec["target_type"],
+                    "source_node_id": rec["source_node_id"],
+                    "target_node_id": rec["target_node_id"],
                     "type": rec["type"],
                     "confidence": rec["confidence"] or 0,
                     "reason": rec["reason"] or "",
@@ -161,9 +167,12 @@ def _map_belief(b: dict) -> dict:
 def _map_node_for_graph(n: dict) -> dict:
     """Map a query_nodes result to the frontend graph node format."""
     node_type = n.get("type", "Concept")
+    node_name = n.get("name", "")
+    node_id = n.get("node_id") or f"{node_type}:{node_name}"
     return {
-        "id": n.get("name", ""),
-        "name": n.get("name", ""),
+        "id": node_id,
+        "node_id": node_id,
+        "name": node_name,
         "type": node_type,
         "summary": n.get("summary", ""),
         "confidence": n.get("confidence"),
@@ -174,9 +183,15 @@ def _map_node_for_graph(n: dict) -> dict:
 
 def _map_edge_for_graph(e: dict) -> dict:
     """Map an edge dict to the frontend graph link format."""
+    source_id = e.get("source_node_id") or f"{e.get('source_type', 'Concept')}:{e.get('source_name', '')}"
+    target_id = e.get("target_node_id") or f"{e.get('target_type', 'Concept')}:{e.get('target_name', '')}"
     return {
-        "source": e.get("source", ""),
-        "target": e.get("target", ""),
+        "source": source_id,
+        "target": target_id,
+        "source_name": e.get("source_name", ""),
+        "target_name": e.get("target_name", ""),
+        "source_type": e.get("source_type", ""),
+        "target_type": e.get("target_type", ""),
         "type": e.get("type", ""),
         "reason": e.get("reason", ""),
     }
@@ -740,6 +755,158 @@ def ingest_text():
             "project": project,
             "error": f"Extraction succeeded but ingestion failed: {exc}",
         }), 207  # Multi-Status: partial success
+
+
+@app.route("/api/relationship", methods=["POST"])
+@require_auth
+def add_relationship_api():
+    """Add or update a relationship between two existing nodes."""
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+
+    body = request.get_json(silent=True) or {}
+    source = (body.get("source") or "").strip()
+    target = (body.get("target") or "").strip()
+    source_type = (body.get("source_type") or "").strip() or None
+    target_type = (body.get("target_type") or "").strip() or None
+    rel_type = (body.get("type") or "").strip()
+    if not source or not target or not rel_type:
+        return _error("'source', 'target', and 'type' are required", 400)
+
+    reason = (body.get("reason") or "").strip()
+    confidence = body.get("confidence", 0.7)
+    project = body.get("project") or "default"
+    actor = request.username or request.user_id or "api"
+
+    result = adapter.add_relationship(
+        source=source,
+        target=target,
+        rel_type=rel_type,
+        project_id=project,
+        reason=reason,
+        confidence=confidence,
+        source_type=source_type,
+        target_type=target_type,
+        actor=actor,
+    )
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+
+@app.route("/api/relationship", methods=["DELETE"])
+@require_auth
+def delete_relationship_api():
+    """Delete a relationship between two nodes."""
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+
+    body = request.get_json(silent=True) or {}
+    source = (body.get("source") or "").strip()
+    target = (body.get("target") or "").strip()
+    source_type = (body.get("source_type") or "").strip() or None
+    target_type = (body.get("target_type") or "").strip() or None
+    rel_type = (body.get("type") or "").strip()
+    if not source or not target or not rel_type:
+        return _error("'source', 'target', and 'type' are required", 400)
+
+    project = body.get("project") or "default"
+    actor = request.username or request.user_id or "api"
+    result = adapter.delete_relationship(
+        source=source,
+        target=target,
+        rel_type=rel_type,
+        project_id=project,
+        source_type=source_type,
+        target_type=target_type,
+        actor=actor,
+    )
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+
+@app.route("/api/node", methods=["DELETE"])
+@require_auth
+def delete_node_api():
+    """Delete one node (and attached edges) with audit/history and vector sync."""
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    node_type = (body.get("node_type") or "").strip() or None
+    if not name:
+        return _error("'name' is required", 400)
+
+    project = body.get("project") or "default"
+    actor = request.username or request.user_id or "api"
+    result = adapter.delete_node(name=name, project_id=project, node_type=node_type, actor=actor)
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+
+@app.route("/api/node", methods=["PATCH"])
+@require_auth
+def update_node_api():
+    """Update node attributes and/or rename node with vector re-embedding."""
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+
+    body = request.get_json(silent=True) or {}
+    name = (body.get("name") or "").strip()
+    if not name:
+        return _error("'name' is required", 400)
+
+    project = body.get("project") or "default"
+    new_name = (body.get("new_name") or "").strip() or None
+    node_type = (body.get("node_type") or "").strip() or None
+    updates = body.get("updates") or {}
+    if not isinstance(updates, dict):
+        return _error("'updates' must be an object", 400)
+
+    actor = request.username or request.user_id or "api"
+    result = adapter.update_node(
+        name=name,
+        project_id=project,
+        updates=updates,
+        new_name=new_name,
+        node_type=node_type,
+        actor=actor,
+    )
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
+
+
+@app.route("/api/nodes/merge", methods=["POST"])
+@require_auth
+def merge_nodes_api():
+    """Merge two nodes by keeping one and removing the other."""
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+
+    body = request.get_json(silent=True) or {}
+    keep_name = (body.get("keep_name") or "").strip()
+    remove_name = (body.get("remove_name") or "").strip()
+    keep_node_id = (body.get("keep_node_id") or "").strip() or None
+    remove_node_id = (body.get("remove_node_id") or "").strip() or None
+    keep_type = (body.get("keep_type") or "").strip() or None
+    remove_type = (body.get("remove_type") or "").strip() or None
+    if not keep_name or not remove_name:
+        return _error("'keep_name' and 'remove_name' are required", 400)
+
+    project = body.get("project") or "default"
+    actor = request.username or request.user_id or "api"
+    result = adapter.merge_nodes(
+        keep_name=keep_name,
+        remove_name=remove_name,
+        keep_node_id=keep_node_id,
+        remove_node_id=remove_node_id,
+        keep_type=keep_type,
+        remove_type=remove_type,
+        project_id=project,
+        actor=actor,
+    )
+    status = 200 if result.get("ok") else 400
+    return jsonify(result), status
 
 
 # ---------------------------------------------------------------------------
