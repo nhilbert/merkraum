@@ -18,7 +18,10 @@ import urllib.error
 
 from flask import Flask, jsonify, request
 
-from merkraum_backend import create_adapter, NODE_TYPES, RELATIONSHIP_TYPES
+from merkraum_backend import (
+    create_adapter, NODE_TYPES, RELATIONSHIP_TYPES,
+    NodeLimitExceeded, TIER_LIMITS,
+)
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -330,6 +333,42 @@ def stats():
         return _error(str(exc))
 
 
+@app.route("/api/usage", methods=["GET"])
+def usage():
+    """Usage metrics for a project — node/edge counts and tier limits.
+
+    Query params:
+        project: project id (default: "default")
+        tier: pricing tier — free, pro, team, enterprise (default: "free")
+
+    Returns:
+        {nodes, edges, node_limit, usage_pct, tier}
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    tier = request.args.get("tier", "free") or "free"
+    if tier not in TIER_LIMITS:
+        return _error(
+            f"Invalid tier '{tier}'. Must be one of: {', '.join(sorted(TIER_LIMITS))}",
+            400,
+        )
+    try:
+        raw = adapter.get_usage(project_id=project)
+        node_limit = TIER_LIMITS[tier]
+        nodes = raw["nodes"]
+        return jsonify({
+            "nodes": nodes,
+            "edges": raw["edges"],
+            "node_limit": node_limit,
+            "usage_pct": round(nodes / node_limit * 100, 1) if node_limit else 0,
+            "tier": tier,
+        })
+    except Exception as exc:
+        logger.exception("usage failed for project=%s", project)
+        return _error(str(exc))
+
+
 @app.route("/api/beliefs", methods=["GET"])
 def beliefs():
     """Beliefs list filtered by status.
@@ -469,6 +508,10 @@ def ingest():
     if not isinstance(entities, list) or not isinstance(relationships, list):
         return _error("'entities' and 'relationships' must be arrays", 400)
 
+    # Resolve node limit from tier (passed in body or default "free")
+    tier = body.get("tier") or "free"
+    node_limit = TIER_LIMITS.get(tier)
+
     try:
         entities_written = 0
         relationships_written = 0
@@ -479,6 +522,7 @@ def ingest():
                 source_cycle=source,
                 source_type="api",
                 project_id=project,
+                node_limit=node_limit,
             )
 
         if relationships:
@@ -496,6 +540,14 @@ def ingest():
                 "project": project,
             }
         )
+    except NodeLimitExceeded as exc:
+        return jsonify({
+            "error": "node_limit_exceeded",
+            "message": str(exc),
+            "current": exc.current,
+            "limit": exc.limit,
+            "attempted": exc.attempted,
+        }), 429
     except Exception as exc:
         logger.exception("ingest failed for project=%s", project)
         return _error(str(exc))
@@ -592,6 +644,10 @@ def ingest_text():
             "message": "No extractable knowledge found in the text.",
         })
 
+    # Resolve node limit from tier
+    tier = body.get("tier") or "free"
+    node_limit = TIER_LIMITS.get(tier)
+
     # Step 2: Ingest into graph
     try:
         entities_written = 0
@@ -603,6 +659,7 @@ def ingest_text():
                 source_cycle=source,
                 source_type="text_extraction",
                 project_id=project,
+                node_limit=node_limit,
             )
 
         if relationships:
@@ -624,9 +681,21 @@ def ingest_text():
             },
             "project": project,
         })
+    except NodeLimitExceeded as exc:
+        return jsonify({
+            "extracted": {
+                "entities": entities,
+                "relationships": relationships,
+            },
+            "ingested": {"entities_written": 0, "relationships_written": 0},
+            "project": project,
+            "error": "node_limit_exceeded",
+            "message": str(exc),
+            "current": exc.current,
+            "limit": exc.limit,
+        }), 429
     except Exception as exc:
         logger.exception("Ingestion failed after extraction for project=%s", project)
-        # Return extraction results even if ingestion fails
         return jsonify({
             "extracted": {
                 "entities": entities,

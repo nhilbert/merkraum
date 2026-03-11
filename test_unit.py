@@ -23,6 +23,8 @@ from merkraum_backend import (
     NODE_TYPES,
     RELATIONSHIP_TYPES,
     SYMMETRIC_TYPES,
+    NodeLimitExceeded,
+    TIER_LIMITS,
 )
 
 
@@ -584,6 +586,155 @@ class TestBackendAdapterInterface(unittest.TestCase):
                             f"Neo4jQdrantAdapter missing {method}")
             self.assertTrue(hasattr(Neo4jPineconeAdapter, method),
                             f"Neo4jPineconeAdapter missing {method}")
+
+
+# --- Node Limit Enforcement (SUP-97) ---
+
+class TestNodeLimitExceeded(unittest.TestCase):
+    """Test the NodeLimitExceeded exception."""
+
+    def test_exception_attributes(self):
+        exc = NodeLimitExceeded(current=90, limit=100, attempted=15)
+        self.assertEqual(exc.current, 90)
+        self.assertEqual(exc.limit, 100)
+        self.assertEqual(exc.attempted, 15)
+
+    def test_exception_message(self):
+        exc = NodeLimitExceeded(current=90, limit=100, attempted=15)
+        self.assertIn("90/100", str(exc))
+        self.assertIn("15", str(exc))
+
+
+class TestTierLimits(unittest.TestCase):
+    """Test tier limit constants."""
+
+    def test_free_tier_limit(self):
+        self.assertEqual(TIER_LIMITS["free"], 100)
+
+    def test_pro_tier_limit(self):
+        self.assertEqual(TIER_LIMITS["pro"], 1_000)
+
+    def test_team_tier_limit(self):
+        self.assertEqual(TIER_LIMITS["team"], 5_000)
+
+    def test_enterprise_tier_limit(self):
+        self.assertEqual(TIER_LIMITS["enterprise"], 50_000)
+
+    def test_all_tiers_present(self):
+        self.assertEqual(set(TIER_LIMITS.keys()),
+                         {"free", "pro", "team", "enterprise"})
+
+
+class TestGetUsage(unittest.TestCase):
+    """Test Neo4jBaseAdapter.get_usage."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_returns_node_and_edge_counts(self):
+        node_result = MagicMock()
+        node_result.single.return_value = {"c": 42}
+        edge_result = MagicMock()
+        edge_result.single.return_value = {"c": 87}
+        self.session.run.side_effect = [node_result, edge_result]
+
+        usage = self.adapter.get_usage(project_id="test")
+        self.assertEqual(usage["nodes"], 42)
+        self.assertEqual(usage["edges"], 87)
+
+    def test_empty_project(self):
+        node_result = MagicMock()
+        node_result.single.return_value = {"c": 0}
+        edge_result = MagicMock()
+        edge_result.single.return_value = {"c": 0}
+        self.session.run.side_effect = [node_result, edge_result]
+
+        usage = self.adapter.get_usage(project_id="empty")
+        self.assertEqual(usage["nodes"], 0)
+        self.assertEqual(usage["edges"], 0)
+
+
+class TestWriteEntitiesWithLimit(unittest.TestCase):
+    """Test node limit enforcement in write_entities."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def _mock_usage(self, node_count, extra_writes=10):
+        """Set up get_usage to return a specific node count, then allow writes."""
+        node_result = MagicMock()
+        node_result.single.return_value = {"c": node_count}
+        edge_result = MagicMock()
+        edge_result.single.return_value = {"c": 0}
+        self.session.run.side_effect = (
+            [node_result, edge_result] + [None] * extra_writes
+        )
+
+    def test_no_limit_allows_write(self):
+        """Without node_limit, writes proceed normally."""
+        entities = [{"name": "A", "node_type": "Concept"}]
+        count = self.adapter.write_entities(entities, "Z1341", project_id="test")
+        self.assertEqual(count, 1)
+
+    def test_within_limit_allows_write(self):
+        """Writes within limit proceed normally."""
+        self._mock_usage(50)
+        entities = [{"name": "A", "node_type": "Concept"}]
+        count = self.adapter.write_entities(
+            entities, "Z1341", project_id="test", node_limit=100
+        )
+        self.assertEqual(count, 1)
+
+    def test_exceeding_limit_raises(self):
+        """Writes that would exceed limit raise NodeLimitExceeded."""
+        self._mock_usage(95)
+        entities = [{"name": f"E{i}", "node_type": "Concept"} for i in range(10)]
+        with self.assertRaises(NodeLimitExceeded) as ctx:
+            self.adapter.write_entities(
+                entities, "Z1341", project_id="test", node_limit=100
+            )
+        self.assertEqual(ctx.exception.current, 95)
+        self.assertEqual(ctx.exception.limit, 100)
+        self.assertEqual(ctx.exception.attempted, 10)
+
+    def test_at_exact_limit_raises(self):
+        """Already at limit, any new entity raises."""
+        self._mock_usage(100)
+        entities = [{"name": "One", "node_type": "Concept"}]
+        with self.assertRaises(NodeLimitExceeded):
+            self.adapter.write_entities(
+                entities, "Z1341", project_id="test", node_limit=100
+            )
+
+    def test_empty_entities_with_limit_ok(self):
+        """Empty entity list with limit set should not check usage."""
+        count = self.adapter.write_entities(
+            [], "Z1341", project_id="test", node_limit=100
+        )
+        self.assertEqual(count, 0)
+
+    def test_exactly_filling_to_limit_ok(self):
+        """Adding entities that exactly reach (not exceed) the limit succeeds."""
+        self._mock_usage(95)
+        entities = [{"name": f"E{i}", "node_type": "Concept"} for i in range(5)]
+        count = self.adapter.write_entities(
+            entities, "Z1341", project_id="test", node_limit=100
+        )
+        self.assertEqual(count, 5)
+
+
+class TestBackendAdapterUsageInterface(unittest.TestCase):
+    """Verify get_usage is in the abstract interface."""
+
+    def test_get_usage_in_required_methods(self):
+        self.assertTrue(hasattr(Neo4jQdrantAdapter, "get_usage"))
+        self.assertTrue(hasattr(Neo4jPineconeAdapter, "get_usage"))
 
 
 if __name__ == "__main__":

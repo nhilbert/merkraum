@@ -29,6 +29,29 @@ from typing import Optional
 
 logger = logging.getLogger(__name__)
 
+
+class NodeLimitExceeded(Exception):
+    """Raised when a write would exceed the project's node limit."""
+
+    def __init__(self, current: int, limit: int, attempted: int):
+        self.current = current
+        self.limit = limit
+        self.attempted = attempted
+        super().__init__(
+            f"Node limit exceeded: {current}/{limit} nodes "
+            f"(attempted to add {attempted})"
+        )
+
+
+# Tier-based node limits.  The API layer maps user tiers to these values.
+TIER_LIMITS = {
+    "free": 100,
+    "pro": 1_000,
+    "team": 5_000,
+    "enterprise": 50_000,
+}
+
+
 # --- Fixed Schema (shared across all backends) ---
 
 NODE_TYPES = [
@@ -69,8 +92,14 @@ class BackendAdapter(ABC):
     @abstractmethod
     def write_entities(self, entities: list, source_cycle: str,
                        source_type: str = "extraction",
-                       project_id: str = "default") -> int:
-        """Write entities to the graph. Returns count of entities written."""
+                       project_id: str = "default",
+                       node_limit: Optional[int] = None) -> int:
+        """Write entities to the graph. Returns count of entities written.
+
+        Args:
+            node_limit: If set, raises NodeLimitExceeded when the project's
+                current node count + new entities would exceed this limit.
+        """
 
     @abstractmethod
     def write_relationships(self, relationships: list, source_cycle: str,
@@ -101,6 +130,14 @@ class BackendAdapter(ABC):
     @abstractmethod
     def delete_project_data(self, project_id: str) -> dict:
         """Delete all nodes and relationships for a project. Returns counts."""
+
+    @abstractmethod
+    def get_usage(self, project_id: str = "default") -> dict:
+        """Get usage metrics for a project.
+
+        Returns:
+            {"nodes": int, "edges": int}
+        """
 
     # --- Vector Operations ---
 
@@ -160,7 +197,15 @@ class Neo4jBaseAdapter(BackendAdapter):
             raise
 
     def write_entities(self, entities, source_cycle, source_type="extraction",
-                       project_id="default"):
+                       project_id="default", node_limit=None):
+        if node_limit is not None and entities:
+            usage = self.get_usage(project_id)
+            if usage["nodes"] + len(entities) > node_limit:
+                raise NodeLimitExceeded(
+                    current=usage["nodes"],
+                    limit=node_limit,
+                    attempted=len(entities),
+                )
         now = datetime.now().isoformat()
         written = 0
         with self._driver.session() as session:
@@ -415,6 +460,21 @@ class Neo4jBaseAdapter(BackendAdapter):
             )
             counts["nodes_deleted"] = result.single()["c"]
         return counts
+
+    def get_usage(self, project_id="default"):
+        with self._driver.session() as session:
+            node_result = session.run(
+                "MATCH (n {project_id: $pid}) RETURN count(n) AS c",
+                pid=project_id,
+            )
+            node_count = node_result.single()["c"]
+            edge_result = session.run(
+                "MATCH (a {project_id: $pid})-[r]->(b {project_id: $pid}) "
+                "RETURN count(r) AS c",
+                pid=project_id,
+            )
+            edge_count = edge_result.single()["c"]
+        return {"nodes": node_count, "edges": edge_count}
 
 
 class Neo4jQdrantAdapter(Neo4jBaseAdapter):
