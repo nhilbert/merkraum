@@ -71,7 +71,7 @@ def add_cors_headers(response):
         # For production, tighten this by removing the else branch.
         response.headers["Access-Control-Allow-Origin"] = "*"
     response.headers["Access-Control-Allow-Methods"] = (
-        "GET, POST, OPTIONS, PUT, DELETE"
+        "GET, POST, PATCH, OPTIONS, PUT, DELETE"
     )
     response.headers["Access-Control-Allow-Headers"] = (
         "Content-Type, Authorization, X-Requested-With"
