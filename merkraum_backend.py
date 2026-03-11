@@ -387,7 +387,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                     if node_type == "Belief":
                         params["confidence"] = ent.get("confidence", 0.7)
                         session.run(
-                            f"""
+                            """
                             MERGE (n:Belief {{name: $name, project_id: $project_id}})
                             ON CREATE SET
                                 n.summary = $summary, n.created_at = $now,

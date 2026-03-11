@@ -133,6 +133,7 @@ python merkraum_mcp_server.py
 - [Architecture](docs/architecture.md) — dual-store design, schema, competitive landscape
 - [Belief Tracking](docs/belief-tracking.md) — developer guide for epistemic belief tracking
 - [Compliance Guide](docs/compliance-guide.md) — EU AI Act, PLD, GDPR compliance mapping
+- [Public Security Readiness](docs/security-public-readiness.md) — checklist for safe public sharing (secrets/privacy)
 - [EpistBench](docs/benchmark.md) — epistemological memory benchmark (baseline results)
 
 ## License
