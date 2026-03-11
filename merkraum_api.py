@@ -63,16 +63,26 @@ ALLOWED_ORIGINS = {
     "http://localhost:5173",
 }
 
+MAX_GRAPH_LIMIT = 1000
+MAX_NODES_LIMIT = 500
+MAX_SEARCH_TOP = 50
+MAX_TRAVERSE_DEPTH = 5
+
+
+def _allowed_origins() -> set[str]:
+    configured = os.environ.get("CORS_ALLOWED_ORIGINS")
+    if not configured:
+        return ALLOWED_ORIGINS
+    return {x.strip() for x in configured.split(",") if x.strip()}
+
 
 @app.after_request
 def add_cors_headers(response):
     origin = request.headers.get("Origin", "")
-    if origin in ALLOWED_ORIGINS:
+    allowed_origins = _allowed_origins()
+    if origin and origin in allowed_origins:
         response.headers["Access-Control-Allow-Origin"] = origin
-    else:
-        # Fallback: allow all origins during development.
-        # For production, tighten this by removing the else branch.
-        response.headers["Access-Control-Allow-Origin"] = "*"
+        response.headers["Vary"] = "Origin"
     response.headers["Access-Control-Allow-Methods"] = (
         "GET, POST, PATCH, OPTIONS, PUT, DELETE"
     )
@@ -87,6 +97,9 @@ def add_cors_headers(response):
 @app.route("/api", methods=["OPTIONS"])
 def handle_preflight(path=""):
     """Handle CORS preflight requests. No authentication required for OPTIONS."""
+    origin = request.headers.get("Origin", "")
+    if origin and origin not in _allowed_origins():
+        return _error("CORS origin not allowed", 403)
     return jsonify({}), 200
 
 
@@ -562,6 +575,7 @@ def graph():
         limit = int(request.args.get("limit", 500))
     except (TypeError, ValueError):
         limit = 500
+    limit = max(1, min(limit, MAX_GRAPH_LIMIT))
 
     try:
         raw_nodes = adapter.query_nodes(node_type=None, project_id=project, limit=limit)
@@ -597,6 +611,7 @@ def nodes():
         limit = int(request.args.get("limit", 100))
     except (TypeError, ValueError):
         limit = 100
+    limit = max(1, min(limit, MAX_NODES_LIMIT))
 
     try:
         results = adapter.query_nodes(
@@ -628,6 +643,7 @@ def traverse(entity: str):
         depth = int(request.args.get("depth", 2))
     except (TypeError, ValueError):
         depth = 2
+    depth = max(1, min(depth, MAX_TRAVERSE_DEPTH))
 
     try:
         result = adapter.traverse(
@@ -744,6 +760,7 @@ def search():
         top = int(request.args.get("top", 5))
     except (TypeError, ValueError):
         top = 5
+    top = max(1, min(top, MAX_SEARCH_TOP))
 
     try:
         results = adapter.vector_search(
