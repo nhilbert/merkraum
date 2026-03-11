@@ -55,6 +55,8 @@ That's it. Start asking your agent to remember things.
 | `traverse_graph` | Walk relationships from any entity |
 | `add_knowledge` | Add a structured entity (no LLM needed) |
 | `add_relationship` | Link two entities with a typed relationship |
+| `update_belief` | Update a belief's confidence, status, or summary — human-auditable correction |
+| `get_usage` | Usage metrics and tier limits (nodes, edges, quota percentage) |
 | `ingest_knowledge` | Extract entities from free text (requires OpenAI API key) |
 | `check_ingestion_status` | Poll async ingestion jobs |
 | `list_beliefs` | View beliefs by status (active, uncertain, contradicted) |

@@ -6,13 +6,13 @@
 
 - **Name**: merkraum
 - **Tagline**: Auditable knowledge memory for AI agents
-- **Description**: Know what your AI believes — and prove it. Structured knowledge graph with belief tracking, contradiction detection, and full audit trail. 10 MCP tools for Claude, Cursor, and any MCP client. Self-hosted via Docker Compose (Neo4j + Qdrant). EU-hosted option available (Frankfurt). BSL 1.1.
+- **Description**: Know what your AI believes — and prove it. Structured knowledge graph with belief tracking, contradiction detection, and full audit trail. 12 MCP tools for Claude, Cursor, and any MCP client. Self-hosted via Docker Compose (Neo4j + Qdrant). EU-hosted option available (Frankfurt). BSL 1.1.
 - **Repository**: https://github.com/nhilbert/merkraum
 - **Website**: https://merkraum.de
 - **Category**: Database / Knowledge Management
 - **License**: BSL 1.1
 - **Contact**: info@merkraum.de
-- **Tools count**: 10
+- **Tools count**: 12
 
 ## Directory Submissions
 
@@ -29,7 +29,7 @@
 **URL**: https://mcpservers.org/submit
 **Fields**:
 - Server Name: `merkraum`
-- Short Description: `Auditable knowledge memory for AI agents. Belief tracking, contradiction detection, and full audit trail. 10 MCP tools. Self-hosted via Docker Compose.`
+- Short Description: `Auditable knowledge memory for AI agents. Belief tracking, contradiction detection, and full audit trail. 12 MCP tools. Self-hosted via Docker Compose.`
 - Link: `https://github.com/nhilbert/merkraum`
 - Category: `database`
 - Contact Email: `info@merkraum.de`
