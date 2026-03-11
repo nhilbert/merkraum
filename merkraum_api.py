@@ -5,7 +5,17 @@ Merkraum REST API Server — HTTP interface for the knowledge graph.
 Wraps BackendAdapter from merkraum_backend.py and exposes endpoints
 consumed by the React frontend (merkraum-front).
 
+Includes Cognito JWT authentication for all endpoints.
+
+Authentication:
+    - AUTH_REQUIRED env var controls if tokens are validated (default: false for local dev)
+    - When AUTH_REQUIRED=true: All requests must have valid Authorization: Bearer header
+    - When AUTH_REQUIRED=false or unset: Endpoints work without authentication
+    - For production deployments, always set AUTH_REQUIRED=true
+
 v1.0 — SUP-94
+v1.1 — SUP-95 (2026-03-11): Added Cognito JWT validation
+v1.2 — SUP-96 (2026-03-11): Made authentication configurable via AUTH_REQUIRED env var
 """
 
 import argparse
@@ -22,6 +32,7 @@ from merkraum_backend import (
     create_adapter, NODE_TYPES, RELATIONSHIP_TYPES,
     NodeLimitExceeded, TIER_LIMITS,
 )
+from jwt_auth import get_cognito_validator, require_auth, optional_auth
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -72,7 +83,7 @@ def add_cors_headers(response):
 @app.route("/api/<path:path>", methods=["OPTIONS"])
 @app.route("/api", methods=["OPTIONS"])
 def handle_preflight(path=""):
-    """Handle CORS preflight requests."""
+    """Handle CORS preflight requests. No authentication required for OPTIONS."""
     return jsonify({}), 200
 
 
@@ -283,8 +294,12 @@ def _llm_extract(text: str, api_key: str, model: str = "gpt-4o-mini") -> dict:
 # ---------------------------------------------------------------------------
 
 @app.route("/api/health", methods=["GET"])
+@require_auth
 def health():
-    """Health check — returns adapter connectivity status."""
+    """Health check — returns adapter connectivity status.
+    
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
+    """
     if adapter is None:
         return _error("Adapter not initialized", 503)
     try:
@@ -299,9 +314,11 @@ def health():
 
 
 @app.route("/api/projects", methods=["GET"])
+@require_auth
 def projects():
     """List all project IDs that have data in the graph.
 
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
     Returns a sorted list of project_id strings.
     """
     if adapter is None:
@@ -320,8 +337,12 @@ def projects():
 
 
 @app.route("/api/stats", methods=["GET"])
+@require_auth
 def stats():
-    """Graph stats in frontend format: {entities, relationships, beliefs, contradictions}."""
+    """Graph stats in frontend format: {entities, relationships, beliefs, contradictions}.
+    
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
+    """
     if adapter is None:
         return _error("Adapter not initialized", 503)
     project = _project_id()
@@ -334,6 +355,7 @@ def stats():
 
 
 @app.route("/api/usage", methods=["GET"])
+@require_auth
 def usage():
     """Usage metrics for a project — node/edge counts and tier limits.
 
@@ -370,8 +392,11 @@ def usage():
 
 
 @app.route("/api/beliefs", methods=["GET"])
+@require_auth
 def beliefs():
     """Beliefs list filtered by status.
+
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
 
     Query params:
         project: project id (default: "default")
@@ -396,6 +421,7 @@ def beliefs():
 
 
 @app.route("/api/graph", methods=["GET"])
+@require_auth
 def graph():
     """All nodes + relationships for force-graph visualization.
 
@@ -425,6 +451,7 @@ def graph():
 
 
 @app.route("/api/nodes", methods=["GET"])
+@require_auth
 def nodes():
     """Query nodes, optionally filtered by type.
 
@@ -453,6 +480,7 @@ def nodes():
 
 
 @app.route("/api/traverse/<path:entity>", methods=["GET"])
+@require_auth
 def traverse(entity: str):
     """Multi-hop graph traversal from a named entity.
 
@@ -482,8 +510,11 @@ def traverse(entity: str):
 
 
 @app.route("/api/ingest", methods=["POST"])
+@require_auth
 def ingest():
     """Ingest entities and/or relationships into the graph.
+
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
 
     JSON body:
         {
@@ -554,6 +585,7 @@ def ingest():
 
 
 @app.route("/api/search", methods=["GET"])
+@require_auth
 def search():
     """Vector (semantic) search.
 
@@ -586,8 +618,11 @@ def search():
 
 
 @app.route("/api/ingest/text", methods=["POST"])
+@require_auth
 def ingest_text():
     """Extract entities and relationships from raw text via LLM, then ingest.
+
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
 
     This is the core merkraum pipeline: text -> extraction -> knowledge graph.
 
@@ -724,6 +759,23 @@ def _init_adapter():
         adapter = None
 
 
+def _init_cognito_auth():
+    """Initialize Cognito JWT validation. Called once at startup."""
+    validator = get_cognito_validator()
+    if validator:
+        app._cognito_validator = validator
+        logger.info(
+            "Cognito JWT validator initialized for pool: %s (region: %s)",
+            validator.user_pool_id,
+            validator.aws_region,
+        )
+    else:
+        logger.warning(
+            "Cognito JWT validation not configured. "
+            "Set COGNITO_USER_POOL_ID and COGNITO_AWS_REGION to enable."
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Merkraum REST API server",
@@ -747,6 +799,7 @@ def main():
     args = parser.parse_args()
 
     _init_adapter()
+    _init_cognito_auth()
 
     logger.info(
         "Starting Merkraum API on %s:%d (debug=%s)",
