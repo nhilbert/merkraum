@@ -12,6 +12,8 @@ CLI tools, and dreaming engine can work against any backend configuration
 without code changes.
 
 v1.0 — Z1134 (2026-03-07)
+v1.1 — Z1336 (2026-03-11): Refactored — shared Neo4j graph ops extracted
+       into Neo4jBaseAdapter, eliminating ~500 lines of duplication.
 """
 
 import os
@@ -113,159 +115,17 @@ class BackendAdapter(ABC):
         """Upsert a vector with text embedding. Returns success."""
 
 
-class Neo4jQdrantAdapter(BackendAdapter):
-    """Concrete adapter for local/open-source deployment: Neo4j CE + Qdrant.
+class Neo4jBaseAdapter(BackendAdapter):
+    """Base adapter with shared Neo4j graph operations.
 
-    This is the open-source adapter for Merkraum local mode.
-    Uses Qdrant (self-hosted) for vector storage and FastEmbed for local
-    embedding generation — no external API calls needed for vector operations.
+    Subclasses must implement:
+      - connect(), close(), is_healthy()
+      - vector_search(), vector_upsert()
 
-    v1.0 — Z1142 (2026-03-07)
+    The Neo4j driver is expected at self._driver after connect().
     """
 
-    # Default embedding model for fastembed (small, fast, good quality)
-    DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
-
-    def __init__(self, neo4j_uri=None, neo4j_user=None, neo4j_password=None,
-                 qdrant_url=None, qdrant_api_key=None,
-                 embed_model=None):
-        self._neo4j_uri = neo4j_uri
-        self._neo4j_user = neo4j_user
-        self._neo4j_password = neo4j_password
-        self._qdrant_url = qdrant_url or "http://localhost:6333"
-        self._qdrant_api_key = qdrant_api_key
-        self._embed_model_name = embed_model or self.DEFAULT_EMBED_MODEL
-        self._driver = None
-        self._qdrant = None
-        self._embedder = None
-
-    def connect(self):
-        """Establish Neo4j driver and Qdrant client."""
-        self._load_credentials()
-        self._connect_neo4j()
-        self._connect_qdrant()
-        self._init_embedder()
-
-    def _load_credentials(self):
-        """Load credentials from environment or .env file."""
-        if not self._neo4j_uri:
-            env = _load_env()
-            self._neo4j_uri = env.get("NEO4J_URI", "bolt://localhost:7687")
-            self._neo4j_user = env.get("NEO4J_USER", "neo4j")
-            self._neo4j_password = env.get("NEO4J_PASSWORD", "")
-            self._qdrant_url = env.get("QDRANT_URL", self._qdrant_url)
-            self._qdrant_api_key = env.get("QDRANT_API_KEY", self._qdrant_api_key)
-
-    def _connect_neo4j(self):
-        """Create Neo4j driver."""
-        try:
-            from neo4j import GraphDatabase
-            self._driver = GraphDatabase.driver(
-                self._neo4j_uri,
-                auth=(self._neo4j_user, self._neo4j_password),
-            )
-            self._driver.verify_connectivity()
-        except Exception as e:
-            logger.error("Neo4j connection failed: %s", e)
-            raise
-
-    def _connect_qdrant(self):
-        """Create Qdrant client."""
-        try:
-            from qdrant_client import QdrantClient
-            kwargs = {"url": self._qdrant_url, "timeout": 15}
-            if self._qdrant_api_key:
-                kwargs["api_key"] = self._qdrant_api_key
-            self._qdrant = QdrantClient(**kwargs)
-            # Verify connectivity
-            self._qdrant.get_collections()
-        except Exception as e:
-            logger.error("Qdrant connection failed: %s", e)
-            raise
-
-    def _init_embedder(self):
-        """Initialize local embedding model via fastembed."""
-        try:
-            from fastembed import TextEmbedding
-            self._embedder = TextEmbedding(model_name=self._embed_model_name)
-            logger.info("FastEmbed initialized: %s", self._embed_model_name)
-        except ImportError:
-            logger.warning("fastembed not installed — vector operations will fail. "
-                           "Install with: pip install fastembed")
-        except Exception as e:
-            logger.warning("FastEmbed init failed: %s", e)
-
-    def _get_collection_name(self, project_id: str,
-                             namespace: Optional[str] = None) -> str:
-        """Map project_id + namespace to Qdrant collection name."""
-        if namespace:
-            return f"{project_id}_{namespace}"
-        return project_id
-
-    def _ensure_collection(self, collection_name: str, vector_size: int = 384):
-        """Create collection if it doesn't exist."""
-        from qdrant_client import models
-        try:
-            self._qdrant.get_collection(collection_name)
-        except Exception:
-            self._qdrant.create_collection(
-                collection_name=collection_name,
-                vectors_config=models.VectorParams(
-                    size=vector_size,
-                    distance=models.Distance.COSINE,
-                ),
-            )
-            logger.info("Created Qdrant collection: %s", collection_name)
-
-    def _embed_text(self, text: str) -> Optional[list]:
-        """Embed text using fastembed."""
-        if not self._embedder:
-            logger.warning("No embedder available")
-            return None
-        try:
-            embeddings = list(self._embedder.embed([text]))
-            return embeddings[0].tolist()
-        except Exception as e:
-            logger.warning("Embedding failed: %s", e)
-            return None
-
-    def _embed_batch(self, texts: list) -> list:
-        """Embed multiple texts efficiently."""
-        if not self._embedder:
-            return []
-        try:
-            return [e.tolist() for e in self._embedder.embed(texts)]
-        except Exception as e:
-            logger.warning("Batch embedding failed: %s", e)
-            return []
-
-    def close(self):
-        if self._driver:
-            self._driver.close()
-            self._driver = None
-        if self._qdrant:
-            self._qdrant.close()
-            self._qdrant = None
-        self._embedder = None
-
-    def is_healthy(self) -> bool:
-        neo4j_ok = False
-        qdrant_ok = False
-        try:
-            if self._driver:
-                self._driver.verify_connectivity()
-                neo4j_ok = True
-        except Exception:
-            pass
-        try:
-            if self._qdrant:
-                self._qdrant.get_collections()
-                qdrant_ok = True
-        except Exception:
-            pass
-        return neo4j_ok and qdrant_ok
-
-    # --- Graph Operations (identical to Neo4jPineconeAdapter) ---
+    _driver = None
 
     def write_entities(self, entities, source_cycle, source_type="extraction",
                        project_id="default"):
@@ -523,6 +383,138 @@ class Neo4jQdrantAdapter(BackendAdapter):
             )
             counts["nodes_deleted"] = result.single()["c"]
         return counts
+
+
+class Neo4jQdrantAdapter(Neo4jBaseAdapter):
+    """Concrete adapter for local/open-source deployment: Neo4j CE + Qdrant.
+
+    Uses Qdrant (self-hosted) for vector storage and FastEmbed for local
+    embedding generation — no external API calls needed for vector operations.
+
+    v1.0 — Z1142 (2026-03-07)
+    v1.1 — Z1336: Inherits shared graph ops from Neo4jBaseAdapter.
+    """
+
+    DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+
+    def __init__(self, neo4j_uri=None, neo4j_user=None, neo4j_password=None,
+                 qdrant_url=None, qdrant_api_key=None,
+                 embed_model=None):
+        self._neo4j_uri = neo4j_uri
+        self._neo4j_user = neo4j_user
+        self._neo4j_password = neo4j_password
+        self._qdrant_url = qdrant_url or "http://localhost:6333"
+        self._qdrant_api_key = qdrant_api_key
+        self._embed_model_name = embed_model or self.DEFAULT_EMBED_MODEL
+        self._driver = None
+        self._qdrant = None
+        self._embedder = None
+
+    def connect(self):
+        self._load_credentials()
+        self._connect_neo4j()
+        self._connect_qdrant()
+        self._init_embedder()
+
+    def _load_credentials(self):
+        if not self._neo4j_uri:
+            env = _load_env()
+            self._neo4j_uri = env.get("NEO4J_URI", "bolt://localhost:7687")
+            self._neo4j_user = env.get("NEO4J_USER", "neo4j")
+            self._neo4j_password = env.get("NEO4J_PASSWORD", "")
+            self._qdrant_url = env.get("QDRANT_URL", self._qdrant_url)
+            self._qdrant_api_key = env.get("QDRANT_API_KEY", self._qdrant_api_key)
+
+    def _connect_neo4j(self):
+        try:
+            from neo4j import GraphDatabase
+            self._driver = GraphDatabase.driver(
+                self._neo4j_uri,
+                auth=(self._neo4j_user, self._neo4j_password),
+            )
+            self._driver.verify_connectivity()
+        except Exception as e:
+            logger.error("Neo4j connection failed: %s", e)
+            raise
+
+    def _connect_qdrant(self):
+        try:
+            from qdrant_client import QdrantClient
+            kwargs = {"url": self._qdrant_url, "timeout": 15}
+            if self._qdrant_api_key:
+                kwargs["api_key"] = self._qdrant_api_key
+            self._qdrant = QdrantClient(**kwargs)
+            self._qdrant.get_collections()
+        except Exception as e:
+            logger.error("Qdrant connection failed: %s", e)
+            raise
+
+    def _init_embedder(self):
+        try:
+            from fastembed import TextEmbedding
+            self._embedder = TextEmbedding(model_name=self._embed_model_name)
+            logger.info("FastEmbed initialized: %s", self._embed_model_name)
+        except ImportError:
+            logger.warning("fastembed not installed — vector operations will fail. "
+                           "Install with: pip install fastembed")
+        except Exception as e:
+            logger.warning("FastEmbed init failed: %s", e)
+
+    def _get_collection_name(self, project_id, namespace=None):
+        if namespace:
+            return f"{project_id}_{namespace}"
+        return project_id
+
+    def _ensure_collection(self, collection_name, vector_size=384):
+        from qdrant_client import models
+        try:
+            self._qdrant.get_collection(collection_name)
+        except Exception:
+            self._qdrant.create_collection(
+                collection_name=collection_name,
+                vectors_config=models.VectorParams(
+                    size=vector_size,
+                    distance=models.Distance.COSINE,
+                ),
+            )
+            logger.info("Created Qdrant collection: %s", collection_name)
+
+    def _embed_text(self, text):
+        if not self._embedder:
+            logger.warning("No embedder available")
+            return None
+        try:
+            embeddings = list(self._embedder.embed([text]))
+            return embeddings[0].tolist()
+        except Exception as e:
+            logger.warning("Embedding failed: %s", e)
+            return None
+
+    def close(self):
+        if self._driver:
+            self._driver.close()
+            self._driver = None
+        if self._qdrant:
+            self._qdrant.close()
+            self._qdrant = None
+        self._embedder = None
+
+    def is_healthy(self) -> bool:
+        neo4j_ok = False
+        qdrant_ok = False
+        try:
+            if self._driver:
+                self._driver.verify_connectivity()
+                neo4j_ok = True
+        except Exception:
+            pass
+        try:
+            if self._qdrant:
+                self._qdrant.get_collections()
+                qdrant_ok = True
+        except Exception:
+            pass
+        return neo4j_ok and qdrant_ok
 
     # --- Vector Operations (Qdrant-specific) ---
 
@@ -569,7 +561,6 @@ class Neo4jQdrantAdapter(BackendAdapter):
             self._ensure_collection(collection, vector_size=len(embedding))
             metadata["project_id"] = project_id
             metadata["content"] = text
-            # Use deterministic ID from vector_id string
             point_id = _string_to_uuid(vector_id)
             self._qdrant.upsert(
                 collection_name=collection,
@@ -587,12 +578,14 @@ class Neo4jQdrantAdapter(BackendAdapter):
             return False
 
 
-class Neo4jPineconeAdapter(BackendAdapter):
-    """Concrete adapter wrapping the current VSG Neo4j + Pinecone setup.
+class Neo4jPineconeAdapter(Neo4jBaseAdapter):
+    """Concrete adapter wrapping Neo4j + Pinecone (managed/cloud).
 
-    This is the reference implementation. It delegates to the existing
-    vsg_knowledge.py and vsg_pinecone.py code paths where possible,
-    providing the BackendAdapter interface on top.
+    This is the reference implementation for production Merkraum deployments
+    using Pinecone's managed vector service.
+
+    v1.0 — Z1134 (2026-03-07)
+    v1.1 — Z1336: Inherits shared graph ops from Neo4jBaseAdapter.
     """
 
     def __init__(self, neo4j_uri=None, neo4j_user=None, neo4j_password=None,
@@ -606,13 +599,11 @@ class Neo4jPineconeAdapter(BackendAdapter):
         self._driver = None
 
     def connect(self):
-        """Establish Neo4j driver and resolve Pinecone host."""
         self._load_credentials()
         self._connect_neo4j()
         self._resolve_pinecone_host()
 
     def _load_credentials(self):
-        """Load credentials from environment or .env file."""
         if not self._neo4j_uri:
             env = _load_env()
             self._neo4j_uri = env.get("NEO4J_URI", "bolt://localhost:7687")
@@ -621,7 +612,6 @@ class Neo4jPineconeAdapter(BackendAdapter):
             self._pinecone_api_key = env.get("PINECONE_API_KEY", "")
 
     def _connect_neo4j(self):
-        """Create Neo4j driver."""
         try:
             from neo4j import GraphDatabase
             self._driver = GraphDatabase.driver(
@@ -634,7 +624,6 @@ class Neo4jPineconeAdapter(BackendAdapter):
             raise
 
     def _resolve_pinecone_host(self):
-        """Resolve Pinecone index host URL."""
         if not self._pinecone_api_key:
             return
         try:
@@ -671,267 +660,7 @@ class Neo4jPineconeAdapter(BackendAdapter):
         pinecone_ok = self._pinecone_host is not None
         return neo4j_ok and pinecone_ok
 
-    # --- Graph Operations ---
-
-    def write_entities(self, entities, source_cycle, source_type="extraction",
-                       project_id="default"):
-        now = datetime.now().isoformat()
-        written = 0
-        with self._driver.session() as session:
-            for ent in entities:
-                try:
-                    node_type = ent.get("node_type", "Concept")
-                    if node_type not in NODE_TYPES:
-                        continue
-                    params = dict(
-                        name=ent["name"],
-                        summary=ent.get("summary", ""),
-                        now=now,
-                        source_cycle=source_cycle,
-                        source_type=source_type,
-                        project_id=project_id,
-                    )
-                    if node_type == "Belief":
-                        params["confidence"] = ent.get("confidence", 0.7)
-                        session.run(
-                            f"""
-                            MERGE (n:Belief {{name: $name, project_id: $project_id}})
-                            ON CREATE SET
-                                n.summary = $summary, n.created_at = $now,
-                                n.updated_at = $now, n.source_cycle = $source_cycle,
-                                n.source_type = $source_type, n.active = true,
-                                n.status = 'active', n.confidence = $confidence,
-                                n.project_id = $project_id
-                            ON MATCH SET
-                                n.summary = $summary, n.updated_at = $now,
-                                n.confidence = CASE WHEN $confidence > n.confidence
-                                    THEN $confidence ELSE n.confidence END
-                            """,
-                            **params,
-                        )
-                    else:
-                        session.run(
-                            f"""
-                            MERGE (n:{node_type} {{name: $name, project_id: $project_id}})
-                            ON CREATE SET
-                                n.summary = $summary, n.created_at = $now,
-                                n.updated_at = $now, n.source_cycle = $source_cycle,
-                                n.source_type = $source_type,
-                                n.project_id = $project_id
-                            ON MATCH SET
-                                n.summary = CASE WHEN size($summary) > size(coalesce(n.summary, ''))
-                                    THEN $summary ELSE n.summary END,
-                                n.updated_at = $now
-                            """,
-                            **params,
-                        )
-                    written += 1
-                except Exception as e:
-                    logger.warning("Entity write failed for %s: %s", ent.get("name"), e)
-        return written
-
-    def write_relationships(self, relationships, source_cycle,
-                            source_type="extraction",
-                            project_id="default"):
-        now = datetime.now().isoformat()
-        written = 0
-        with self._driver.session() as session:
-            for rel in relationships:
-                try:
-                    rel_type = rel.get("type", "REFERENCES")
-                    if rel_type not in RELATIONSHIP_TYPES:
-                        continue
-                    params = dict(
-                        source=rel["source"],
-                        target=rel["target"],
-                        confidence=rel.get("confidence", 0.7),
-                        reason=rel.get("reason", ""),
-                        source_cycle=source_cycle,
-                        source_type=source_type,
-                        now=now,
-                        project_id=project_id,
-                        valid_from=rel.get("valid_from", now),
-                    )
-                    cypher = f"""
-                    MATCH (a {{name: $source, project_id: $project_id}})
-                    MATCH (b {{name: $target, project_id: $project_id}})
-                    MERGE (a)-[r:{rel_type}]->(b)
-                    ON CREATE SET
-                        r.confidence = $confidence, r.reason = $reason,
-                        r.source_cycle = $source_cycle, r.source_type = $source_type,
-                        r.created_at = $now, r.active = true,
-                        r.weight = $confidence, r.valid_from = $valid_from,
-                        r.valid_until = null, r.expired_at = null
-                    ON MATCH SET
-                        r.confidence = CASE WHEN $confidence > r.confidence
-                            THEN $confidence ELSE r.confidence END,
-                        r.updated_at = $now,
-                        r.weight = CASE WHEN $confidence > r.weight
-                            THEN $confidence ELSE r.weight END
-                    """
-                    result = session.run(cypher, **params)
-                    summary = result.consume()
-                    if summary.counters.relationships_created > 0:
-                        written += 1
-                        # Handle symmetric types
-                        if rel_type in SYMMETRIC_TYPES:
-                            inverse = f"""
-                            MATCH (a {{name: $target, project_id: $project_id}})
-                            MATCH (b {{name: $source, project_id: $project_id}})
-                            MERGE (a)-[r:{rel_type}]->(b)
-                            ON CREATE SET
-                                r.confidence = $confidence, r.reason = $reason,
-                                r.source_cycle = $source_cycle,
-                                r.source_type = $source_type,
-                                r.created_at = $now, r.active = true,
-                                r.weight = $confidence, r.valid_from = $valid_from
-                            """
-                            session.run(inverse, **params)
-                    elif summary.counters.properties_set > 0:
-                        written += 1
-                except Exception as e:
-                    logger.warning("Relationship write failed %s->%s: %s",
-                                   rel.get("source"), rel.get("target"), e)
-        return written
-
-    def query_nodes(self, node_type=None, project_id="default", limit=100):
-        results = []
-        with self._driver.session() as session:
-            if node_type and node_type in NODE_TYPES:
-                cypher = f"""
-                MATCH (n:{node_type} {{project_id: $pid}})
-                RETURN n.name AS name, n.summary AS summary,
-                       labels(n)[0] AS type, n.created_at AS created
-                ORDER BY n.updated_at DESC LIMIT $limit
-                """
-            else:
-                cypher = """
-                MATCH (n {project_id: $pid})
-                RETURN n.name AS name, n.summary AS summary,
-                       labels(n)[0] AS type, n.created_at AS created
-                ORDER BY n.updated_at DESC LIMIT $limit
-                """
-            records = session.run(cypher, pid=project_id, limit=limit)
-            for rec in records:
-                results.append({
-                    "name": rec["name"],
-                    "summary": rec["summary"],
-                    "type": rec["type"],
-                    "created": rec["created"],
-                })
-        return results
-
-    def traverse(self, entity_name, project_id="default", max_depth=2):
-        nodes = {}
-        edges = []
-        with self._driver.session() as session:
-            cypher = """
-            MATCH path = (start {name: $name, project_id: $pid})-[*1..""" + str(max_depth) + """]->(end)
-            WHERE end.project_id = $pid
-            RETURN path
-            LIMIT 100
-            """
-            records = session.run(cypher, name=entity_name, pid=project_id)
-            for rec in records:
-                path = rec["path"]
-                for node in path.nodes:
-                    nid = node.element_id
-                    if nid not in nodes:
-                        nodes[nid] = {
-                            "name": node.get("name", ""),
-                            "type": list(node.labels)[0] if node.labels else "Unknown",
-                            "summary": node.get("summary", ""),
-                        }
-                for rel in path.relationships:
-                    edges.append({
-                        "source": rel.start_node.get("name", ""),
-                        "target": rel.end_node.get("name", ""),
-                        "type": rel.type,
-                        "confidence": rel.get("confidence", 0),
-                    })
-        return {"nodes": list(nodes.values()), "edges": edges}
-
-    def get_beliefs(self, project_id="default", status="active"):
-        beliefs = []
-        with self._driver.session() as session:
-            if status == "uncertain":
-                cypher = """
-                MATCH (b:Belief {project_id: $pid})
-                WHERE b.active = true AND b.confidence < 0.5
-                RETURN b.name AS name, b.summary AS summary,
-                       b.confidence AS confidence, b.source_cycle AS cycle
-                ORDER BY b.confidence ASC
-                """
-            elif status == "contradicted":
-                cypher = """
-                MATCH (b1:Belief {project_id: $pid})-[:CONTRADICTS]-(b2:Belief {project_id: $pid})
-                WHERE b1.active = true AND b2.active = true
-                RETURN DISTINCT b1.name AS name, b1.summary AS summary,
-                       b1.confidence AS confidence, b1.source_cycle AS cycle
-                """
-            elif status == "superseded":
-                cypher = """
-                MATCH (b:Belief {project_id: $pid})
-                WHERE b.status = 'superseded'
-                RETURN b.name AS name, b.summary AS summary,
-                       b.confidence AS confidence, b.source_cycle AS cycle
-                ORDER BY b.updated_at DESC LIMIT 20
-                """
-            else:  # active
-                cypher = """
-                MATCH (b:Belief {project_id: $pid})
-                WHERE b.active = true
-                RETURN b.name AS name, b.summary AS summary,
-                       b.confidence AS confidence, b.source_cycle AS cycle
-                ORDER BY b.confidence DESC
-                """
-            records = session.run(cypher, pid=project_id)
-            for rec in records:
-                beliefs.append({
-                    "name": rec["name"],
-                    "summary": rec["summary"],
-                    "confidence": rec["confidence"],
-                    "cycle": rec["cycle"],
-                })
-        return beliefs
-
-    def get_stats(self, project_id="default"):
-        stats = {"nodes": {}, "edges": {}, "total_nodes": 0, "total_edges": 0}
-        with self._driver.session() as session:
-            for nt in NODE_TYPES:
-                result = session.run(
-                    f"MATCH (n:{nt} {{project_id: $pid}}) RETURN count(n) AS c",
-                    pid=project_id,
-                )
-                count = result.single()["c"]
-                if count > 0:
-                    stats["nodes"][nt] = count
-                    stats["total_nodes"] += count
-            for rt in RELATIONSHIP_TYPES:
-                result = session.run(
-                    f"""MATCH (a {{project_id: $pid}})-[r:{rt}]->(b {{project_id: $pid}})
-                    RETURN count(r) AS c""",
-                    pid=project_id,
-                )
-                count = result.single()["c"]
-                if count > 0:
-                    stats["edges"][rt] = count
-                    stats["total_edges"] += count
-        return stats
-
-    def delete_project_data(self, project_id):
-        if project_id == "default":
-            raise ValueError("Cannot delete the VSG's own knowledge project")
-        counts = {"nodes_deleted": 0, "relationships_deleted": 0}
-        with self._driver.session() as session:
-            result = session.run(
-                "MATCH (n {project_id: $pid}) DETACH DELETE n RETURN count(n) AS c",
-                pid=project_id,
-            )
-            counts["nodes_deleted"] = result.single()["c"]
-        return counts
-
-    # --- Vector Operations ---
+    # --- Vector Operations (Pinecone-specific) ---
 
     def vector_search(self, query_text, top_k=5, project_id="default",
                       namespace=None):
@@ -939,11 +668,9 @@ class Neo4jPineconeAdapter(BackendAdapter):
             return []
         ns = namespace or "knowledge"
         try:
-            # Embed query
             embedding = self._embed_text(query_text)
             if not embedding:
                 return []
-            # Search
             headers = {
                 "Api-Key": self._pinecone_api_key,
                 "Content-Type": "application/json",
@@ -1037,16 +764,20 @@ class Neo4jPineconeAdapter(BackendAdapter):
 
 # --- Factory ---
 
-def create_adapter(backend_type="neo4j_pinecone", **kwargs) -> BackendAdapter:
+def create_adapter(backend_type=None, **kwargs) -> BackendAdapter:
     """Factory function to create the appropriate backend adapter.
 
     Args:
-        backend_type: One of "neo4j_pinecone" (default), or future backends.
+        backend_type: One of "neo4j_pinecone", "neo4j_qdrant".
+            If None, auto-detects from MERKRAUM_BACKEND env var,
+            defaulting to "neo4j_pinecone".
         **kwargs: Backend-specific configuration.
 
     Returns:
         BackendAdapter instance (not yet connected — call .connect()).
     """
+    if backend_type is None:
+        backend_type = os.environ.get("MERKRAUM_BACKEND", "neo4j_pinecone")
     if backend_type == "neo4j_pinecone":
         return Neo4jPineconeAdapter(**kwargs)
     if backend_type == "neo4j_qdrant":
@@ -1120,10 +851,17 @@ if __name__ == "__main__":
                 print("  Neo4j: connected")
             else:
                 print("  Neo4j: FAILED")
-            if adapter._pinecone_host:
-                print(f"  Pinecone: {adapter._pinecone_host}")
-            else:
-                print("  Pinecone: NOT RESOLVED")
+            adapter_type = type(adapter).__name__
+            if adapter_type == "Neo4jPineconeAdapter":
+                if adapter._pinecone_host:
+                    print(f"  Pinecone: {adapter._pinecone_host}")
+                else:
+                    print("  Pinecone: NOT RESOLVED")
+            elif adapter_type == "Neo4jQdrantAdapter":
+                if adapter._qdrant:
+                    print("  Qdrant: connected")
+                else:
+                    print("  Qdrant: NOT CONNECTED")
 
         elif args.command == "stats":
             stats = adapter.get_stats()
