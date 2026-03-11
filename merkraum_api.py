@@ -9,12 +9,16 @@ v1.0 — SUP-94
 """
 
 import argparse
+import json
 import logging
+import os
 import sys
+import urllib.request
+import urllib.error
 
 from flask import Flask, jsonify, request
 
-from merkraum_backend import create_adapter
+from merkraum_backend import create_adapter, NODE_TYPES, RELATIONSHIP_TYPES
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -160,6 +164,113 @@ def _map_edge_for_graph(e: dict) -> dict:
         "type": e.get("type", ""),
         "reason": e.get("reason", ""),
     }
+
+
+# ---------------------------------------------------------------------------
+# LLM-based text extraction
+# ---------------------------------------------------------------------------
+
+_NODE_TYPES_LIST = ", ".join(NODE_TYPES)
+_REL_TYPES_LIST = ", ".join(RELATIONSHIP_TYPES)
+
+EXTRACTION_SYSTEM_PROMPT = f"""You are a knowledge extraction engine for Merkraum, a knowledge graph tool.
+
+Your task: Extract structured entities and relationships from the given text.
+Use ONLY the following fixed vocabulary.
+
+## NODE TYPES (use exactly these labels):
+{chr(10).join(f"- {t}" for t in NODE_TYPES)}
+
+## RELATIONSHIP TYPES (use exactly these labels):
+{chr(10).join(f"- {t}" for t in RELATIONSHIP_TYPES)}
+
+## RULES:
+1. Each entity must be ATOMIC: one concept per node. Do NOT merge multiple concepts.
+2. Each Belief must be a SINGLE falsifiable proposition, max 200 characters.
+3. Set confidence for Beliefs: 0.9 = directly stated as fact, 0.7 = inferred, 0.5 = speculative.
+4. Prefer canonical entity names. Use full names for people.
+5. Extract AT MOST 15 entities and 20 relationships per text passage.
+6. If the text contains no extractable knowledge, return empty arrays.
+7. Do NOT invent relationships not stated or clearly implied in the text.
+
+## OUTPUT FORMAT:
+Return a JSON object with two arrays: "entities" and "relationships".
+
+{{
+  "entities": [
+    {{
+      "name": "canonical name",
+      "node_type": "one of the node types above",
+      "summary": "one-paragraph description, max 500 chars",
+      "confidence": 0.9
+    }}
+  ],
+  "relationships": [
+    {{
+      "source": "entity name",
+      "target": "entity name",
+      "type": "one of the relationship types above",
+      "confidence": 0.8,
+      "reason": "brief explanation, max 200 chars"
+    }}
+  ]
+}}
+
+Return ONLY valid JSON. No explanation, no markdown fences."""
+
+
+def _get_openai_key() -> str | None:
+    """Get OpenAI API key from environment."""
+    return os.environ.get("OPENAI_API_KEY") or _load_env_value("OPENAI_API_KEY")
+
+
+def _load_env_value(key: str) -> str | None:
+    """Load a single value from .env file."""
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if not os.path.exists(env_path):
+        return None
+    with open(env_path) as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith(f"{key}="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return None
+
+
+def _llm_extract(text: str, api_key: str, model: str = "gpt-4o-mini") -> dict:
+    """Call OpenAI to extract entities and relationships from text."""
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": model,
+        "response_format": {"type": "json_object"},
+        "temperature": 0.3,
+        "max_completion_tokens": 8000,
+        "messages": [
+            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Extract entities and relationships from the following text:\n\n{text[:8000]}"},
+        ],
+    }
+    body = json.dumps(payload).encode()
+    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read())
+        content = data["choices"][0]["message"].get("content", "")
+        if not content:
+            return {"entities": [], "relationships": []}
+        result = json.loads(content)
+        # Validate structure
+        entities = result.get("entities", [])
+        relationships = result.get("relationships", [])
+        # Filter to valid types
+        valid_node_types = set(NODE_TYPES)
+        valid_rel_types = set(RELATIONSHIP_TYPES)
+        entities = [e for e in entities if e.get("node_type") in valid_node_types]
+        relationships = [r for r in relationships if r.get("type") in valid_rel_types]
+        return {"entities": entities, "relationships": relationships}
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +508,111 @@ def search():
     except Exception as exc:
         logger.exception("search failed for q=%s project=%s", query, project)
         return _error(str(exc))
+
+
+@app.route("/api/ingest/text", methods=["POST"])
+def ingest_text():
+    """Extract entities and relationships from raw text via LLM, then ingest.
+
+    This is the core merkraum pipeline: text -> extraction -> knowledge graph.
+
+    JSON body:
+        {
+            "text": "raw text to extract knowledge from (required, max 8000 chars)",
+            "project": "project_id (default: 'default')",
+            "source": "provenance label (default: 'text_ingestion')"
+        }
+
+    Returns extracted entities and relationships, plus ingestion counts.
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+
+    body = request.get_json(silent=True)
+    if not body:
+        return _error("Request body must be JSON", 400)
+
+    text = (body.get("text") or "").strip()
+    if not text:
+        return _error("'text' field is required and must be non-empty", 400)
+    if len(text) > 16000:
+        return _error("Text too long (max 16000 characters)", 400)
+
+    project = body.get("project") or "default"
+    source = body.get("source") or "text_ingestion"
+
+    api_key = _get_openai_key()
+    if not api_key:
+        return _error(
+            "OPENAI_API_KEY not configured. Set it in .env or environment.",
+            503,
+        )
+
+    # Step 1: LLM extraction
+    try:
+        extracted = _llm_extract(text, api_key)
+    except urllib.error.HTTPError as exc:
+        logger.exception("LLM extraction HTTP error")
+        return _error(f"LLM extraction failed: HTTP {exc.code}", 502)
+    except Exception as exc:
+        logger.exception("LLM extraction failed")
+        return _error(f"LLM extraction failed: {exc}", 502)
+
+    entities = extracted.get("entities", [])
+    relationships = extracted.get("relationships", [])
+
+    if not entities and not relationships:
+        return jsonify({
+            "extracted": {"entities": [], "relationships": []},
+            "ingested": {"entities_written": 0, "relationships_written": 0},
+            "project": project,
+            "message": "No extractable knowledge found in the text.",
+        })
+
+    # Step 2: Ingest into graph
+    try:
+        entities_written = 0
+        relationships_written = 0
+
+        if entities:
+            entities_written = adapter.write_entities(
+                entities,
+                source_cycle=source,
+                source_type="text_extraction",
+                project_id=project,
+            )
+
+        if relationships:
+            relationships_written = adapter.write_relationships(
+                relationships,
+                source_cycle=source,
+                source_type="text_extraction",
+                project_id=project,
+            )
+
+        return jsonify({
+            "extracted": {
+                "entities": entities,
+                "relationships": relationships,
+            },
+            "ingested": {
+                "entities_written": entities_written,
+                "relationships_written": relationships_written,
+            },
+            "project": project,
+        })
+    except Exception as exc:
+        logger.exception("Ingestion failed after extraction for project=%s", project)
+        # Return extraction results even if ingestion fails
+        return jsonify({
+            "extracted": {
+                "entities": entities,
+                "relationships": relationships,
+            },
+            "ingested": {"entities_written": 0, "relationships_written": 0},
+            "project": project,
+            "error": f"Extraction succeeded but ingestion failed: {exc}",
+        }), 207  # Multi-Status: partial success
 
 
 # ---------------------------------------------------------------------------
