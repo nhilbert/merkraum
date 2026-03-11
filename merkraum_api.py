@@ -19,17 +19,19 @@ v1.2 — SUP-96 (2026-03-11): Made authentication configurable via AUTH_REQUIRED
 """
 
 import argparse
+import importlib
 import json
 import logging
 import os
 import sys
 import urllib.request
 import urllib.error
+from typing import cast
 
 from flask import Flask, jsonify, request
 
 from merkraum_backend import (
-    create_adapter, NODE_TYPES, RELATIONSHIP_TYPES,
+    create_adapter, NODE_TYPES, RELATIONSHIP_TYPES, Neo4jBaseAdapter,
     NodeLimitExceeded, TIER_LIMITS,
 )
 from jwt_auth import get_cognito_validator, require_auth, optional_auth
@@ -47,7 +49,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # Global adapter instance — created once at startup.
-adapter = None
+adapter: Neo4jBaseAdapter | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +96,14 @@ def handle_preflight(path=""):
 def _project_id() -> str:
     """Extract project_id from query params, defaulting to 'default'."""
     return request.args.get("project", "default") or "default"
+
+
+def _actor() -> str:
+    return (
+        getattr(request, "username", None)
+        or getattr(request, "user_id", None)
+        or "api"
+    )
 
 
 def _error(message: str, status: int = 500):
@@ -315,7 +325,7 @@ def _llm_extract(text: str, api_key: str, model: str = "gpt-4o-mini") -> dict:
 @require_auth
 def health():
     """Health check — returns adapter connectivity status.
-    
+
     Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
     """
     if adapter is None:
@@ -339,10 +349,11 @@ def projects():
     Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
     Returns a sorted list of project_id strings.
     """
-    if adapter is None:
+    adp = adapter
+    if adp is None:
         return _error("Adapter not initialized", 503)
     try:
-        with adapter._driver.session() as session:
+        with adp._driver.session() as session:
             records = session.run(
                 "MATCH (n) WHERE n.project_id IS NOT NULL "
                 "RETURN DISTINCT n.project_id AS pid ORDER BY pid"
@@ -358,7 +369,7 @@ def projects():
 @require_auth
 def stats():
     """Graph stats in frontend format: {entities, relationships, beliefs, contradictions}.
-    
+
     Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
     """
     if adapter is None:
@@ -779,7 +790,7 @@ def add_relationship_api():
     reason = (body.get("reason") or "").strip()
     confidence = body.get("confidence", 0.7)
     project = body.get("project") or "default"
-    actor = request.username or request.user_id or "api"
+    actor = _actor()
 
     result = adapter.add_relationship(
         source=source,
@@ -813,7 +824,7 @@ def delete_relationship_api():
         return _error("'source', 'target', and 'type' are required", 400)
 
     project = body.get("project") or "default"
-    actor = request.username or request.user_id or "api"
+    actor = _actor()
     result = adapter.delete_relationship(
         source=source,
         target=target,
@@ -841,7 +852,7 @@ def delete_node_api():
         return _error("'name' is required", 400)
 
     project = body.get("project") or "default"
-    actor = request.username or request.user_id or "api"
+    actor = _actor()
     result = adapter.delete_node(name=name, project_id=project, node_type=node_type, actor=actor)
     status = 200 if result.get("ok") else 400
     return jsonify(result), status
@@ -866,7 +877,7 @@ def update_node_api():
     if not isinstance(updates, dict):
         return _error("'updates' must be an object", 400)
 
-    actor = request.username or request.user_id or "api"
+    actor = _actor()
     result = adapter.update_node(
         name=name,
         project_id=project,
@@ -897,7 +908,7 @@ def merge_nodes_api():
         return _error("'keep_name' and 'remove_name' are required", 400)
 
     project = body.get("project") or "default"
-    actor = request.username or request.user_id or "api"
+    actor = _actor()
     result = adapter.merge_nodes(
         keep_name=keep_name,
         remove_name=remove_name,
@@ -923,7 +934,7 @@ def _load_secrets():
     Falls back silently to existing env vars / .env for local development.
     """
     try:
-        import boto3
+        boto3 = importlib.import_module("boto3")
         client = boto3.client("secretsmanager", region_name="eu-central-1")
         resp = client.get_secret_value(SecretId="merkraum/config")
         secrets = json.loads(resp["SecretString"])
@@ -938,7 +949,7 @@ def _init_adapter():
     """Create and connect the adapter. Called once at startup."""
     global adapter
     try:
-        adapter = create_adapter()
+        adapter = cast(Neo4jBaseAdapter, create_adapter())
         adapter.connect()
         logger.info("Adapter connected: %s", type(adapter).__name__)
     except Exception as exc:
@@ -951,7 +962,7 @@ def _init_cognito_auth():
     """Initialize Cognito JWT validation. Called once at startup."""
     validator = get_cognito_validator()
     if validator:
-        app._cognito_validator = validator
+        setattr(app, "_cognito_validator", validator)
         logger.info(
             "Cognito JWT validator initialized for pool: %s (region: %s)",
             validator.user_pool_id,

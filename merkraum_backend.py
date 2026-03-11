@@ -152,11 +152,13 @@ class BackendAdapter(ABC):
     def update_node(self, name: str, project_id: str = "default",
                     updates: Optional[dict] = None,
                     new_name: Optional[str] = None,
+                    node_type: Optional[str] = None,
                     actor: str = "api") -> dict:
         """Update a node and keep history/audit metadata."""
 
     @abstractmethod
     def delete_node(self, name: str, project_id: str = "default",
+                    node_type: Optional[str] = None,
                     actor: str = "api") -> dict:
         """Delete a node and its relationships with history/audit metadata."""
 
@@ -165,12 +167,16 @@ class BackendAdapter(ABC):
                          project_id: str = "default",
                          reason: str = "",
                          confidence: float = 0.7,
+                         source_type: Optional[str] = None,
+                         target_type: Optional[str] = None,
                          actor: str = "api") -> dict:
         """Create or update a relationship between two existing nodes."""
 
     @abstractmethod
     def delete_relationship(self, source: str, target: str, rel_type: str,
                             project_id: str = "default",
+                            source_type: Optional[str] = None,
+                            target_type: Optional[str] = None,
                             actor: str = "api") -> dict:
         """Delete a relationship between two nodes."""
 
