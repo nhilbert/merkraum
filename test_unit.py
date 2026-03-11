@@ -863,6 +863,15 @@ class TestGraphMutationOperations(unittest.TestCase):
         self.tx.run.return_value = mock_result
         result = self.adapter.delete_node("Missing", project_id="p")
         self.assertFalse(result["ok"])
+        self.assertIn("not found", result.get("error", "").lower())
+
+    def test_delete_node_uses_requested_type_label(self):
+        mock_result = MagicMock()
+        mock_result.single.return_value = None
+        self.tx.run.return_value = mock_result
+        self.adapter.delete_node("Missing", project_id="p", node_type="Belief")
+        cypher = self.tx.run.call_args[0][0]
+        self.assertIn("(n:Belief", cypher)
 
     def test_update_node_not_found(self):
         mock_result = MagicMock()
@@ -870,6 +879,14 @@ class TestGraphMutationOperations(unittest.TestCase):
         self.tx.run.return_value = mock_result
         result = self.adapter.update_node("Missing", project_id="p", updates={"summary": "x"})
         self.assertFalse(result["ok"])
+
+    def test_update_node_uses_requested_type_label(self):
+        mock_result = MagicMock()
+        mock_result.single.return_value = None
+        self.tx.run.return_value = mock_result
+        self.adapter.update_node("Missing", project_id="p", updates={"summary": "x"}, node_type="Belief")
+        cypher = self.tx.run.call_args[0][0]
+        self.assertIn("(n:Belief", cypher)
 
     def test_merge_nodes_same_name_rejected(self):
         result = self.adapter.merge_nodes("A", "A", project_id="p")

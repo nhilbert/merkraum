@@ -107,6 +107,8 @@ def _get_all_edges(adp, project_id: str, limit: int = 1000) -> list:
         records = session.run(
             """
             MATCH (a {project_id: $pid})-[r]->(b {project_id: $pid})
+            WHERE any(lbl IN labels(a) WHERE lbl IN $node_types)
+              AND any(lbl IN labels(b) WHERE lbl IN $node_types)
             RETURN a.name AS source_name, b.name AS target_name,
                    labels(a)[0] AS source_type, labels(b)[0] AS target_type,
                    a.node_id AS source_node_id, b.node_id AS target_node_id,
@@ -115,6 +117,7 @@ def _get_all_edges(adp, project_id: str, limit: int = 1000) -> list:
             """,
             pid=project_id,
             limit=limit,
+            node_types=list(NODE_TYPES),
         )
         for rec in records:
             edges.append(
@@ -167,7 +170,7 @@ def _map_belief(b: dict) -> dict:
 def _map_node_for_graph(n: dict) -> dict:
     """Map a query_nodes result to the frontend graph node format."""
     node_type = n.get("type", "Concept")
-    node_name = n.get("name", "")
+    node_name = n.get("name") or ""
     node_id = n.get("node_id") or f"{node_type}:{node_name}"
     return {
         "id": node_id,

@@ -332,9 +332,11 @@ class Neo4jBaseAdapter(BackendAdapter):
                 """
                 MATCH (n {project_id: $pid})
                 WHERE n.node_id IS NULL
+                  AND any(lbl IN labels(n) WHERE lbl IN $node_types)
                 RETURN n.name AS name, labels(n)[0] AS node_type
                 """,
                 pid=project_id,
+                node_types=list(NODE_TYPES),
             )
             for rec in records:
                 name = rec.get("name") or ""
@@ -495,12 +497,16 @@ class Neo4jBaseAdapter(BackendAdapter):
             else:
                 cypher = """
                 MATCH (n {project_id: $pid})
+                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
                 RETURN n.name AS name, n.summary AS summary,
                        labels(n)[0] AS type, n.created_at AS created,
                        n.node_id AS node_id, n.confidence AS confidence
                 ORDER BY n.updated_at DESC LIMIT $limit
                 """
-            records = session.run(cypher, pid=project_id, limit=limit)
+            params = {"pid": project_id, "limit": limit}
+            if not (node_type and node_type in NODE_TYPES):
+                params["node_types"] = list(NODE_TYPES)
+            records = session.run(cypher, **params)
             for rec in records:
                 results.append({
                     "name": rec["name"],
@@ -800,7 +806,7 @@ class Neo4jBaseAdapter(BackendAdapter):
         op_id = self._operation_id()
         vector_deleted = False
         before_state = None
-        node_type = "Concept"
+        node_type = node_type if node_type in NODE_TYPES else None
         with self._driver.session() as session:
             tx = session.begin_transaction()
             try:
@@ -812,12 +818,12 @@ class Neo4jBaseAdapter(BackendAdapter):
                     OPTIONAL MATCH (n)-[r]-(m {{project_id: $pid}})
                     RETURN labels(n)[0] AS node_type,
                            properties(n) AS node_props,
-                           collect(CASE WHEN r IS NULL THEN NULL ELSE {
+                           collect(CASE WHEN r IS NULL THEN NULL ELSE {{
                                source: startNode(r).name,
                                target: endNode(r).name,
                                type: type(r),
                                props: properties(r)
-                           } END) AS rels
+                           }} END) AS rels
                     """,
                     name=name,
                     pid=project_id,
@@ -855,13 +861,14 @@ class Neo4jBaseAdapter(BackendAdapter):
                 tx.rollback()
                 if vector_deleted and before_state:
                     node_props = before_state.get("node", {})
+                    old_type = before_state.get("node_type", node_type)
                     self.vector_upsert(
                         self._vector_id_for_node(project_id, name, node_type=old_type,
-                                                 node_id=old_node.get("node_id")),
+                                                 node_id=node_props.get("node_id")),
                         self._vector_text_for_node(name, node_props.get("summary", "")),
                         {
                             "name": name,
-                            "node_type": node_type,
+                            "node_type": old_type,
                             "source": "api_rollback",
                         },
                         project_id=project_id,
@@ -876,7 +883,7 @@ class Neo4jBaseAdapter(BackendAdapter):
         op_id = self._operation_id()
         before_state = None
         after_name = name
-        node_type = "Concept"
+        node_type = node_type if node_type in NODE_TYPES else None
         vector_upserted = False
         old_vector_deleted = False
         with self._driver.session() as session:
