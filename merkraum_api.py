@@ -23,7 +23,6 @@ import importlib
 import json
 import logging
 import os
-import sys
 import urllib.request
 import urllib.error
 from functools import lru_cache
@@ -35,7 +34,7 @@ from merkraum_backend import (
     create_adapter, NODE_TYPES, RELATIONSHIP_TYPES, Neo4jBaseAdapter,
     NodeLimitExceeded, TIER_LIMITS,
 )
-from jwt_auth import get_cognito_validator, require_auth, optional_auth
+from jwt_auth import get_cognito_validator, require_auth
 
 # ---------------------------------------------------------------------------
 # App setup

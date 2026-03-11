@@ -18,7 +18,6 @@ from datetime import datetime, timezone
 import jwt
 import requests
 from flask import request, jsonify, current_app
-from jwt import PyJWTError
 
 logger = logging.getLogger(__name__)
 

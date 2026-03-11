@@ -19,7 +19,6 @@ v2.0 — (2026-03-11). Added Cognito OAuth for MCP client authentication.
 """
 
 import os
-import sys
 import json
 import time
 import uuid
@@ -32,10 +31,10 @@ import asyncio
 import argparse
 from functools import partial
 from typing import Optional
+from urllib.parse import urlencode
 
-# Ensure project root is on path
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, SCRIPT_DIR)
+from starlette.requests import Request
+from starlette.responses import JSONResponse, RedirectResponse, Response
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
@@ -225,10 +224,6 @@ mcp = FastMCP(
 
 
 # --- OAuth Discovery + Proxy Endpoints ---
-
-from starlette.requests import Request
-from starlette.responses import JSONResponse, RedirectResponse, Response
-from urllib.parse import urlencode
 
 
 @mcp.custom_route("/.well-known/oauth-authorization-server", methods=["GET"])

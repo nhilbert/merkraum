@@ -11,7 +11,7 @@ Z1337 — SUP-93 further work: adapter unit tests.
 
 import os
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 from merkraum_backend import (
     BackendAdapter,
