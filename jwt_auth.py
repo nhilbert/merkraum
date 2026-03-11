@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 
 import jwt
 import requests
-from flask import request, jsonify
+from flask import request, jsonify, current_app
 from jwt import PyJWTError
 
 logger = logging.getLogger(__name__)
@@ -216,7 +216,7 @@ def require_auth(f):
             return f(*args, **kwargs)
 
         # Get validator from app config
-        validator = getattr(request.app, "_cognito_validator", None)
+        validator = getattr(current_app, "_cognito_validator", None)
 
         if not validator:
             logger.warning("Cognito validator not configured, but AUTH_REQUIRED=true. Rejecting request.")
@@ -294,7 +294,7 @@ def optional_auth(f):
         request.username = None
         request.groups = []
 
-        validator = getattr(request.app, "_cognito_validator", None)
+        validator = getattr(current_app, "_cognito_validator", None)
         if not validator:
             return f(*args, **kwargs)
 
