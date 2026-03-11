@@ -1,0 +1,515 @@
+#!/usr/bin/env python3
+"""
+Unit tests for Merkraum BackendAdapter hierarchy.
+
+Tests the factory function, shared Neo4jBaseAdapter graph operations,
+and adapter-specific vector/connection behavior — all with mocked backends.
+No live Neo4j, Qdrant, or Pinecone required.
+
+Z1337 — SUP-93 further work: adapter unit tests.
+"""
+
+import os
+import unittest
+from unittest.mock import MagicMock, patch, PropertyMock
+
+from merkraum_backend import (
+    BackendAdapter,
+    Neo4jBaseAdapter,
+    Neo4jQdrantAdapter,
+    Neo4jPineconeAdapter,
+    create_adapter,
+    _string_to_uuid,
+    NODE_TYPES,
+    RELATIONSHIP_TYPES,
+    SYMMETRIC_TYPES,
+)
+
+
+# --- Factory tests ---
+
+class TestCreateAdapter(unittest.TestCase):
+    """Test create_adapter factory function."""
+
+    def test_explicit_neo4j_pinecone(self):
+        adapter = create_adapter("neo4j_pinecone")
+        self.assertIsInstance(adapter, Neo4jPineconeAdapter)
+
+    def test_explicit_neo4j_qdrant(self):
+        adapter = create_adapter("neo4j_qdrant")
+        self.assertIsInstance(adapter, Neo4jQdrantAdapter)
+
+    def test_invalid_backend_type(self):
+        with self.assertRaises(ValueError) as ctx:
+            create_adapter("mysql_redis")
+        self.assertIn("Unknown backend type", str(ctx.exception))
+
+    @patch.dict(os.environ, {"MERKRAUM_BACKEND": "neo4j_qdrant"})
+    def test_env_var_auto_detection(self):
+        adapter = create_adapter()
+        self.assertIsInstance(adapter, Neo4jQdrantAdapter)
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_default_is_neo4j_pinecone(self):
+        # Remove MERKRAUM_BACKEND if present
+        os.environ.pop("MERKRAUM_BACKEND", None)
+        adapter = create_adapter()
+        self.assertIsInstance(adapter, Neo4jPineconeAdapter)
+
+    def test_kwargs_forwarded_to_pinecone(self):
+        adapter = create_adapter("neo4j_pinecone",
+                                 neo4j_uri="bolt://test:7687",
+                                 pinecone_api_key="test-key")
+        self.assertEqual(adapter._neo4j_uri, "bolt://test:7687")
+        self.assertEqual(adapter._pinecone_api_key, "test-key")
+
+    def test_kwargs_forwarded_to_qdrant(self):
+        adapter = create_adapter("neo4j_qdrant",
+                                 neo4j_uri="bolt://test:7687",
+                                 qdrant_url="http://test:6333")
+        self.assertEqual(adapter._neo4j_uri, "bolt://test:7687")
+        self.assertEqual(adapter._qdrant_url, "http://test:6333")
+
+
+# --- Schema constants tests ---
+
+class TestSchemaConstants(unittest.TestCase):
+    """Verify schema constants are consistent."""
+
+    def test_node_types_non_empty(self):
+        self.assertGreater(len(NODE_TYPES), 0)
+
+    def test_relationship_types_non_empty(self):
+        self.assertGreater(len(RELATIONSHIP_TYPES), 0)
+
+    def test_symmetric_types_subset_of_relationship_types(self):
+        for st in SYMMETRIC_TYPES:
+            self.assertIn(st, RELATIONSHIP_TYPES,
+                          f"Symmetric type '{st}' not in RELATIONSHIP_TYPES")
+
+    def test_expected_node_types(self):
+        for expected in ["Belief", "Person", "Concept", "Organization"]:
+            self.assertIn(expected, NODE_TYPES)
+
+    def test_expected_relationship_types(self):
+        for expected in ["SUPPORTS", "CONTRADICTS", "SUPERSEDES"]:
+            self.assertIn(expected, RELATIONSHIP_TYPES)
+
+
+# --- Utility tests ---
+
+class TestStringToUuid(unittest.TestCase):
+
+    def test_deterministic(self):
+        a = _string_to_uuid("test-vector-id")
+        b = _string_to_uuid("test-vector-id")
+        self.assertEqual(a, b)
+
+    def test_different_inputs_different_uuids(self):
+        a = _string_to_uuid("alpha")
+        b = _string_to_uuid("beta")
+        self.assertNotEqual(a, b)
+
+    def test_valid_uuid_format(self):
+        import uuid
+        result = _string_to_uuid("my-id")
+        uuid.UUID(result)  # Should not raise
+
+
+# --- Neo4jBaseAdapter shared graph operations ---
+
+def _make_mock_adapter():
+    """Create a Neo4jQdrantAdapter with mocked Neo4j driver (no connect())."""
+    adapter = Neo4jQdrantAdapter.__new__(Neo4jQdrantAdapter)
+    adapter._driver = MagicMock()
+    adapter._qdrant = None
+    adapter._embedder = None
+    adapter._neo4j_uri = "bolt://mock:7687"
+    adapter._neo4j_user = "neo4j"
+    adapter._neo4j_password = "test"
+    adapter._qdrant_url = "http://mock:6333"
+    adapter._qdrant_api_key = None
+    adapter._embed_model_name = "BAAI/bge-small-en-v1.5"
+    return adapter
+
+
+class TestWriteEntities(unittest.TestCase):
+    """Test Neo4jBaseAdapter.write_entities via a concrete subclass."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_write_valid_entity(self):
+        entities = [{"name": "TestConcept", "node_type": "Concept", "summary": "A test"}]
+        count = self.adapter.write_entities(entities, "Z1337", project_id="test")
+        self.assertEqual(count, 1)
+        self.session.run.assert_called_once()
+
+    def test_skip_invalid_node_type(self):
+        entities = [{"name": "Bad", "node_type": "InvalidType"}]
+        count = self.adapter.write_entities(entities, "Z1337", project_id="test")
+        self.assertEqual(count, 0)
+        self.session.run.assert_not_called()
+
+    def test_default_node_type_is_concept(self):
+        entities = [{"name": "NoType"}]  # No node_type field
+        count = self.adapter.write_entities(entities, "Z1337", project_id="test")
+        self.assertEqual(count, 1)
+        # Verify the Cypher was for Concept (default)
+        call_args = self.session.run.call_args
+        self.assertIn("Concept", call_args[0][0])
+
+    def test_belief_entity_uses_confidence(self):
+        entities = [{"name": "TestBelief", "node_type": "Belief",
+                     "confidence": 0.9, "summary": "High confidence"}]
+        count = self.adapter.write_entities(entities, "Z1337", project_id="test")
+        self.assertEqual(count, 1)
+        call_args = self.session.run.call_args
+        self.assertIn("Belief", call_args[0][0])
+        self.assertIn("confidence", call_args[0][0])
+
+    def test_belief_default_confidence(self):
+        entities = [{"name": "LowConf", "node_type": "Belief"}]
+        count = self.adapter.write_entities(entities, "Z1337", project_id="test")
+        self.assertEqual(count, 1)
+        # Default confidence is 0.7
+        call_kwargs = self.session.run.call_args[1]
+        self.assertEqual(call_kwargs["confidence"], 0.7)
+
+    def test_multiple_entities(self):
+        entities = [
+            {"name": "A", "node_type": "Person"},
+            {"name": "B", "node_type": "Organization"},
+            {"name": "C", "node_type": "InvalidType"},  # Skipped
+            {"name": "D", "node_type": "Event"},
+        ]
+        count = self.adapter.write_entities(entities, "Z1337", project_id="test")
+        self.assertEqual(count, 3)  # A, B, D written; C skipped
+
+    def test_entity_write_error_continues(self):
+        """If one entity fails, others should still be written."""
+        self.session.run.side_effect = [Exception("DB error"), None]
+        entities = [
+            {"name": "Fail", "node_type": "Concept"},
+            {"name": "Succeed", "node_type": "Concept"},
+        ]
+        count = self.adapter.write_entities(entities, "Z1337", project_id="test")
+        self.assertEqual(count, 1)  # Only second succeeds
+
+    def test_project_id_passed_through(self):
+        entities = [{"name": "X", "node_type": "Concept"}]
+        self.adapter.write_entities(entities, "Z1337", project_id="my_project")
+        call_kwargs = self.session.run.call_args[1]
+        self.assertEqual(call_kwargs["project_id"], "my_project")
+
+
+class TestWriteRelationships(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        # Default: simulate a new relationship created
+        mock_summary = MagicMock()
+        mock_summary.counters.relationships_created = 1
+        mock_summary.counters.properties_set = 0
+        mock_result = MagicMock()
+        mock_result.consume.return_value = mock_summary
+        self.session.run.return_value = mock_result
+
+    def test_write_valid_relationship(self):
+        rels = [{"source": "A", "target": "B", "type": "SUPPORTS"}]
+        count = self.adapter.write_relationships(rels, "Z1337", project_id="test")
+        self.assertEqual(count, 1)
+
+    def test_skip_invalid_relationship_type(self):
+        rels = [{"source": "A", "target": "B", "type": "FAKE_REL"}]
+        count = self.adapter.write_relationships(rels, "Z1337", project_id="test")
+        self.assertEqual(count, 0)
+
+    def test_default_type_is_references(self):
+        rels = [{"source": "A", "target": "B"}]  # No type field
+        count = self.adapter.write_relationships(rels, "Z1337", project_id="test")
+        self.assertEqual(count, 1)
+        call_args = self.session.run.call_args_list[0]
+        self.assertIn("REFERENCES", call_args[0][0])
+
+    def test_symmetric_type_creates_inverse(self):
+        rels = [{"source": "A", "target": "B", "type": "CONTRADICTS"}]
+        self.adapter.write_relationships(rels, "Z1337", project_id="test")
+        # Should have 2 calls: forward + inverse
+        self.assertEqual(self.session.run.call_count, 2)
+
+    def test_non_symmetric_no_inverse(self):
+        rels = [{"source": "A", "target": "B", "type": "SUPPORTS"}]
+        self.adapter.write_relationships(rels, "Z1337", project_id="test")
+        # Only 1 call (forward) + consume
+        self.assertEqual(self.session.run.call_count, 1)
+
+    def test_update_existing_counts(self):
+        """When rel already exists (properties_set > 0, relationships_created = 0)."""
+        mock_summary = MagicMock()
+        mock_summary.counters.relationships_created = 0
+        mock_summary.counters.properties_set = 3
+        mock_result = MagicMock()
+        mock_result.consume.return_value = mock_summary
+        self.session.run.return_value = mock_result
+
+        rels = [{"source": "A", "target": "B", "type": "SUPPORTS"}]
+        count = self.adapter.write_relationships(rels, "Z1337", project_id="test")
+        self.assertEqual(count, 1)  # Updated counts as written
+
+    def test_relationship_error_continues(self):
+        self.session.run.side_effect = [Exception("DB error"), self.session.run.return_value]
+        rels = [
+            {"source": "A", "target": "B", "type": "SUPPORTS"},
+            {"source": "C", "target": "D", "type": "SUPPORTS"},
+        ]
+        count = self.adapter.write_relationships(rels, "Z1337", project_id="test")
+        self.assertEqual(count, 1)
+
+
+class TestQueryNodes(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_query_all_nodes(self):
+        self.session.run.return_value = [
+            {"name": "A", "summary": "desc", "type": "Concept", "created": "2026-01-01"},
+        ]
+        results = self.adapter.query_nodes(project_id="test")
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0]["name"], "A")
+
+    def test_query_filtered_by_type(self):
+        self.session.run.return_value = []
+        self.adapter.query_nodes(node_type="Belief", project_id="test")
+        call_args = self.session.run.call_args[0][0]
+        self.assertIn("Belief", call_args)
+
+    def test_invalid_type_uses_unfiltered_query(self):
+        self.session.run.return_value = []
+        self.adapter.query_nodes(node_type="FakeType", project_id="test")
+        call_args = self.session.run.call_args[0][0]
+        # Should NOT contain FakeType in the Cypher
+        self.assertNotIn("FakeType", call_args)
+
+
+class TestGetBeliefs(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        self.session.run.return_value = []
+
+    def test_active_status(self):
+        self.adapter.get_beliefs(project_id="test", status="active")
+        cypher = self.session.run.call_args[0][0]
+        self.assertIn("b.active = true", cypher)
+
+    def test_uncertain_status(self):
+        self.adapter.get_beliefs(project_id="test", status="uncertain")
+        cypher = self.session.run.call_args[0][0]
+        self.assertIn("confidence < 0.5", cypher)
+
+    def test_contradicted_status(self):
+        self.adapter.get_beliefs(project_id="test", status="contradicted")
+        cypher = self.session.run.call_args[0][0]
+        self.assertIn("CONTRADICTS", cypher)
+
+    def test_superseded_status(self):
+        self.adapter.get_beliefs(project_id="test", status="superseded")
+        cypher = self.session.run.call_args[0][0]
+        self.assertIn("superseded", cypher)
+
+
+class TestGetStats(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        # All counts return 0 by default
+        mock_result = MagicMock()
+        mock_result.single.return_value = {"c": 0}
+        self.session.run.return_value = mock_result
+
+    def test_stats_structure(self):
+        stats = self.adapter.get_stats(project_id="test")
+        self.assertIn("nodes", stats)
+        self.assertIn("edges", stats)
+        self.assertIn("total_nodes", stats)
+        self.assertIn("total_edges", stats)
+
+    def test_stats_queries_all_types(self):
+        self.adapter.get_stats(project_id="test")
+        # Should query each NODE_TYPE + each RELATIONSHIP_TYPE
+        expected_calls = len(NODE_TYPES) + len(RELATIONSHIP_TYPES)
+        self.assertEqual(self.session.run.call_count, expected_calls)
+
+
+class TestDeleteProjectData(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_cannot_delete_default(self):
+        with self.assertRaises(ValueError):
+            self.adapter.delete_project_data("default")
+
+    def test_delete_non_default(self):
+        mock_result = MagicMock()
+        mock_result.single.return_value = {"c": 5}
+        self.session.run.return_value = mock_result
+        counts = self.adapter.delete_project_data("test_project")
+        self.assertEqual(counts["nodes_deleted"], 5)
+
+
+# --- Adapter-specific tests ---
+
+class TestNeo4jQdrantAdapterInit(unittest.TestCase):
+
+    def test_default_qdrant_url(self):
+        adapter = Neo4jQdrantAdapter()
+        self.assertEqual(adapter._qdrant_url, "http://localhost:6333")
+
+    def test_custom_qdrant_url(self):
+        adapter = Neo4jQdrantAdapter(qdrant_url="http://custom:6333")
+        self.assertEqual(adapter._qdrant_url, "http://custom:6333")
+
+    def test_default_embed_model(self):
+        adapter = Neo4jQdrantAdapter()
+        self.assertEqual(adapter._embed_model_name, "BAAI/bge-small-en-v1.5")
+
+    def test_collection_name_default(self):
+        adapter = _make_mock_adapter()
+        self.assertEqual(adapter._get_collection_name("proj1"), "proj1")
+
+    def test_collection_name_with_namespace(self):
+        adapter = _make_mock_adapter()
+        self.assertEqual(adapter._get_collection_name("proj1", "beliefs"), "proj1_beliefs")
+
+    def test_is_healthy_both_down(self):
+        adapter = Neo4jQdrantAdapter()
+        adapter._driver = None
+        adapter._qdrant = None
+        self.assertFalse(adapter.is_healthy())
+
+    def test_vector_search_no_client_returns_empty(self):
+        adapter = _make_mock_adapter()
+        adapter._qdrant = None
+        result = adapter.vector_search("test query")
+        self.assertEqual(result, [])
+
+    def test_vector_upsert_no_client_returns_false(self):
+        adapter = _make_mock_adapter()
+        adapter._qdrant = None
+        result = adapter.vector_upsert("id1", "text", {})
+        self.assertFalse(result)
+
+    def test_close_clears_all(self):
+        adapter = _make_mock_adapter()
+        adapter._qdrant = MagicMock()
+        adapter._embedder = MagicMock()
+        adapter.close()
+        self.assertIsNone(adapter._driver)
+        self.assertIsNone(adapter._qdrant)
+        self.assertIsNone(adapter._embedder)
+
+
+class TestNeo4jPineconeAdapterInit(unittest.TestCase):
+
+    def test_default_index_name(self):
+        adapter = Neo4jPineconeAdapter()
+        self.assertEqual(adapter._pinecone_index, "vsg-memory")
+
+    def test_custom_index_name(self):
+        adapter = Neo4jPineconeAdapter(pinecone_index="my-index")
+        self.assertEqual(adapter._pinecone_index, "my-index")
+
+    def test_is_healthy_no_driver_no_host(self):
+        adapter = Neo4jPineconeAdapter()
+        adapter._driver = None
+        adapter._pinecone_host = None
+        self.assertFalse(adapter.is_healthy())
+
+    def test_is_healthy_with_host_no_driver(self):
+        adapter = Neo4jPineconeAdapter()
+        adapter._driver = None
+        adapter._pinecone_host = "index.pinecone.io"
+        self.assertFalse(adapter.is_healthy())
+
+    def test_is_healthy_with_driver_no_host(self):
+        adapter = Neo4jPineconeAdapter()
+        adapter._driver = MagicMock()
+        adapter._pinecone_host = None
+        self.assertFalse(adapter.is_healthy())
+
+    def test_vector_search_no_host_returns_empty(self):
+        adapter = Neo4jPineconeAdapter()
+        adapter._pinecone_host = None
+        adapter._pinecone_api_key = "key"
+        result = adapter.vector_search("test")
+        self.assertEqual(result, [])
+
+    def test_vector_upsert_no_host_returns_false(self):
+        adapter = Neo4jPineconeAdapter()
+        adapter._pinecone_host = None
+        adapter._pinecone_api_key = "key"
+        result = adapter.vector_upsert("id1", "text", {})
+        self.assertFalse(result)
+
+    def test_close_clears_driver(self):
+        adapter = Neo4jPineconeAdapter()
+        adapter._driver = MagicMock()
+        adapter.close()
+        self.assertIsNone(adapter._driver)
+
+
+# --- Abstract interface compliance ---
+
+class TestBackendAdapterInterface(unittest.TestCase):
+    """Verify both concrete adapters implement the full abstract interface."""
+
+    def test_qdrant_adapter_is_backend_adapter(self):
+        self.assertTrue(issubclass(Neo4jQdrantAdapter, BackendAdapter))
+
+    def test_pinecone_adapter_is_backend_adapter(self):
+        self.assertTrue(issubclass(Neo4jPineconeAdapter, BackendAdapter))
+
+    def test_all_abstract_methods_implemented(self):
+        """Both adapters should be instantiable (all abstract methods implemented)."""
+        # These should not raise TypeError
+        Neo4jQdrantAdapter()
+        Neo4jPineconeAdapter()
+
+    def test_required_methods_exist(self):
+        required = [
+            "connect", "close", "is_healthy",
+            "write_entities", "write_relationships", "query_nodes",
+            "traverse", "get_beliefs", "get_stats", "delete_project_data",
+            "vector_search", "vector_upsert",
+        ]
+        for method in required:
+            self.assertTrue(hasattr(Neo4jQdrantAdapter, method),
+                            f"Neo4jQdrantAdapter missing {method}")
+            self.assertTrue(hasattr(Neo4jPineconeAdapter, method),
+                            f"Neo4jPineconeAdapter missing {method}")
+
+
+if __name__ == "__main__":
+    unittest.main()
