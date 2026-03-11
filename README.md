@@ -1,5 +1,7 @@
 # Merkraum
 
+<!-- mcp-name: io.github.nhilbert/merkraum -->
+
 Auditable knowledge memory for AI agents. Know what your AI believes — and prove it.
 
 ## Why Merkraum

@@ -1,0 +1,26 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.nhilbert/merkraum",
+  "title": "Merkraum",
+  "description": "Auditable knowledge memory for AI agents. Know what your AI believes — and prove it. Structured knowledge graph with belief tracking, contradiction detection, and full audit trail. 12 MCP tools for Claude, Cursor, and any MCP client.",
+  "version": "1.0.0",
+  "packages": [
+    {
+      "registryType": "pypi",
+      "identifier": "merkraum",
+      "version": "1.0.0",
+      "transport": {
+        "type": "http",
+        "port": 8090,
+        "path": "/mcp"
+      },
+      "environmentVariables": [
+        { "name": "NEO4J_URI", "description": "Neo4j bolt URI (e.g. bolt://localhost:7687)", "required": true },
+        { "name": "NEO4J_USER", "description": "Neo4j username", "required": true },
+        { "name": "NEO4J_PASSWORD", "description": "Neo4j password", "required": true },
+        { "name": "QDRANT_URL", "description": "Qdrant REST URL (e.g. http://localhost:6333)", "required": true },
+        { "name": "OPENAI_API_KEY", "description": "OpenAI API key for LLM-powered text ingestion", "required": false }
+      ]
+    }
+  ]
+}
