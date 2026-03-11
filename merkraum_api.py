@@ -121,13 +121,15 @@ def _map_stats(raw: dict) -> dict:
          total_nodes, total_edges}
 
     Frontend expects:
-        {entities, relationships, beliefs, contradictions}
+        {entities, relationships, beliefs, contradictions, nodes_by_type}
     """
+    nodes_by_type = raw.get("nodes", {})
     return {
         "entities": raw.get("total_nodes", 0),
         "relationships": raw.get("total_edges", 0),
-        "beliefs": raw.get("nodes", {}).get("Belief", 0),
+        "beliefs": nodes_by_type.get("Belief", 0),
         "contradictions": raw.get("edges", {}).get("CONTRADICTS", 0),
+        "nodes_by_type": nodes_by_type,
     }
 
 
