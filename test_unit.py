@@ -737,5 +737,99 @@ class TestBackendAdapterUsageInterface(unittest.TestCase):
         self.assertTrue(hasattr(Neo4jPineconeAdapter, "get_usage"))
 
 
+# --- update_belief tests ---
+
+class TestUpdateBelief(unittest.TestCase):
+    """Test update_belief method on Neo4jBaseAdapter."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def _mock_found(self, name="test belief"):
+        """Mock a successful belief match."""
+        mock_result = MagicMock()
+        mock_result.single.return_value = {"name": name}
+        self.session.run.return_value = mock_result
+
+    def _mock_not_found(self):
+        """Mock a belief not found."""
+        mock_result = MagicMock()
+        mock_result.single.return_value = None
+        self.session.run.return_value = mock_result
+
+    def test_update_confidence(self):
+        self._mock_found()
+        result = self.adapter.update_belief("test belief", "proj", confidence=0.9)
+        self.assertTrue(result["updated"])
+        self.assertEqual(result["changes"]["confidence"], 0.9)
+
+    def test_update_status_superseded(self):
+        self._mock_found()
+        result = self.adapter.update_belief("test belief", "proj", status="superseded")
+        self.assertTrue(result["updated"])
+        self.assertEqual(result["changes"]["status"], "superseded")
+        cypher = self.session.run.call_args[0][0]
+        self.assertIn("b.active = false", cypher)
+
+    def test_update_status_active(self):
+        self._mock_found()
+        result = self.adapter.update_belief("test belief", "proj", status="active")
+        self.assertTrue(result["updated"])
+        cypher = self.session.run.call_args[0][0]
+        self.assertIn("b.active = true", cypher)
+
+    def test_update_summary(self):
+        self._mock_found()
+        result = self.adapter.update_belief("test belief", "proj", summary="new text")
+        self.assertTrue(result["updated"])
+        self.assertEqual(result["changes"]["summary"], "new text")
+
+    def test_multiple_changes(self):
+        self._mock_found()
+        result = self.adapter.update_belief(
+            "test belief", "proj", confidence=0.3, status="superseded"
+        )
+        self.assertTrue(result["updated"])
+        self.assertIn("confidence", result["changes"])
+        self.assertIn("status", result["changes"])
+
+    def test_invalid_status(self):
+        result = self.adapter.update_belief("test belief", "proj", status="invalid")
+        self.assertFalse(result["updated"])
+        self.assertIn("error", result)
+
+    def test_no_changes(self):
+        result = self.adapter.update_belief("test belief", "proj")
+        self.assertFalse(result["updated"])
+        self.assertIn("error", result)
+
+    def test_belief_not_found(self):
+        self._mock_not_found()
+        result = self.adapter.update_belief("nonexistent", "proj", confidence=0.5)
+        self.assertFalse(result["updated"])
+        self.assertIn("not found", result["error"])
+
+    def test_confidence_clamped_high(self):
+        self._mock_found()
+        result = self.adapter.update_belief("test belief", "proj", confidence=1.5)
+        self.assertEqual(result["changes"]["confidence"], 1.0)
+
+    def test_confidence_clamped_low(self):
+        self._mock_found()
+        result = self.adapter.update_belief("test belief", "proj", confidence=-0.5)
+        self.assertEqual(result["changes"]["confidence"], 0.0)
+
+
+class TestUpdateBeliefInterface(unittest.TestCase):
+    """Verify update_belief is in the abstract interface."""
+
+    def test_update_belief_in_adapters(self):
+        self.assertTrue(hasattr(Neo4jQdrantAdapter, "update_belief"))
+        self.assertTrue(hasattr(Neo4jPineconeAdapter, "update_belief"))
+
+
 if __name__ == "__main__":
     unittest.main()

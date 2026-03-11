@@ -132,6 +132,23 @@ class BackendAdapter(ABC):
         """Delete all nodes and relationships for a project. Returns counts."""
 
     @abstractmethod
+    def update_belief(self, name: str, project_id: str = "default",
+                      confidence: Optional[float] = None,
+                      status: Optional[str] = None,
+                      summary: Optional[str] = None) -> dict:
+        """Update an existing belief's confidence, status, or summary.
+
+        Args:
+            name: Belief name (must exist).
+            confidence: New confidence score (0.0-1.0). None = no change.
+            status: New status — 'active', 'superseded'. None = no change.
+            summary: New summary text. None = no change.
+
+        Returns:
+            {"updated": bool, "name": str, "changes": dict}
+        """
+
+    @abstractmethod
     def get_usage(self, project_id: str = "default") -> dict:
         """Get usage metrics for a project.
 
@@ -475,6 +492,54 @@ class Neo4jBaseAdapter(BackendAdapter):
             )
             edge_count = edge_result.single()["c"]
         return {"nodes": node_count, "edges": edge_count}
+
+    def update_belief(self, name, project_id="default", confidence=None,
+                      status=None, summary=None):
+        valid_statuses = ("active", "superseded")
+        if status is not None and status not in valid_statuses:
+            return {"updated": False, "name": name,
+                    "error": f"Invalid status: {status}. Valid: {valid_statuses}"}
+        if confidence is not None:
+            confidence = max(0.0, min(1.0, float(confidence)))
+
+        now = datetime.now().isoformat()
+        changes = {}
+        set_clauses = ["b.updated_at = $now"]
+
+        if confidence is not None:
+            set_clauses.append("b.confidence = $confidence")
+            changes["confidence"] = confidence
+        if status is not None:
+            set_clauses.append("b.status = $status")
+            if status == "superseded":
+                set_clauses.append("b.active = false")
+            elif status == "active":
+                set_clauses.append("b.active = true")
+            changes["status"] = status
+        if summary is not None:
+            set_clauses.append("b.summary = $summary")
+            changes["summary"] = summary
+
+        if not changes:
+            return {"updated": False, "name": name, "error": "No changes specified"}
+
+        cypher = f"""
+        MATCH (b:Belief {{name: $name, project_id: $pid}})
+        SET {', '.join(set_clauses)}
+        RETURN b.name AS name
+        """
+        with self._driver.session() as session:
+            result = session.run(
+                cypher, name=name, pid=project_id, now=now,
+                confidence=confidence, status=status, summary=summary,
+            )
+            record = result.single()
+
+        if record is None:
+            return {"updated": False, "name": name,
+                    "error": f"Belief '{name}' not found in project '{project_id}'"}
+
+        return {"updated": True, "name": name, "changes": changes}
 
 
 class Neo4jQdrantAdapter(Neo4jBaseAdapter):

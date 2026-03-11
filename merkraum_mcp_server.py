@@ -45,7 +45,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
 from fastmcp import FastMCP
-from merkraum_backend import create_adapter, BackendAdapter, NODE_TYPES, RELATIONSHIP_TYPES
+from merkraum_backend import create_adapter, BackendAdapter, NODE_TYPES, RELATIONSHIP_TYPES, TIER_LIMITS
 
 # --- Configuration ---
 
@@ -318,6 +318,69 @@ async def add_relationship(
         }
     except Exception as e:
         logger.error("add_relationship failed: %s", e)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def update_belief(
+    name: str,
+    confidence: float = None,
+    status: str = None,
+    summary: str = None,
+) -> dict:
+    """Update an existing belief's confidence, status, or summary.
+    This is how humans audit and correct the knowledge graph.
+
+    Args:
+        name: Belief name (must already exist)
+        confidence: New confidence score (0.0-1.0). None = no change.
+        status: New status — 'active' or 'superseded'. None = no change.
+        summary: New summary text. None = no change.
+    """
+    adapter = _get_adapter()
+    start = time.time()
+    try:
+        result = await _run_sync(
+            adapter.update_belief, name, DEFAULT_PROJECT,
+            confidence=confidence, status=status, summary=summary,
+        )
+        result["duration_ms"] = int((time.time() - start) * 1000)
+        return result
+    except Exception as e:
+        logger.error("update_belief failed: %s", e)
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_usage(
+    tier: str = "free",
+) -> dict:
+    """Get knowledge graph usage metrics and tier limits.
+    Shows current node/edge counts and how much of the tier quota is used.
+
+    Args:
+        tier: Pricing tier — free (100 nodes), pro (1000), team (5000),
+            enterprise (50000). Default: free.
+    """
+    tier = tier.lower()
+    if tier not in TIER_LIMITS:
+        tier = "free"
+    adapter = _get_adapter()
+    start = time.time()
+    try:
+        usage = await _run_sync(adapter.get_usage, DEFAULT_PROJECT)
+        node_limit = TIER_LIMITS[tier]
+        usage_pct = round(usage["nodes"] / node_limit * 100, 1) if node_limit else 0
+        return {
+            "nodes": usage["nodes"],
+            "edges": usage["edges"],
+            "node_limit": node_limit,
+            "usage_pct": usage_pct,
+            "tier": tier,
+            "duration_ms": int((time.time() - start) * 1000),
+        }
+    except Exception as e:
+        logger.error("get_usage failed: %s", e)
         return {"error": str(e)}
 
 
