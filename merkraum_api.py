@@ -746,6 +746,24 @@ def ingest_text():
 # Startup
 # ---------------------------------------------------------------------------
 
+def _load_secrets():
+    """Load secrets from AWS Secrets Manager into environment variables.
+
+    Reads merkraum/config secret (JSON with NEO4J_PASSWORD, OPENAI_API_KEY).
+    Falls back silently to existing env vars / .env for local development.
+    """
+    try:
+        import boto3
+        client = boto3.client("secretsmanager", region_name="eu-central-1")
+        resp = client.get_secret_value(SecretId="merkraum/config")
+        secrets = json.loads(resp["SecretString"])
+        for key, value in secrets.items():
+            os.environ.setdefault(key, value)
+        logger.info("Loaded %d secrets from AWS Secrets Manager", len(secrets))
+    except Exception as exc:
+        logger.info("Secrets Manager not available (%s), using env vars", exc)
+
+
 def _init_adapter():
     """Create and connect the adapter. Called once at startup."""
     global adapter
@@ -798,6 +816,7 @@ def main():
     )
     args = parser.parse_args()
 
+    _load_secrets()
     _init_adapter()
     _init_cognito_auth()
 
