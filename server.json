@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.nhilbert/merkraum",
   "title": "Merkraum",
-  "description": "Auditable knowledge memory for AI agents. Know what your AI believes — and prove it. Structured knowledge graph with belief tracking, contradiction detection, and full audit trail. 12 MCP tools for Claude, Cursor, and any MCP client.",
+  "description": "Auditable knowledge memory for AI agents with belief tracking and contradiction detection.",
   "version": "1.0.0",
   "packages": [
     {
@@ -10,9 +10,8 @@
       "identifier": "merkraum",
       "version": "1.0.0",
       "transport": {
-        "type": "http",
-        "port": 8090,
-        "path": "/mcp"
+        "type": "streamable-http",
+        "url": "http://localhost:8090/mcp"
       },
       "environmentVariables": [
         { "name": "NEO4J_URI", "description": "Neo4j bolt URI (e.g. bolt://localhost:7687)", "required": true },
