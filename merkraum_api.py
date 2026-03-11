@@ -295,6 +295,27 @@ def health():
         return _error(str(exc), 503)
 
 
+@app.route("/api/projects", methods=["GET"])
+def projects():
+    """List all project IDs that have data in the graph.
+
+    Returns a sorted list of project_id strings.
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    try:
+        with adapter._driver.session() as session:
+            records = session.run(
+                "MATCH (n) WHERE n.project_id IS NOT NULL "
+                "RETURN DISTINCT n.project_id AS pid ORDER BY pid"
+            )
+            project_ids = [rec["pid"] for rec in records]
+        return jsonify(project_ids)
+    except Exception as exc:
+        logger.exception("projects listing failed")
+        return _error(str(exc))
+
+
 @app.route("/api/stats", methods=["GET"])
 def stats():
     """Graph stats in frontend format: {entities, relationships, beliefs, contradictions}."""
