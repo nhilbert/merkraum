@@ -31,6 +31,7 @@ class CognitoJWTValidator:
         user_pool_id: str,
         aws_region: str,
         client_id: Optional[str] = None,
+        allowed_token_use: Optional[set[str]] = None,
     ):
         """
         Initialize Cognito JWT validator.
@@ -43,6 +44,7 @@ class CognitoJWTValidator:
         self.user_pool_id = user_pool_id
         self.aws_region = aws_region
         self.client_id = client_id
+        self.allowed_token_use = allowed_token_use or {"id"}
         self.cognito_domain = f"https://cognito-idp.{aws_region}.amazonaws.com/{user_pool_id}"
         self.jwks_url = f"{self.cognito_domain}/.well-known/jwks.json"
         self._jwks_cache: Optional[Dict[str, Any]] = None
@@ -141,6 +143,15 @@ class CognitoJWTValidator:
                 )
                 return None
 
+            token_use = decoded.get("token_use")
+            if token_use not in self.allowed_token_use:
+                logger.error(
+                    "Invalid token_use: expected one of %s, got %s",
+                    sorted(self.allowed_token_use),
+                    token_use,
+                )
+                return None
+
             # Verify token is not expired (jwt.decode handles this by default)
             logger.info(
                 "Token validated successfully for user: %s",
@@ -164,6 +175,10 @@ def get_cognito_validator() -> Optional[CognitoJWTValidator]:
     user_pool_id = os.environ.get("COGNITO_USER_POOL_ID")
     aws_region = os.environ.get("COGNITO_AWS_REGION")
     client_id = os.environ.get("COGNITO_CLIENT_ID")
+    auth_required = os.environ.get("AUTH_REQUIRED", "false").lower() in ("true", "1", "yes")
+    allowed_token_use = {
+        x.strip() for x in os.environ.get("COGNITO_TOKEN_USE", "id").split(",") if x.strip()
+    } or {"id"}
 
     if not user_pool_id or not aws_region:
         logger.warning(
@@ -173,8 +188,17 @@ def get_cognito_validator() -> Optional[CognitoJWTValidator]:
         )
         return None
 
+    if auth_required and not client_id:
+        logger.warning(
+            "COGNITO_CLIENT_ID is required when AUTH_REQUIRED=true"
+        )
+        return None
+
     return CognitoJWTValidator(
-        user_pool_id=user_pool_id, aws_region=aws_region, client_id=client_id
+        user_pool_id=user_pool_id,
+        aws_region=aws_region,
+        client_id=client_id,
+        allowed_token_use=allowed_token_use,
     )
 
 

@@ -26,6 +26,7 @@ import os
 import sys
 import urllib.request
 import urllib.error
+from functools import lru_cache
 from typing import cast
 
 from flask import Flask, jsonify, request
@@ -96,6 +97,88 @@ def handle_preflight(path=""):
 def _project_id() -> str:
     """Extract project_id from query params, defaulting to 'default'."""
     return request.args.get("project", "default") or "default"
+
+
+def _is_auth_required() -> bool:
+    return os.environ.get("AUTH_REQUIRED", "false").lower() in ("true", "1", "yes")
+
+
+def _is_production_env() -> bool:
+    env = (os.environ.get("APP_ENV") or os.environ.get("FLASK_ENV") or "").strip().lower()
+    return env in {"prod", "production"}
+
+
+def _split_csv_env(name: str) -> set[str]:
+    raw = os.environ.get(name, "")
+    return {x.strip() for x in raw.split(",") if x.strip()}
+
+
+@lru_cache(maxsize=1)
+def _project_group_acl() -> dict[str, set[str]]:
+    raw = os.environ.get("PROJECT_GROUP_ACL_JSON", "{}")
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return {}
+        out: dict[str, set[str]] = {}
+        for project, groups in parsed.items():
+            if isinstance(project, str) and isinstance(groups, list):
+                out[project] = {str(g).strip() for g in groups if str(g).strip()}
+        return out
+    except Exception:
+        logger.warning("Invalid PROJECT_GROUP_ACL_JSON; ignoring")
+        return {}
+
+
+@lru_cache(maxsize=1)
+def _project_user_acl() -> dict[str, set[str]]:
+    raw = os.environ.get("PROJECT_USER_ACL_JSON", "{}")
+    try:
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict):
+            return {}
+        out: dict[str, set[str]] = {}
+        for project, users in parsed.items():
+            if isinstance(project, str) and isinstance(users, list):
+                out[project] = {str(u).strip() for u in users if str(u).strip()}
+        return out
+    except Exception:
+        logger.warning("Invalid PROJECT_USER_ACL_JSON; ignoring")
+        return {}
+
+
+def _is_project_allowed(project: str) -> bool:
+    if not _is_auth_required():
+        return True
+
+    user_id = getattr(request, "user_id", None)
+    groups = set(getattr(request, "groups", []) or [])
+    if not user_id:
+        return False
+
+    if project == "default" and os.environ.get("ALLOW_DEFAULT_PROJECT", "true").lower() in ("true", "1", "yes"):
+        return True
+
+    admin_groups = _split_csv_env("ADMIN_GROUPS")
+    if admin_groups and groups.intersection(admin_groups):
+        return True
+
+    if project == user_id or project.startswith(f"{user_id}:"):
+        return True
+
+    if user_id in _project_user_acl().get(project, set()):
+        return True
+
+    if groups.intersection(_project_group_acl().get(project, set())):
+        return True
+
+    return False
+
+
+def _deny_if_project_forbidden(project: str):
+    if _is_project_allowed(project):
+        return None
+    return _error(f"Forbidden project access: '{project}'", 403)
 
 
 def _actor() -> str:
@@ -359,6 +442,8 @@ def projects():
                 "RETURN DISTINCT n.project_id AS pid ORDER BY pid"
             )
             project_ids = [rec["pid"] for rec in records]
+            if _is_auth_required():
+                project_ids = [pid for pid in project_ids if _is_project_allowed(pid)]
         return jsonify(project_ids)
     except Exception as exc:
         logger.exception("projects listing failed")
@@ -375,6 +460,9 @@ def stats():
     if adapter is None:
         return _error("Adapter not initialized", 503)
     project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     try:
         raw = adapter.get_stats(project_id=project)
         return jsonify(_map_stats(raw))
@@ -398,6 +486,9 @@ def usage():
     if adapter is None:
         return _error("Adapter not initialized", 503)
     project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     tier = request.args.get("tier", "free") or "free"
     if tier not in TIER_LIMITS:
         return _error(
@@ -434,6 +525,9 @@ def beliefs():
     if adapter is None:
         return _error("Adapter not initialized", 503)
     project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     status = request.args.get("status", "active") or "active"
     valid_statuses = {"active", "uncertain", "contradicted", "superseded"}
     if status not in valid_statuses:
@@ -461,6 +555,9 @@ def graph():
     if adapter is None:
         return _error("Adapter not initialized", 503)
     project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     try:
         limit = int(request.args.get("limit", 500))
     except (TypeError, ValueError):
@@ -492,6 +589,9 @@ def nodes():
     if adapter is None:
         return _error("Adapter not initialized", 503)
     project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     node_type = request.args.get("type") or None
     try:
         limit = int(request.args.get("limit", 100))
@@ -521,6 +621,9 @@ def traverse(entity: str):
     if adapter is None:
         return _error("Adapter not initialized", 503)
     project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     try:
         depth = int(request.args.get("depth", 2))
     except (TypeError, ValueError):
@@ -561,6 +664,9 @@ def ingest():
         return _error("Request body must be JSON", 400)
 
     project = body.get("project") or "default"
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     source = body.get("source") or "api"
     entities = body.get("entities") or []
     relationships = body.get("relationships") or []
@@ -631,6 +737,9 @@ def search():
         return _error("Query parameter 'q' is required", 400)
 
     project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     try:
         top = int(request.args.get("top", 5))
     except (TypeError, ValueError):
@@ -678,6 +787,9 @@ def ingest_text():
         return _error("Text too long (max 16000 characters)", 400)
 
     project = body.get("project") or "default"
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     source = body.get("source") or "text_ingestion"
 
     api_key = _get_openai_key()
@@ -790,6 +902,9 @@ def add_relationship_api():
     reason = (body.get("reason") or "").strip()
     confidence = body.get("confidence", 0.7)
     project = body.get("project") or "default"
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     actor = _actor()
 
     result = adapter.add_relationship(
@@ -824,6 +939,9 @@ def delete_relationship_api():
         return _error("'source', 'target', and 'type' are required", 400)
 
     project = body.get("project") or "default"
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     actor = _actor()
     result = adapter.delete_relationship(
         source=source,
@@ -852,6 +970,9 @@ def delete_node_api():
         return _error("'name' is required", 400)
 
     project = body.get("project") or "default"
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     actor = _actor()
     result = adapter.delete_node(name=name, project_id=project, node_type=node_type, actor=actor)
     status = 200 if result.get("ok") else 400
@@ -871,6 +992,9 @@ def update_node_api():
         return _error("'name' is required", 400)
 
     project = body.get("project") or "default"
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     new_name = (body.get("new_name") or "").strip() or None
     node_type = (body.get("node_type") or "").strip() or None
     updates = body.get("updates") or {}
@@ -908,6 +1032,9 @@ def merge_nodes_api():
         return _error("'keep_name' and 'remove_name' are required", 400)
 
     project = body.get("project") or "default"
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
     actor = _actor()
     result = adapter.merge_nodes(
         keep_name=keep_name,
@@ -998,6 +1125,16 @@ def main():
     args = parser.parse_args()
 
     _load_secrets()
+
+    if _is_production_env():
+        if not _is_auth_required():
+            raise RuntimeError(
+                "Security baseline failed: AUTH_REQUIRED must be true in production"
+            )
+        if not os.environ.get("COGNITO_CLIENT_ID"):
+            raise RuntimeError(
+                "Security baseline failed: COGNITO_CLIENT_ID is required in production"
+            )
     _init_adapter()
     _init_cognito_auth()
 
