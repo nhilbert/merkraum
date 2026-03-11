@@ -14,6 +14,8 @@ without code changes.
 v1.0 — Z1134 (2026-03-07)
 v1.1 — Z1336 (2026-03-11): Refactored — shared Neo4j graph ops extracted
        into Neo4jBaseAdapter, eliminating ~500 lines of duplication.
+v1.2 — Z1340 (2026-03-11): Connection dedup — _connect_neo4j() and
+       _load_neo4j_credentials() lifted into Neo4jBaseAdapter.
 """
 
 import os
@@ -116,16 +118,46 @@ class BackendAdapter(ABC):
 
 
 class Neo4jBaseAdapter(BackendAdapter):
-    """Base adapter with shared Neo4j graph operations.
+    """Base adapter with shared Neo4j graph operations and connection logic.
 
     Subclasses must implement:
       - connect(), close(), is_healthy()
       - vector_search(), vector_upsert()
 
-    The Neo4j driver is expected at self._driver after connect().
+    Subclasses should call _load_neo4j_credentials() and _connect_neo4j()
+    from their connect() method. The Neo4j driver is at self._driver after
+    _connect_neo4j().
     """
 
     _driver = None
+    _neo4j_uri = None
+    _neo4j_user = None
+    _neo4j_password = None
+
+    def _load_neo4j_credentials(self):
+        """Load Neo4j credentials from environment if not already set.
+
+        Returns the env dict so subclasses can read vendor-specific keys.
+        """
+        env = _load_env()
+        if not self._neo4j_uri:
+            self._neo4j_uri = env.get("NEO4J_URI", "bolt://localhost:7687")
+            self._neo4j_user = env.get("NEO4J_USER", "neo4j")
+            self._neo4j_password = env.get("NEO4J_PASSWORD", "")
+        return env
+
+    def _connect_neo4j(self):
+        """Connect to Neo4j and verify connectivity."""
+        try:
+            from neo4j import GraphDatabase
+            self._driver = GraphDatabase.driver(
+                self._neo4j_uri,
+                auth=(self._neo4j_user, self._neo4j_password),
+            )
+            self._driver.verify_connectivity()
+        except Exception as e:
+            logger.error("Neo4j connection failed: %s", e)
+            raise
 
     def write_entities(self, entities, source_cycle, source_type="extraction",
                        project_id="default"):
@@ -417,25 +449,9 @@ class Neo4jQdrantAdapter(Neo4jBaseAdapter):
         self._init_embedder()
 
     def _load_credentials(self):
-        if not self._neo4j_uri:
-            env = _load_env()
-            self._neo4j_uri = env.get("NEO4J_URI", "bolt://localhost:7687")
-            self._neo4j_user = env.get("NEO4J_USER", "neo4j")
-            self._neo4j_password = env.get("NEO4J_PASSWORD", "")
-            self._qdrant_url = env.get("QDRANT_URL", self._qdrant_url)
-            self._qdrant_api_key = env.get("QDRANT_API_KEY", self._qdrant_api_key)
-
-    def _connect_neo4j(self):
-        try:
-            from neo4j import GraphDatabase
-            self._driver = GraphDatabase.driver(
-                self._neo4j_uri,
-                auth=(self._neo4j_user, self._neo4j_password),
-            )
-            self._driver.verify_connectivity()
-        except Exception as e:
-            logger.error("Neo4j connection failed: %s", e)
-            raise
+        env = self._load_neo4j_credentials()
+        self._qdrant_url = env.get("QDRANT_URL", self._qdrant_url)
+        self._qdrant_api_key = env.get("QDRANT_API_KEY", self._qdrant_api_key)
 
     def _connect_qdrant(self):
         try:
@@ -604,24 +620,9 @@ class Neo4jPineconeAdapter(Neo4jBaseAdapter):
         self._resolve_pinecone_host()
 
     def _load_credentials(self):
-        if not self._neo4j_uri:
-            env = _load_env()
-            self._neo4j_uri = env.get("NEO4J_URI", "bolt://localhost:7687")
-            self._neo4j_user = env.get("NEO4J_USER", "neo4j")
-            self._neo4j_password = env.get("NEO4J_PASSWORD", "")
+        env = self._load_neo4j_credentials()
+        if not self._pinecone_api_key:
             self._pinecone_api_key = env.get("PINECONE_API_KEY", "")
-
-    def _connect_neo4j(self):
-        try:
-            from neo4j import GraphDatabase
-            self._driver = GraphDatabase.driver(
-                self._neo4j_uri,
-                auth=(self._neo4j_user, self._neo4j_password),
-            )
-            self._driver.verify_connectivity()
-        except Exception as e:
-            logger.error("Neo4j connection failed: %s", e)
-            raise
 
     def _resolve_pinecone_host(self):
         if not self._pinecone_api_key:

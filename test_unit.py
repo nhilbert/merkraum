@@ -381,6 +381,81 @@ class TestDeleteProjectData(unittest.TestCase):
 
 # --- Adapter-specific tests ---
 
+class TestNeo4jBaseAdapterCredentials(unittest.TestCase):
+    """Test shared credential loading and Neo4j connection in base class."""
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_load_neo4j_credentials_from_env_file(self):
+        """When no constructor args, credentials come from _load_env()."""
+        adapter = Neo4jQdrantAdapter()  # No URI passed
+        with patch("merkraum_backend._load_env", return_value={
+            "NEO4J_URI": "bolt://envhost:7687",
+            "NEO4J_USER": "envuser",
+            "NEO4J_PASSWORD": "envpass",
+        }):
+            adapter._load_neo4j_credentials()
+        self.assertEqual(adapter._neo4j_uri, "bolt://envhost:7687")
+        self.assertEqual(adapter._neo4j_user, "envuser")
+        self.assertEqual(adapter._neo4j_password, "envpass")
+
+    def test_load_neo4j_credentials_skips_if_already_set(self):
+        """Constructor-provided URI takes precedence over env."""
+        adapter = Neo4jQdrantAdapter(neo4j_uri="bolt://explicit:7687",
+                                     neo4j_user="explicit",
+                                     neo4j_password="explicitpw")
+        with patch("merkraum_backend._load_env", return_value={
+            "NEO4J_URI": "bolt://envhost:7687",
+        }):
+            adapter._load_neo4j_credentials()
+        self.assertEqual(adapter._neo4j_uri, "bolt://explicit:7687")
+        self.assertEqual(adapter._neo4j_user, "explicit")
+
+    def test_load_neo4j_credentials_returns_env_dict(self):
+        """_load_neo4j_credentials returns env dict for subclass use."""
+        adapter = Neo4jPineconeAdapter()
+        with patch("merkraum_backend._load_env", return_value={
+            "NEO4J_URI": "bolt://test:7687",
+            "PINECONE_API_KEY": "pk-test",
+        }):
+            env = adapter._load_neo4j_credentials()
+        self.assertEqual(env["PINECONE_API_KEY"], "pk-test")
+
+    def test_connect_neo4j_uses_base_class(self):
+        """Both adapters use the same _connect_neo4j from base class."""
+        self.assertIs(Neo4jQdrantAdapter._connect_neo4j,
+                      Neo4jPineconeAdapter._connect_neo4j)
+        self.assertIs(Neo4jQdrantAdapter._connect_neo4j,
+                      Neo4jBaseAdapter._connect_neo4j)
+
+    def test_qdrant_load_credentials_loads_qdrant_keys(self):
+        """Qdrant adapter loads vendor-specific keys via base env dict."""
+        adapter = Neo4jQdrantAdapter()
+        with patch("merkraum_backend._load_env", return_value={
+            "NEO4J_URI": "bolt://test:7687",
+            "NEO4J_USER": "neo4j",
+            "NEO4J_PASSWORD": "pw",
+            "QDRANT_URL": "http://qdrant:6333",
+            "QDRANT_API_KEY": "qk-test",
+        }):
+            adapter._load_credentials()
+        self.assertEqual(adapter._qdrant_url, "http://qdrant:6333")
+        self.assertEqual(adapter._qdrant_api_key, "qk-test")
+        self.assertEqual(adapter._neo4j_uri, "bolt://test:7687")
+
+    def test_pinecone_load_credentials_loads_pinecone_key(self):
+        """Pinecone adapter loads vendor-specific keys via base env dict."""
+        adapter = Neo4jPineconeAdapter()
+        with patch("merkraum_backend._load_env", return_value={
+            "NEO4J_URI": "bolt://test:7687",
+            "NEO4J_USER": "neo4j",
+            "NEO4J_PASSWORD": "pw",
+            "PINECONE_API_KEY": "pk-test",
+        }):
+            adapter._load_credentials()
+        self.assertEqual(adapter._pinecone_api_key, "pk-test")
+        self.assertEqual(adapter._neo4j_uri, "bolt://test:7687")
+
+
 class TestNeo4jQdrantAdapterInit(unittest.TestCase):
 
     def test_default_qdrant_url(self):
