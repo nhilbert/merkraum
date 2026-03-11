@@ -1,6 +1,6 @@
 # MCP Directory Listings — Submission Guide
 
-*Prepared Z1241. GTM execution for developer discovery (SUP-118).*
+*Prepared Z1241. Updated Z1348 (server.json validated, mcp-publisher installed, submission paths verified).*
 
 ## Submission Metadata (reuse across directories)
 
@@ -16,13 +16,14 @@
 
 ## Directory Submissions
 
-### 1. PulseMCP (highest priority — 8,594 servers, community hub)
+### 1. PulseMCP (highest priority — 8,610+ servers, community hub)
 
 **URL**: https://www.pulsemcp.com/submit
 **Process**: Select "MCP Server" → paste GitHub URL → submit.
 **Input needed**: `https://github.com/nhilbert/merkraum`
 **Time**: ~30 seconds.
-**Status**: READY — submit now.
+**Status**: NOT LISTED (verified Z1348). READY — Norman submits via web form.
+**Note**: PulseMCP is a read-only aggregator — no API submission. Also auto-ingests from Official MCP Registry weekly.
 
 ### 2. mcpservers.org (free listing, broad reach)
 
@@ -35,29 +36,33 @@
 - Contact Email: `info@merkraum.de`
 **Tier**: Free (skip the $39 premium for now).
 **Time**: ~1 minute.
-**Status**: READY — submit now.
+**Status**: NOT LISTED (verified Z1348). READY — Norman submits via web form.
 
-### 3. Glama (largest directory — 18,497 servers)
+### 3. Glama (largest directory — 18,967+ servers)
 
 **URL**: https://glama.ai/mcp/servers → click "Add Server"
 **Process**: Browser-based form. Details extracted from GitHub repo automatically.
-**Input needed**: GitHub URL.
+**Input needed**: `https://github.com/nhilbert/merkraum`
 **Time**: ~1 minute.
-**Status**: READY — submit now.
+**Status**: NOT LISTED (verified Z1348). READY — Norman submits via web form.
 
-### 4. Official MCP Registry (auto-propagates to PulseMCP weekly)
+### 4. Official MCP Registry (canonical — auto-propagates to PulseMCP weekly)
 
 **URL**: https://registry.modelcontextprotocol.io
-**Process**: Requires `mcp-publisher` CLI + PyPI package.
-**Steps**:
-1. Publish merkraum to PyPI: `pip install hatch && hatch build && hatch publish` (needs PyPI API token)
-2. Clone registry repo: `git clone https://github.com/modelcontextprotocol/registry`
-3. Build publisher: `make publisher`
-4. Login: `./bin/mcp-publisher login github`
-5. Create server.json (see below)
-6. Publish: `./bin/mcp-publisher publish`
-**Naming**: `io.github.nhilbert/merkraum`
-**Status**: BLOCKED — needs PyPI account + API token. Highest long-term value (canonical source, auto-synced to PulseMCP).
+**Tooling prepared (Z1348)**:
+- `server.json` created in repo root — VALIDATED by mcp-publisher
+- `mcp-publisher` CLI installed at `/home/vsg/.local/bin/mcp-publisher`
+- README has `<!-- mcp-name: io.github.nhilbert/merkraum -->` verification comment
+- `pyproject.toml` has `name = "merkraum"` matching registry identifier
+
+**Steps (Norman needed for PyPI)**:
+1. Create PyPI account at https://pypi.org/account/register/ (if not existing)
+2. Generate API token at https://pypi.org/manage/account/token/
+3. Build + publish: `cd /home/vsg/merkraum && pip install hatch && hatch build && hatch publish` (enter token when prompted)
+4. Login to registry: `mcp-publisher login github` (uses Norman's gh auth)
+5. Publish to registry: `cd /home/vsg/merkraum && mcp-publisher publish`
+
+**Status**: BLOCKED on PyPI account + API token. Highest long-term value (canonical source, auto-synced to PulseMCP).
 
 ### 5. Smithery (developer-focused)
 
@@ -65,43 +70,19 @@
 **Process**: CLI-based (`smithery mcp publish`) or web form.
 **Status**: DEFERRED — lower priority, revisit after top 3.
 
-## server.json (for Official MCP Registry)
-
-```json
-{
-  "name": "io.github.nhilbert/merkraum",
-  "description": "Auditable knowledge memory for AI agents. Belief tracking, contradiction detection, and full audit trail via MCP.",
-  "repository": {
-    "url": "https://github.com/nhilbert/merkraum"
-  },
-  "version": "1.0.0",
-  "packages": [
-    {
-      "registryType": "docker",
-      "identifier": "nhilbert/merkraum",
-      "version": "latest",
-      "transport": [
-        {
-          "type": "http",
-          "port": 8090,
-          "path": "/mcp"
-        }
-      ],
-      "environmentVariables": [
-        { "name": "NEO4J_URI", "description": "Neo4j bolt URI", "required": true },
-        { "name": "NEO4J_USER", "description": "Neo4j username", "required": true },
-        { "name": "NEO4J_PASSWORD", "description": "Neo4j password", "required": true },
-        { "name": "QDRANT_URL", "description": "Qdrant REST URL", "required": true },
-        { "name": "OPENAI_API_KEY", "description": "For LLM-powered text ingestion", "required": false }
-      ]
-    }
-  ]
-}
-```
-
 ## Competitive context
 
 Cognee is already listed on PulseMCP (7 tools, $7.5M seed). Hindsight (Vectorize) is growing fast with MIT license. Being absent from directories while competitors are listed = lost developer discovery. Every day without listings is a day developers find Cognee or Hindsight instead.
+
+## Norman action summary (total ~3 minutes)
+
+**Immediate (web forms, ~2 min total)**:
+1. Open https://www.pulsemcp.com/submit → paste `https://github.com/nhilbert/merkraum` → submit (~30s)
+2. Open https://mcpservers.org/submit → fill fields above → submit (~1 min)
+3. Open https://glama.ai/mcp/servers → "Add Server" → paste GitHub URL → submit (~30s)
+
+**When ready (PyPI, ~5 min)**:
+4. Create PyPI account + API token → run `hatch build && hatch publish` → then `mcp-publisher publish`
 
 ## Next steps after initial listings
 
