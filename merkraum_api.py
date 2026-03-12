@@ -112,7 +112,13 @@ def _project_id() -> str:
 
 
 def _is_auth_required() -> bool:
-    return os.environ.get("AUTH_REQUIRED", "false").lower() in ("true", "1", "yes")
+    raw = os.environ.get("AUTH_REQUIRED")
+    if raw is not None:
+        return raw.lower() in ("true", "1", "yes")
+    dev_mode = os.environ.get("DEV_MODE")
+    if dev_mode is not None:
+        return dev_mode.lower() not in ("true", "1", "yes")
+    return True
 
 
 def _is_production_env() -> bool:
@@ -168,7 +174,7 @@ def _is_project_allowed(project: str) -> bool:
     if not user_id:
         return False
 
-    if project == "default" and os.environ.get("ALLOW_DEFAULT_PROJECT", "true").lower() in ("true", "1", "yes"):
+    if project == "default" and os.environ.get("ALLOW_DEFAULT_PROJECT", "false").lower() in ("true", "1", "yes"):
         return True
 
     admin_groups = _split_csv_env("ADMIN_GROUPS")
@@ -1124,8 +1130,8 @@ def main():
     )
     parser.add_argument(
         "--host",
-        default="0.0.0.0",
-        help="Host to bind (default: 0.0.0.0)",
+        default="127.0.0.1",
+        help="Host to bind (default: 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
@@ -1151,6 +1157,10 @@ def main():
             raise RuntimeError(
                 "Security baseline failed: COGNITO_CLIENT_ID is required in production"
             )
+    if args.host not in {"127.0.0.1", "localhost", "::1"} and not _is_auth_required():
+        raise RuntimeError(
+            "Security baseline failed: AUTH_REQUIRED must be true when binding to non-loopback host"
+        )
     _init_adapter()
     _init_cognito_auth()
 

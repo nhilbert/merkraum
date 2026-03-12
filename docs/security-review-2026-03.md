@@ -196,6 +196,23 @@ Increases accidental exposure likelihood in local/dev environments.
 
 ## Prioritized remediation roadmap
 
+## Remediation status update (implemented in this repository)
+
+Implemented in code:
+
+1. JWT client binding is now enforced in MCP token validation via `MCP_ALLOWED_CLIENT_IDS` (with `aud` checks for ID tokens and `client_id` checks for access tokens).
+2. MCP auth configuration now fails closed in non-dev mode when required Cognito/MCP env vars are missing; insecure hardcoded Cognito defaults were removed.
+3. Default project access is now hardened: `ALLOW_DEFAULT_PROJECT` defaults to `false`.
+4. API auth default is now secure-by-default (`AUTH_REQUIRED=true` unless explicitly disabled or `DEV_MODE=true`).
+5. Token proxy no longer returns raw exception text to clients.
+6. Dynamic client registration (`/register`) is now disabled by default and must be explicitly enabled.
+7. API default bind host is now loopback (`127.0.0.1`) and startup blocks non-loopback binds when auth is disabled.
+
+Partially addressed / deferred:
+
+1. URL egress hardening remains partial (basic HTTPS URL validation for configured auth endpoints added; full host allowlisting across all adapters still pending).
+2. Registration endpoint still lacks built-in application-layer rate limiting when enabled.
+
 ### Immediate (0–7 days)
 
 1. Enforce JWT audience/client checks in MCP verifier.
@@ -213,4 +230,3 @@ Increases accidental exposure likelihood in local/dev environments.
 1. Add CI security gates: Bandit + dependency audit + secret scanning.
 2. Establish deployment profiles (dev/stage/prod) with locked security defaults.
 3. Add tenant-isolation integration tests covering project ACL edge cases.
-
