@@ -16,6 +16,7 @@ Architecture:
 
 v1.0 — Z1144 (2026-03-07). Extracted from vsg_mcp_server.py.
 v2.0 — (2026-03-11). Added Cognito OAuth for MCP client authentication.
+v2.1 — Z1439 (2026-03-12). Default project = Cognito sub (Norman directive). Auto-provision on first MCP connection.
 """
 
 import os
@@ -479,20 +480,71 @@ def _run_sync(func, *args, **kwargs):
 
 
 
+def _get_authenticated_user() -> tuple[str | None, set[str]]:
+    """Extract user_id (Cognito sub) and groups from the FastMCP access token."""
+    token = get_access_token()
+    if token is None:
+        return None, set()
+    claims = getattr(token, "claims", {}) or {}
+    user_id = claims.get("sub")
+    groups = set(claims.get("cognito:groups", []) or [])
+    return user_id, groups
+
+
+def _resolve_project(project: str | None) -> str:
+    """Resolve project ID: explicit value > authenticated user's Cognito sub > DEFAULT_PROJECT.
+
+    Norman's directive (Z1439): When connecting via MCP, the default project
+    should be the user's Cognito sub. Users don't need to configure or pass
+    a project_id — the auth already tells us who they are.
+    """
+    if project and project.strip():
+        return project.strip()
+    user_id, _ = _get_authenticated_user()
+    if user_id:
+        return user_id
+    return DEFAULT_PROJECT
+
+
+def _auto_provision_project(project: str, user_id: str) -> None:
+    """Auto-create a personal project if it matches the user's sub and doesn't exist yet.
+
+    Mirrors the REST API auto-provision logic from Z1437. Only triggers when
+    project == user_id (personal namespace), avoiding unintended creation.
+    """
+    if project != user_id:
+        return
+    adapter = _get_adapter()
+    try:
+        existing = adapter.list_projects(owner=user_id)
+        if any(p.get("project_id") == project for p in existing):
+            return
+    except Exception:
+        return
+    try:
+        adapter.create_project(
+            project_id=user_id,
+            name="My Knowledge Space",
+            owner=user_id,
+            description="Auto-created on first MCP connection",
+            tier="free",
+        )
+        logger.info("Auto-provisioned project %s for user", user_id[:8])
+    except (ValueError, Exception) as e:
+        logger.debug("Auto-provision skipped (may already exist): %s", e)
+
+
 def _check_project_access(project: str) -> tuple[str | None, set[str], str | None]:
-    """Extract user info from FastMCP access token and check project ACL.
+    """Check project ACL for the authenticated user. Auto-provisions if needed.
 
     Returns (user_id, groups, error_message).
     error_message is None if access is allowed.
     """
-    token = get_access_token()
-    if token is None:
-        user_id = None
-        groups: set[str] = set()
-    else:
-        claims = getattr(token, "claims", {}) or {}
-        user_id = claims.get("sub")
-        groups = set(claims.get("cognito:groups", []) or [])
+    user_id, groups = _get_authenticated_user()
+
+    # Auto-provision personal project on first access
+    if user_id and project == user_id:
+        _auto_provision_project(project, user_id)
 
     if not is_project_allowed(project, user_id, groups):
         return user_id, groups, f"Forbidden: no access to project '{project}'"
@@ -512,9 +564,9 @@ async def search_knowledge(
     Args:
         query: What to search for (natural language)
         top_k: Number of results to return (1-20, default 5)
-        project: Project ID (default: server default)
+        project: Project ID (default: your personal space)
     """
-    project = project or DEFAULT_PROJECT
+    project = _resolve_project(project)
     _uid, _grp, _err = _check_project_access(project)
     if _err:
         return {"error": _err}
@@ -545,9 +597,9 @@ async def traverse_graph(
     Args:
         entity: Entity name to start from
         depth: How many hops to traverse (1-4, default 2)
-        project: Project ID (default: server default)
+        project: Project ID (default: your personal space)
     """
-    project = project or DEFAULT_PROJECT
+    project = _resolve_project(project)
     _uid, _grp, _err = _check_project_access(project)
     if _err:
         return {"error": _err}
@@ -576,9 +628,9 @@ async def list_beliefs(
 
     Args:
         status: Filter — active, uncertain, superseded, contradicted
-        project: Project ID (default: server default)
+        project: Project ID (default: your personal space)
     """
-    project = project or DEFAULT_PROJECT
+    project = _resolve_project(project)
     _uid, _grp, _err = _check_project_access(project)
     if _err:
         return {"error": _err}
@@ -604,9 +656,9 @@ async def get_graph_stats(project: str = None) -> dict:
     """Get knowledge graph statistics: node counts by type, edge counts, totals.
 
     Args:
-        project: Project ID (default: server default)
+        project: Project ID (default: your personal space)
     """
-    project = project or DEFAULT_PROJECT
+    project = _resolve_project(project)
     _uid, _grp, _err = _check_project_access(project)
     if _err:
         return {"error": _err}
@@ -636,9 +688,9 @@ async def query_nodes(
         node_type: Filter by type (Person, Organization, Project, Concept,
             Regulation, Event, Belief, Artifact, Interview, Quote). None = all.
         limit: Max results (1-200, default 50)
-        project: Project ID (default: server default)
+        project: Project ID (default: your personal space)
     """
-    project = project or DEFAULT_PROJECT
+    project = _resolve_project(project)
     _uid, _grp, _err = _check_project_access(project)
     if _err:
         return {"error": _err}
@@ -676,9 +728,9 @@ async def add_knowledge(
         node_type: One of Person, Organization, Project, Concept, Regulation,
             Event, Belief, Artifact, Interview, Quote
         confidence: For Beliefs only (0.0-1.0, default 0.7)
-        project: Project ID (default: server default)
+        project: Project ID (default: your personal space)
     """
-    project = project or DEFAULT_PROJECT
+    project = _resolve_project(project)
     _uid, _grp, _err = _check_project_access(project)
     if _err:
         return {"error": _err}
@@ -726,9 +778,9 @@ async def add_relationship(
             EXTENDS, REFINES, CREATED_BY, AFFILIATED_WITH, APPLIES, IMPLEMENTS,
             PARTICIPATED_IN, PRODUCES, REFERENCES, TEMPORAL, MENTIONS, PART_OF
         reason: Why this relationship exists (optional)
-        project: Project ID (default: server default)
+        project: Project ID (default: your personal space)
     """
-    project = project or DEFAULT_PROJECT
+    project = _resolve_project(project)
     _uid, _grp, _err = _check_project_access(project)
     if _err:
         return {"error": _err}
@@ -770,9 +822,9 @@ async def update_belief(
         confidence: New confidence score (0.0-1.0). None = no change.
         status: New status — active or superseded. None = no change.
         summary: New summary text. None = no change.
-        project: Project ID (default: server default)
+        project: Project ID (default: your personal space)
     """
-    project = project or DEFAULT_PROJECT
+    project = _resolve_project(project)
     _uid, _grp, _err = _check_project_access(project)
     if _err:
         return {"error": _err}
@@ -803,9 +855,9 @@ async def get_usage(
 
     Args:
         tier: Pricing tier — free (100), pro (1000), team (5000), enterprise (50000)
-        project: Project ID (default: server default)
+        project: Project ID (default: your personal space)
     """
-    project = project or DEFAULT_PROJECT
+    project = _resolve_project(project)
     _uid, _grp, _err = _check_project_access(project)
     if _err:
         return {"error": _err}
@@ -843,20 +895,20 @@ def _ensure_worker():
 
     def _worker():
         while True:
-            job_id, text = _job_queue.get()
-            _run_ingestion_job(job_id, text)
+            job_id, text, project = _job_queue.get()
+            _run_ingestion_job(job_id, text, project)
             _job_queue.task_done()
 
     t = threading.Thread(target=_worker, daemon=True, name="ingestion-worker")
     t.start()
 
 
-def _run_ingestion_job(job_id: str, text: str):
+def _run_ingestion_job(job_id: str, text: str, project: str):
     with _jobs_lock:
         _jobs[job_id]["status"] = "running"
     start = time.time()
     try:
-        result = _extract_and_write(text)
+        result = _extract_and_write(text, project)
         with _jobs_lock:
             _jobs[job_id]["status"] = "completed"
             _jobs[job_id]["result"] = result
@@ -868,7 +920,7 @@ def _run_ingestion_job(job_id: str, text: str):
             _jobs[job_id]["duration_ms"] = int((time.time() - start) * 1000)
 
 
-def _extract_and_write(text: str) -> dict:
+def _extract_and_write(text: str, project: str = None) -> dict:
     """Extract entities/relationships from text via LLM, write to graph."""
     api_key = OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY", "")
     if not api_key:
@@ -915,17 +967,18 @@ Text:
     entities = extracted.get("entities", [])
     relationships = extracted.get("relationships", [])
 
-    ent_count = adapter.write_entities(entities, "ingest", "extraction", DEFAULT_PROJECT)
-    rel_count = adapter.write_relationships(relationships, "ingest", "extraction", DEFAULT_PROJECT)
+    project = project or DEFAULT_PROJECT
+    ent_count = adapter.write_entities(entities, "ingest", "extraction", project)
+    rel_count = adapter.write_relationships(relationships, "ingest", "extraction", project)
 
     for ent in entities:
         name = ent.get("name", "")
         summary = ent.get("summary", "")
         if name:
             adapter.vector_upsert(
-                f"{DEFAULT_PROJECT}:{name}", f"{name}: {summary}",
+                f"{project}:{name}", f"{name}: {summary}",
                 {"name": name, "node_type": ent.get("node_type", "Concept"),
-                 "source": "extraction"}, DEFAULT_PROJECT,
+                 "source": "extraction"}, project,
             )
 
     return {
@@ -944,12 +997,18 @@ async def ingest_knowledge(
 
     Args:
         text: Text to extract knowledge from (max 10KB)
-        project: Project ID (default: server default)
+        project: Project ID (default: your personal space)
     """
     if len(text) > MAX_INGEST_LENGTH:
         return {"error": f"Text too long ({len(text)} bytes). Max: {MAX_INGEST_LENGTH}"}
     if not text.strip():
         return {"error": "Empty text"}
+
+    # Resolve project now (in auth context) before dispatching to background thread
+    project = _resolve_project(project)
+    _uid, _grp, _err = _check_project_access(project)
+    if _err:
+        return {"error": _err}
 
     _ensure_worker()
     job_id = uuid.uuid4().hex[:12]
@@ -963,7 +1022,7 @@ async def ingest_knowledge(
             "status": "queued", "created": time.time(),
             "text_len": len(text), "result": None, "error": None,
         }
-    _job_queue.put((job_id, text))
+    _job_queue.put((job_id, text, project))
     return {"job_id": job_id, "status": "queued",
             "message": "Ingestion queued. Use check_ingestion_status to poll."}
 
