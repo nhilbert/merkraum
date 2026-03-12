@@ -481,6 +481,26 @@ def projects():
                 if not (admin_groups and groups.intersection(admin_groups)):
                     owner = owner_filter
             project_list = adp.list_projects(owner=owner)
+
+            # Auto-provision: if authenticated user has no projects, create one
+            if not project_list and owner:
+                username = getattr(request, "username", None) or "My Space"
+                display_name = username.split("@")[0].replace(".", " ").title()
+                try:
+                    auto_result = adp.create_project(
+                        project_id=owner,
+                        name=f"{display_name}'s Knowledge Space",
+                        owner=owner,
+                        description="Auto-created on first login",
+                        tier="free",
+                    )
+                    logger.info("Auto-provisioned project '%s' for user '%s'",
+                                owner, username)
+                    project_list = adp.list_projects(owner=owner)
+                except ValueError:
+                    # Project already exists (race condition) — just re-list
+                    project_list = adp.list_projects(owner=owner)
+
             # Enrich with usage stats
             for proj in project_list:
                 pid = proj.get("project_id", "")
@@ -503,6 +523,27 @@ def projects():
             project_ids = [rec["pid"] for rec in records]
             if _is_auth_required():
                 project_ids = [pid for pid in project_ids if _is_project_allowed(pid)]
+
+        # Auto-provision in legacy mode too
+        if not project_ids and _is_auth_required():
+            user_id = getattr(request, "user_id", None)
+            if user_id:
+                username = getattr(request, "username", None) or "My Space"
+                display_name = username.split("@")[0].replace(".", " ").title()
+                try:
+                    adp.create_project(
+                        project_id=user_id,
+                        name=f"{display_name}'s Knowledge Space",
+                        owner=user_id,
+                        description="Auto-created on first login",
+                        tier="free",
+                    )
+                    logger.info("Auto-provisioned project '%s' for user '%s'",
+                                user_id, username)
+                    project_ids = [user_id]
+                except ValueError:
+                    project_ids = [user_id]
+
         return jsonify(project_ids)
     except Exception as exc:
         logger.exception("projects listing failed")
