@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.nhilbert/merkraum",
   "title": "Merkraum",
-  "description": "Auditable knowledge memory for AI agents with belief tracking and contradiction detection.",
+  "description": "Auditable knowledge memory for AI agents with belief tracking, contradiction detection, and full audit trail. Structured knowledge graph (Neo4j) + semantic search with provenance, confidence scoring, and human-auditable epistemics.",
   "version": "1.0.0",
   "packages": [
     {
@@ -11,14 +11,11 @@
       "version": "1.0.0",
       "transport": {
         "type": "streamable-http",
-        "url": "http://localhost:8090/mcp"
+        "url": "https://mcp.merkraum.de/mcp/merkraum/"
       },
       "environmentVariables": [
-        { "name": "NEO4J_URI", "description": "Neo4j bolt URI (e.g. bolt://localhost:7687)", "required": true },
-        { "name": "NEO4J_USER", "description": "Neo4j username", "required": true },
-        { "name": "NEO4J_PASSWORD", "description": "Neo4j password", "required": true },
-        { "name": "QDRANT_URL", "description": "Qdrant REST URL (e.g. http://localhost:6333)", "required": true },
-        { "name": "OPENAI_API_KEY", "description": "OpenAI API key for LLM-powered text ingestion", "required": false }
+        { "name": "MERKRAUM_AUTH_DOMAIN", "description": "Cognito OAuth domain for authentication (default: merkraum.auth.eu-central-1.amazoncognito.com)", "required": false },
+        { "name": "MERKRAUM_CLIENT_ID", "description": "OAuth client ID for PKCE flow", "required": true }
       ]
     }
   ]
