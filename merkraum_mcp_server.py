@@ -39,6 +39,9 @@ from starlette.responses import JSONResponse, RedirectResponse, Response
 from fastmcp import FastMCP
 from fastmcp.server.auth import AccessToken, TokenVerifier
 
+from merkraum_acl import is_project_allowed
+from fastmcp.server.dependencies import get_access_token
+
 from merkraum_backend import (
     create_adapter, BackendAdapter, NODE_TYPES, RELATIONSHIP_TYPES, TIER_LIMITS,
 )
@@ -475,6 +478,26 @@ def _run_sync(func, *args, **kwargs):
     return loop.run_in_executor(None, partial(func, *args, **kwargs))
 
 
+
+def _check_project_access(project: str) -> tuple[str | None, set[str], str | None]:
+    """Extract user info from FastMCP access token and check project ACL.
+
+    Returns (user_id, groups, error_message).
+    error_message is None if access is allowed.
+    """
+    token = get_access_token()
+    if token is None:
+        user_id = None
+        groups: set[str] = set()
+    else:
+        claims = getattr(token, "claims", {}) or {}
+        user_id = claims.get("sub")
+        groups = set(claims.get("cognito:groups", []) or [])
+
+    if not is_project_allowed(project, user_id, groups):
+        return user_id, groups, f"Forbidden: no access to project '{project}'"
+    return user_id, groups, None
+
 # --- Tools ---
 
 @mcp.tool()
@@ -492,6 +515,9 @@ async def search_knowledge(
         project: Project ID (default: server default)
     """
     project = project or DEFAULT_PROJECT
+    _uid, _grp, _err = _check_project_access(project)
+    if _err:
+        return {"error": _err}
     top_k = max(1, min(20, top_k))
     adapter = _get_adapter()
     start = time.time()
@@ -522,6 +548,9 @@ async def traverse_graph(
         project: Project ID (default: server default)
     """
     project = project or DEFAULT_PROJECT
+    _uid, _grp, _err = _check_project_access(project)
+    if _err:
+        return {"error": _err}
     depth = max(1, min(4, depth))
     adapter = _get_adapter()
     start = time.time()
@@ -550,6 +579,9 @@ async def list_beliefs(
         project: Project ID (default: server default)
     """
     project = project or DEFAULT_PROJECT
+    _uid, _grp, _err = _check_project_access(project)
+    if _err:
+        return {"error": _err}
     if status not in ("active", "uncertain", "superseded", "contradicted"):
         status = "active"
     adapter = _get_adapter()
@@ -575,6 +607,9 @@ async def get_graph_stats(project: str = None) -> dict:
         project: Project ID (default: server default)
     """
     project = project or DEFAULT_PROJECT
+    _uid, _grp, _err = _check_project_access(project)
+    if _err:
+        return {"error": _err}
     adapter = _get_adapter()
     start = time.time()
     try:
@@ -604,6 +639,9 @@ async def query_nodes(
         project: Project ID (default: server default)
     """
     project = project or DEFAULT_PROJECT
+    _uid, _grp, _err = _check_project_access(project)
+    if _err:
+        return {"error": _err}
     if node_type and node_type not in NODE_TYPES:
         return {"error": f"Unknown node_type: {node_type}. Valid: {NODE_TYPES}"}
     limit = max(1, min(200, limit))
@@ -641,6 +679,9 @@ async def add_knowledge(
         project: Project ID (default: server default)
     """
     project = project or DEFAULT_PROJECT
+    _uid, _grp, _err = _check_project_access(project)
+    if _err:
+        return {"error": _err}
     if node_type not in NODE_TYPES:
         return {"error": f"Unknown node_type: {node_type}. Valid: {NODE_TYPES}"}
     adapter = _get_adapter()
@@ -688,6 +729,9 @@ async def add_relationship(
         project: Project ID (default: server default)
     """
     project = project or DEFAULT_PROJECT
+    _uid, _grp, _err = _check_project_access(project)
+    if _err:
+        return {"error": _err}
     if relationship_type not in RELATIONSHIP_TYPES:
         return {"error": f"Unknown type: {relationship_type}. Valid: {RELATIONSHIP_TYPES}"}
     adapter = _get_adapter()
@@ -729,6 +773,9 @@ async def update_belief(
         project: Project ID (default: server default)
     """
     project = project or DEFAULT_PROJECT
+    _uid, _grp, _err = _check_project_access(project)
+    if _err:
+        return {"error": _err}
     adapter = _get_adapter()
     start = time.time()
     try:
@@ -759,6 +806,9 @@ async def get_usage(
         project: Project ID (default: server default)
     """
     project = project or DEFAULT_PROJECT
+    _uid, _grp, _err = _check_project_access(project)
+    if _err:
+        return {"error": _err}
     tier = tier.lower()
     if tier not in TIER_LIMITS:
         tier = "free"

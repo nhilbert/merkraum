@@ -28,6 +28,8 @@ import urllib.error
 from functools import lru_cache
 from typing import cast
 
+from merkraum_acl import is_auth_required, is_project_allowed, split_csv_env
+
 from flask import Flask, jsonify, request
 
 from merkraum_backend import (
@@ -111,86 +113,24 @@ def _project_id() -> str:
     return request.args.get("project", "default") or "default"
 
 
+
 def _is_auth_required() -> bool:
-    raw = os.environ.get("AUTH_REQUIRED")
-    if raw is not None:
-        return raw.lower() in ("true", "1", "yes")
-    dev_mode = os.environ.get("DEV_MODE")
-    if dev_mode is not None:
-        return dev_mode.lower() not in ("true", "1", "yes")
-    return True
+    return is_auth_required()
 
 
 def _is_production_env() -> bool:
-    env = (os.environ.get("APP_ENV") or os.environ.get("FLASK_ENV") or "").strip().lower()
-    return env in {"prod", "production"}
+    env = (os.environ.get('APP_ENV') or os.environ.get('FLASK_ENV') or '').strip().lower()
+    return env in {'prod', 'production'}
 
 
 def _split_csv_env(name: str) -> set[str]:
-    raw = os.environ.get(name, "")
-    return {x.strip() for x in raw.split(",") if x.strip()}
-
-
-@lru_cache(maxsize=1)
-def _project_group_acl() -> dict[str, set[str]]:
-    raw = os.environ.get("PROJECT_GROUP_ACL_JSON", "{}")
-    try:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            return {}
-        out: dict[str, set[str]] = {}
-        for project, groups in parsed.items():
-            if isinstance(project, str) and isinstance(groups, list):
-                out[project] = {str(g).strip() for g in groups if str(g).strip()}
-        return out
-    except Exception:
-        logger.warning("Invalid PROJECT_GROUP_ACL_JSON; ignoring")
-        return {}
-
-
-@lru_cache(maxsize=1)
-def _project_user_acl() -> dict[str, set[str]]:
-    raw = os.environ.get("PROJECT_USER_ACL_JSON", "{}")
-    try:
-        parsed = json.loads(raw)
-        if not isinstance(parsed, dict):
-            return {}
-        out: dict[str, set[str]] = {}
-        for project, users in parsed.items():
-            if isinstance(project, str) and isinstance(users, list):
-                out[project] = {str(u).strip() for u in users if str(u).strip()}
-        return out
-    except Exception:
-        logger.warning("Invalid PROJECT_USER_ACL_JSON; ignoring")
-        return {}
+    return split_csv_env(name)
 
 
 def _is_project_allowed(project: str) -> bool:
-    if not _is_auth_required():
-        return True
-
-    user_id = getattr(request, "user_id", None)
-    groups = set(getattr(request, "groups", []) or [])
-    if not user_id:
-        return False
-
-    if project == "default" and os.environ.get("ALLOW_DEFAULT_PROJECT", "false").lower() in ("true", "1", "yes"):
-        return True
-
-    admin_groups = _split_csv_env("ADMIN_GROUPS")
-    if admin_groups and groups.intersection(admin_groups):
-        return True
-
-    if project == user_id or project.startswith(f"{user_id}:"):
-        return True
-
-    if user_id in _project_user_acl().get(project, set()):
-        return True
-
-    if groups.intersection(_project_group_acl().get(project, set())):
-        return True
-
-    return False
+    user_id = getattr(request, 'user_id', None)
+    groups = set(getattr(request, 'groups', []) or [])
+    return is_project_allowed(project, user_id, groups)
 
 
 def _deny_if_project_forbidden(project: str):
@@ -201,14 +141,15 @@ def _deny_if_project_forbidden(project: str):
 
 def _actor() -> str:
     return (
-        getattr(request, "username", None)
-        or getattr(request, "user_id", None)
-        or "api"
+        getattr(request, 'username', None)
+        or getattr(request, 'user_id', None)
+        or 'api'
     )
 
 
 def _error(message: str, status: int = 500):
-    return jsonify({"error": message}), status
+    return jsonify({'error': message}), status
+
 
 
 def _get_all_edges(adp, project_id: str, limit: int = 1000) -> list:
