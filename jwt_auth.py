@@ -22,6 +22,20 @@ from flask import request, jsonify, current_app
 logger = logging.getLogger(__name__)
 
 
+def _is_dev_mode() -> bool:
+    dev_mode = os.environ.get("DEV_MODE")
+    if dev_mode is not None:
+        return dev_mode.lower() in ("true", "1", "yes")
+    return False
+
+
+def _auth_required() -> bool:
+    raw = os.environ.get("AUTH_REQUIRED")
+    if raw is None:
+        return not _is_dev_mode()
+    return raw.lower() in ("true", "1", "yes")
+
+
 class CognitoJWTValidator:
     """Validates JWT tokens from AWS Cognito User Pool."""
 
@@ -174,7 +188,7 @@ def get_cognito_validator() -> Optional[CognitoJWTValidator]:
     user_pool_id = os.environ.get("COGNITO_USER_POOL_ID")
     aws_region = os.environ.get("COGNITO_AWS_REGION")
     client_id = os.environ.get("COGNITO_CLIENT_ID")
-    auth_required = os.environ.get("AUTH_REQUIRED", "false").lower() in ("true", "1", "yes")
+    auth_required = _auth_required()
     allowed_token_use = {
         x.strip() for x in os.environ.get("COGNITO_TOKEN_USE", "id").split(",") if x.strip()
     } or {"id"}
@@ -225,7 +239,7 @@ def require_auth(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         # Check if authentication is enabled
-        auth_required = os.environ.get("AUTH_REQUIRED", "false").lower() in ("true", "1", "yes")
+        auth_required = _auth_required()
 
         # Initialize request attributes
         request.user = None

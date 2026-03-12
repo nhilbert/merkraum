@@ -86,6 +86,13 @@ Copy `.env.example` to `.env` to customize:
 | `MERKRAUM_PORT` | `8090` | MCP server HTTP port |
 | `OPENAI_API_KEY` | (none) | Optional: enables LLM-powered text ingestion |
 
+### Security defaults (v1.1)
+
+- `AUTH_REQUIRED` defaults to **enabled** when unset. Use `DEV_MODE=true` for local development bypass.
+- `ALLOW_DEFAULT_PROJECT` defaults to **disabled** to reduce accidental cross-tenant data exposure.
+- MCP OAuth config is fail-closed in non-dev mode: set `COGNITO_AWS_REGION`, `COGNITO_USER_POOL_ID`, `COGNITO_AUTH_DOMAIN`, `MCP_BASE_URL`, and `MCP_ALLOWED_CLIENT_IDS` (or `MCP_COGNITO_CLIENT_ID`).
+- Dynamic OAuth client registration (`/register`) is disabled by default; explicitly set `MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION=true` only when protected by additional controls.
+
 ## System requirements
 
 - Docker and Docker Compose

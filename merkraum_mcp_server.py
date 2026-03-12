@@ -31,7 +31,7 @@ import asyncio
 import argparse
 from functools import partial
 from typing import Optional
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 from starlette.requests import Request
 from starlette.responses import JSONResponse, RedirectResponse, Response
@@ -45,18 +45,34 @@ from merkraum_backend import (
 
 # --- Configuration ---
 
-COGNITO_REGION = os.environ.get("COGNITO_AWS_REGION", "eu-central-1")
-COGNITO_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "eu-central-1_JhyAYVWGl")
+_dev_mode_env = os.environ.get("DEV_MODE")
+if _dev_mode_env is None:
+    _app_env = (os.environ.get("APP_ENV") or os.environ.get("FLASK_ENV") or "").strip().lower()
+    DEV_MODE = _app_env not in {"prod", "production"}
+else:
+    DEV_MODE = _dev_mode_env.lower() in ("true", "1", "yes")
+
+COGNITO_REGION = os.environ.get("COGNITO_AWS_REGION", "")
+COGNITO_POOL_ID = os.environ.get("COGNITO_USER_POOL_ID", "")
 COGNITO_ISSUER = f"https://cognito-idp.{COGNITO_REGION}.amazonaws.com/{COGNITO_POOL_ID}"
 COGNITO_JWKS_URL = f"{COGNITO_ISSUER}/.well-known/jwks.json"
-COGNITO_APP_CLIENT_ID = os.environ.get("MCP_COGNITO_CLIENT_ID", "4moil9kjh8ufgvqs5nv8chq64n")
+COGNITO_APP_CLIENT_ID = os.environ.get("MCP_COGNITO_CLIENT_ID", "")
 COGNITO_APP_CLIENT_SECRET = os.environ.get("MCP_COGNITO_CLIENT_SECRET", "")
-COGNITO_AUTH_DOMAIN = os.environ.get("COGNITO_AUTH_DOMAIN", "https://merkraum.auth.eu-central-1.amazoncognito.com")
+COGNITO_AUTH_DOMAIN = os.environ.get("COGNITO_AUTH_DOMAIN", "")
 COGNITO_TOKEN_URL = f"{COGNITO_AUTH_DOMAIN}/oauth2/token"
 COGNITO_AUTHORIZE_URL = f"{COGNITO_AUTH_DOMAIN}/oauth2/authorize"
 COGNITO_ALLOWED_SCOPES = {"openid", "email", "phone", "profile"}
 
-MCP_BASE_URL = os.environ.get("MCP_BASE_URL", "https://www.agent.nhilbert.de/mcp/merkraum")
+MCP_ALLOWED_CLIENT_IDS = {
+    x.strip() for x in os.environ.get("MCP_ALLOWED_CLIENT_IDS", "").split(",") if x.strip()
+}
+if not MCP_ALLOWED_CLIENT_IDS and COGNITO_APP_CLIENT_ID:
+    MCP_ALLOWED_CLIENT_IDS = {COGNITO_APP_CLIENT_ID}
+
+MCP_BASE_URL = os.environ.get("MCP_BASE_URL", "")
+MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION = os.environ.get(
+    "MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION", "false"
+).lower() in ("true", "1", "yes")
 
 DEFAULT_BACKEND = os.environ.get("MERKRAUM_BACKEND", "neo4j_qdrant")
 DEFAULT_PROJECT = os.environ.get("MERKRAUM_PROJECT", "default")
@@ -75,6 +91,52 @@ logging.basicConfig(
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
 logger = logging.getLogger("merkraum-mcp")
+
+
+def _validate_https_url(url: str, label: str):
+    parsed = urlparse(url)
+    if parsed.scheme != "https" or not parsed.netloc:
+        raise ValueError(f"{label} must be a valid https URL")
+
+
+def _validate_auth_config():
+    required = {
+        "COGNITO_AWS_REGION": COGNITO_REGION,
+        "COGNITO_USER_POOL_ID": COGNITO_POOL_ID,
+        "COGNITO_AUTH_DOMAIN": COGNITO_AUTH_DOMAIN,
+        "MCP_BASE_URL": MCP_BASE_URL,
+    }
+    missing = [name for name, value in required.items() if not value]
+
+    if missing and not DEV_MODE:
+        raise RuntimeError(
+            "Missing required auth configuration for MCP server: " + ", ".join(missing)
+        )
+
+    if DEV_MODE and missing:
+        logger.warning("DEV_MODE=true, allowing missing auth configuration: %s", ", ".join(missing))
+
+    if COGNITO_AUTH_DOMAIN:
+        _validate_https_url(COGNITO_AUTH_DOMAIN, "COGNITO_AUTH_DOMAIN")
+    if COGNITO_JWKS_URL:
+        _validate_https_url(COGNITO_JWKS_URL, "COGNITO_JWKS_URL")
+    if MCP_BASE_URL:
+        _validate_https_url(MCP_BASE_URL, "MCP_BASE_URL")
+
+    if not MCP_ALLOWED_CLIENT_IDS and not DEV_MODE:
+        raise RuntimeError("MCP_ALLOWED_CLIENT_IDS (or MCP_COGNITO_CLIENT_ID) is required in non-dev mode")
+
+    logger.info(
+        "Auth config loaded: issuer=%s auth_domain=%s base_url=%s allowed_clients=%d dev_mode=%s",
+        COGNITO_ISSUER,
+        COGNITO_AUTH_DOMAIN,
+        MCP_BASE_URL,
+        len(MCP_ALLOWED_CLIENT_IDS),
+        DEV_MODE,
+    )
+
+
+_validate_auth_config()
 
 # --- Secrets Manager ---
 
@@ -166,11 +228,22 @@ def validate_jwt(token: str) -> dict:
         algorithms=["RS256"],
         issuer=COGNITO_ISSUER,
         options={
-            "verify_aud": False,  # Cognito access tokens don't have 'aud'
+            "verify_aud": False,
             "verify_exp": True,
             "verify_iss": True,
         },
     )
+
+    token_use = claims.get("token_use")
+    if token_use == "id":
+        aud = claims.get("aud")
+        if aud not in MCP_ALLOWED_CLIENT_IDS:
+            raise ValueError("Token aud is not an allowed client id")
+    else:
+        client_id = claims.get("client_id")
+        if client_id not in MCP_ALLOWED_CLIENT_IDS:
+            raise ValueError("Token client_id is not an allowed client id")
+
     return claims
 
 
@@ -339,7 +412,7 @@ async def token_proxy(request: Request) -> Response:
         logger.warning("AUDIT /token Cognito returned %d: %s", resp_status, resp_body[:200])
     except Exception as e:
         logger.error("AUDIT /token proxy error: %s", e)
-        return JSONResponse({"error": "token_proxy_error", "detail": str(e)}, status_code=502)
+        return JSONResponse({"error": "token_proxy_error", "detail": "token proxy failed"}, status_code=502)
 
     return Response(
         content=resp_body,
@@ -353,6 +426,9 @@ async def token_proxy(request: Request) -> Response:
 @mcp.custom_route("/register", methods=["POST"])
 async def register_client(request: Request) -> JSONResponse:
     """Return pre-created Cognito app client for MCP OAuth bootstrap."""
+    if not MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION:
+        return JSONResponse({"error": "registration_disabled"}, status_code=404)
+
     try:
         body = await request.json()
     except Exception:
