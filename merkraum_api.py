@@ -413,6 +413,72 @@ def _llm_extract(text: str, api_key: str, model: str = "gpt-4o-mini") -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Discovery endpoints (unauthenticated — public by design)
+# ---------------------------------------------------------------------------
+
+@app.route("/api/discover", methods=["GET"])
+def discover():
+    """Machine-readable discovery endpoint — returns capabilities, auth, schema.
+
+    No authentication required. This is how agents find out what Merkraum offers.
+    """
+    return jsonify({
+        "name": "Merkraum",
+        "version": "1.0",
+        "description": "Structured knowledge graph memory for AI agents with belief tracking and contradiction detection.",
+        "base_url": "https://agent.nhilbert.de/api/merkraum",
+        "mcp_url": "https://agent.nhilbert.de/mcp/merkraum/",
+        "skill_md": "https://agent.nhilbert.de/.well-known/skill.md",
+        "authentication": {
+            "type": "oauth2",
+            "provider": "aws_cognito",
+            "region": "eu-central-1",
+            "flows": ["authorization_code_pkce"],
+            "header": "Authorization: Bearer <jwt_token>",
+        },
+        "schema": {
+            "node_types": list(NODE_TYPES),
+            "relationship_types": list(RELATIONSHIP_TYPES),
+        },
+        "tiers": {k: {"node_limit": v} for k, v in TIER_LIMITS.items()},
+        "endpoints": [
+            {"path": "/api/search", "method": "GET", "auth": True, "description": "Semantic vector search"},
+            {"path": "/api/ingest", "method": "POST", "auth": True, "description": "Ingest structured entities and relationships"},
+            {"path": "/api/ingest/text", "method": "POST", "auth": True, "description": "Extract knowledge from text via LLM and ingest"},
+            {"path": "/api/traverse/<entity>", "method": "GET", "auth": True, "description": "Multi-hop graph traversal from entity"},
+            {"path": "/api/beliefs", "method": "GET", "auth": True, "description": "List beliefs by status"},
+            {"path": "/api/stats", "method": "GET", "auth": True, "description": "Graph statistics"},
+            {"path": "/api/graph", "method": "GET", "auth": True, "description": "Full graph data for visualization"},
+            {"path": "/api/nodes", "method": "GET", "auth": True, "description": "Query nodes by type"},
+            {"path": "/api/node", "method": "PATCH", "auth": True, "description": "Update node attributes"},
+            {"path": "/api/node", "method": "DELETE", "auth": True, "description": "Delete node and attached edges"},
+            {"path": "/api/relationship", "method": "POST", "auth": True, "description": "Add or update relationship"},
+            {"path": "/api/relationship", "method": "DELETE", "auth": True, "description": "Delete relationship"},
+            {"path": "/api/nodes/merge", "method": "POST", "auth": True, "description": "Merge two nodes"},
+            {"path": "/api/health", "method": "GET", "auth": True, "description": "Service health check"},
+            {"path": "/api/usage", "method": "GET", "auth": True, "description": "Usage metrics and tier limits"},
+            {"path": "/api/projects", "method": "GET", "auth": True, "description": "List accessible projects"},
+        ],
+        "operator": {
+            "name": "Supervision Rheinland",
+            "contact": "Dr. Norman Hilbert",
+            "website": "https://merkraum.de",
+        },
+    })
+
+
+@app.route("/.well-known/skill.md", methods=["GET"])
+def well_known_skill():
+    """Serve skill.md at the well-known path for agent discovery."""
+    skill_path = os.path.join(os.path.dirname(__file__), "skill.md")
+    if not os.path.exists(skill_path):
+        return _error("skill.md not found", 404)
+    with open(skill_path) as f:
+        content = f.read()
+    return content, 200, {"Content-Type": "text/markdown; charset=utf-8"}
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
