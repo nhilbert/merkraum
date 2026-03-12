@@ -198,6 +198,37 @@ class BackendAdapter(ABC):
             {"nodes": int, "edges": int}
         """
 
+    # --- Project Management ---
+
+    @abstractmethod
+    def create_project(self, project_id: str, name: str,
+                       owner: str, description: str = "",
+                       tier: str = "free") -> dict:
+        """Create a new project with metadata.
+
+        Returns:
+            {"created": True, "project_id": str, "name": str, ...}
+        Raises ValueError if project_id already exists.
+        """
+
+    @abstractmethod
+    def get_project(self, project_id: str) -> Optional[dict]:
+        """Get project metadata. Returns None if not found."""
+
+    @abstractmethod
+    def update_project(self, project_id: str,
+                       name: Optional[str] = None,
+                       description: Optional[str] = None,
+                       tier: Optional[str] = None) -> dict:
+        """Update project metadata. Returns updated project dict."""
+
+    @abstractmethod
+    def list_projects(self, owner: Optional[str] = None) -> list:
+        """List projects, optionally filtered by owner.
+
+        Returns list of project metadata dicts.
+        """
+
     # --- Vector Operations ---
 
     @abstractmethod
@@ -632,7 +663,102 @@ class Neo4jBaseAdapter(BackendAdapter):
                 pid=project_id,
             )
             counts["nodes_deleted"] = result.single()["c"]
+            # Also remove the ProjectMeta node
+            session.run(
+                "MATCH (pm:ProjectMeta {project_id: $pid}) DELETE pm",
+                pid=project_id,
+            )
         return counts
+
+    # --- Project Management (SUP-134) ---
+
+    def create_project(self, project_id, name, owner, description="",
+                       tier="free"):
+        if tier not in TIER_LIMITS:
+            raise ValueError(f"Invalid tier: {tier}. Valid: {list(TIER_LIMITS.keys())}")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._driver.session() as session:
+            # Check if project already exists
+            existing = session.run(
+                "MATCH (pm:ProjectMeta {project_id: $pid}) RETURN pm",
+                pid=project_id,
+            ).single()
+            if existing:
+                raise ValueError(f"Project '{project_id}' already exists")
+            session.run(
+                """
+                CREATE (pm:ProjectMeta {
+                    project_id: $pid,
+                    name: $name,
+                    description: $desc,
+                    owner: $owner,
+                    tier: $tier,
+                    created_at: $now,
+                    updated_at: $now
+                })
+                """,
+                pid=project_id, name=name, desc=description,
+                owner=owner, tier=tier, now=now,
+            )
+        return {
+            "created": True, "project_id": project_id, "name": name,
+            "description": description, "owner": owner, "tier": tier,
+            "created_at": now, "updated_at": now,
+        }
+
+    def get_project(self, project_id):
+        with self._driver.session() as session:
+            result = session.run(
+                "MATCH (pm:ProjectMeta {project_id: $pid}) RETURN pm",
+                pid=project_id,
+            ).single()
+            if not result:
+                return None
+            props = dict(result["pm"])
+            return props
+
+    def update_project(self, project_id, name=None, description=None,
+                       tier=None):
+        if tier is not None and tier not in TIER_LIMITS:
+            raise ValueError(f"Invalid tier: {tier}. Valid: {list(TIER_LIMITS.keys())}")
+        now = datetime.now(timezone.utc).isoformat()
+        set_clauses = ["pm.updated_at = $now"]
+        params: dict = {"pid": project_id, "now": now}
+        if name is not None:
+            set_clauses.append("pm.name = $name")
+            params["name"] = name
+        if description is not None:
+            set_clauses.append("pm.description = $desc")
+            params["desc"] = description
+        if tier is not None:
+            set_clauses.append("pm.tier = $tier")
+            params["tier"] = tier
+
+        with self._driver.session() as session:
+            result = session.run(
+                f"MATCH (pm:ProjectMeta {{project_id: $pid}}) "
+                f"SET {', '.join(set_clauses)} "
+                f"RETURN pm",
+                **params,
+            ).single()
+            if not result:
+                return {"updated": False, "error": f"Project '{project_id}' not found"}
+            return {"updated": True, **dict(result["pm"])}
+
+    def list_projects(self, owner=None):
+        with self._driver.session() as session:
+            if owner:
+                records = session.run(
+                    "MATCH (pm:ProjectMeta {owner: $owner}) "
+                    "RETURN pm ORDER BY pm.created_at DESC",
+                    owner=owner,
+                )
+            else:
+                records = session.run(
+                    "MATCH (pm:ProjectMeta) "
+                    "RETURN pm ORDER BY pm.created_at DESC",
+                )
+            return [dict(rec["pm"]) for rec in records]
 
     def get_usage(self, project_id="default"):
         with self._driver.session() as session:

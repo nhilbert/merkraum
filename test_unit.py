@@ -581,6 +581,7 @@ class TestBackendAdapterInterface(unittest.TestCase):
             "traverse", "get_beliefs", "get_stats", "delete_project_data",
             "update_node", "delete_node", "add_relationship", "delete_relationship",
             "merge_nodes", "vector_search", "vector_upsert", "vector_delete",
+            "create_project", "get_project", "update_project", "list_projects",
         ]
         for method in required:
             self.assertTrue(hasattr(Neo4jQdrantAdapter, method),
@@ -933,6 +934,127 @@ class TestGraphMutationOperations(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result.get("keep_node_id"), "keep-1")
         self.assertEqual(result.get("remove_node_id"), "remove-1")
+
+
+# --- Project Management (SUP-134) ---
+
+class TestCreateProject(unittest.TestCase):
+    """Test Neo4jBaseAdapter.create_project."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def _mock_no_existing(self):
+        mock_result = MagicMock()
+        mock_result.single.return_value = None
+        self.session.run.side_effect = [mock_result, None]
+
+    def _mock_existing(self):
+        mock_result = MagicMock()
+        mock_result.single.return_value = {"pm": {"project_id": "test"}}
+        self.session.run.return_value = mock_result
+
+    def test_create_new_project(self):
+        self._mock_no_existing()
+        result = self.adapter.create_project("test", "Test Project", "user1")
+        self.assertTrue(result["created"])
+        self.assertEqual(result["project_id"], "test")
+        self.assertEqual(result["name"], "Test Project")
+        self.assertEqual(result["owner"], "user1")
+        self.assertEqual(result["tier"], "free")
+
+    def test_create_duplicate_raises(self):
+        self._mock_existing()
+        with self.assertRaises(ValueError) as ctx:
+            self.adapter.create_project("test", "Test", "user1")
+        self.assertIn("already exists", str(ctx.exception))
+
+    def test_invalid_tier_raises(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.adapter.create_project("test", "Test", "user1", tier="invalid")
+        self.assertIn("Invalid tier", str(ctx.exception))
+
+
+class TestGetProject(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_get_existing(self):
+        mock_result = MagicMock()
+        mock_pm = MagicMock()
+        mock_pm.__iter__ = lambda s: iter([("project_id", "test"), ("name", "Test")])
+        mock_pm.items = lambda: [("project_id", "test"), ("name", "Test")]
+        mock_pm.keys = lambda: ["project_id", "name"]
+        mock_pm.__getitem__ = lambda s, k: {"project_id": "test", "name": "Test"}[k]
+        mock_result.single.return_value = {"pm": mock_pm}
+        self.session.run.return_value = mock_result
+        result = self.adapter.get_project("test")
+        self.assertIsNotNone(result)
+
+    def test_get_nonexistent(self):
+        mock_result = MagicMock()
+        mock_result.single.return_value = None
+        self.session.run.return_value = mock_result
+        result = self.adapter.get_project("nonexistent")
+        self.assertIsNone(result)
+
+
+class TestUpdateProject(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_update_not_found(self):
+        mock_result = MagicMock()
+        mock_result.single.return_value = None
+        self.session.run.return_value = mock_result
+        result = self.adapter.update_project("nonexistent", name="New Name")
+        self.assertFalse(result["updated"])
+
+    def test_invalid_tier_raises(self):
+        with self.assertRaises(ValueError):
+            self.adapter.update_project("test", tier="invalid")
+
+
+class TestListProjects(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_list_empty(self):
+        self.session.run.return_value = []
+        result = self.adapter.list_projects()
+        self.assertEqual(result, [])
+
+    def test_list_with_owner_filter(self):
+        self.session.run.return_value = []
+        self.adapter.list_projects(owner="user1")
+        cypher = self.session.run.call_args[0][0]
+        self.assertIn("owner", cypher)
+
+
+class TestProjectManagementInterface(unittest.TestCase):
+    """Verify project management methods exist on adapters."""
+
+    def test_methods_exist(self):
+        for method in ["create_project", "get_project", "update_project", "list_projects"]:
+            self.assertTrue(hasattr(Neo4jQdrantAdapter, method),
+                            f"Neo4jQdrantAdapter missing {method}")
+            self.assertTrue(hasattr(Neo4jPineconeAdapter, method),
+                            f"Neo4jPineconeAdapter missing {method}")
 
 
 if __name__ == "__main__":

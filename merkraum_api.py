@@ -463,7 +463,11 @@ def discover():
             {"path": "/api/nodes/merge", "method": "POST", "auth": True, "description": "Merge two nodes"},
             {"path": "/api/health", "method": "GET", "auth": True, "description": "Service health check"},
             {"path": "/api/usage", "method": "GET", "auth": True, "description": "Usage metrics and tier limits"},
-            {"path": "/api/projects", "method": "GET", "auth": True, "description": "List accessible projects"},
+            {"path": "/api/projects", "method": "GET", "auth": True, "description": "List projects (detail=true for metadata)"},
+            {"path": "/api/projects", "method": "POST", "auth": True, "description": "Create a new project (knowledge space)"},
+            {"path": "/api/projects/<id>", "method": "GET", "auth": True, "description": "Get project metadata and usage"},
+            {"path": "/api/projects/<id>", "method": "PATCH", "auth": True, "description": "Update project metadata"},
+            {"path": "/api/projects/<id>", "method": "DELETE", "auth": True, "description": "Delete project and all data"},
         ],
         "operator": {
             "name": "Supervision Rheinland",
@@ -511,15 +515,45 @@ def health():
 @app.route("/api/projects", methods=["GET"])
 @require_auth
 def projects():
-    """List all project IDs that have data in the graph.
+    """List projects with metadata.
 
     Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
-    Returns a sorted list of project_id strings.
+
+    Query params:
+        detail: if "true", return full project metadata from ProjectMeta nodes.
+                Otherwise return sorted list of project_id strings (legacy).
+
+    Returns: list of project metadata dicts (detail=true) or project_id strings.
     """
     adp = adapter
     if adp is None:
         return _error("Adapter not initialized", 503)
     try:
+        detail = request.args.get("detail", "false").lower() in ("true", "1", "yes")
+        if detail:
+            owner = None
+            if _is_auth_required():
+                owner_filter = getattr(request, "user_id", None)
+                admin_groups = _split_csv_env("ADMIN_GROUPS")
+                groups = set(getattr(request, "groups", []) or [])
+                # Admins see all projects; non-admins see own projects only
+                if not (admin_groups and groups.intersection(admin_groups)):
+                    owner = owner_filter
+            project_list = adp.list_projects(owner=owner)
+            # Enrich with usage stats
+            for proj in project_list:
+                pid = proj.get("project_id", "")
+                if _is_project_allowed(pid):
+                    try:
+                        usage = adp.get_usage(project_id=pid)
+                        proj["nodes"] = usage.get("nodes", 0)
+                        proj["edges"] = usage.get("edges", 0)
+                    except Exception:
+                        proj["nodes"] = 0
+                        proj["edges"] = 0
+            return jsonify(project_list)
+
+        # Legacy mode: just project_id strings
         with adp._driver.session() as session:
             records = session.run(
                 "MATCH (n) WHERE n.project_id IS NOT NULL "
@@ -531,6 +565,147 @@ def projects():
         return jsonify(project_ids)
     except Exception as exc:
         logger.exception("projects listing failed")
+        return _error(str(exc))
+
+
+@app.route("/api/projects", methods=["POST"])
+@require_auth
+def create_project():
+    """Create a new project (knowledge space).
+
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
+
+    Body (JSON):
+        name: display name (required)
+        project_id: unique identifier (optional — derived from name if omitted)
+        description: project description (optional)
+        tier: pricing tier — free, pro, team, enterprise (default: "free")
+
+    Returns: created project metadata.
+    """
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+    body = request.get_json(silent=True) or {}
+    name = body.get("name", "").strip()
+    if not name:
+        return _error("'name' is required", 400)
+
+    # Derive project_id from name if not provided
+    project_id = body.get("project_id", "").strip()
+    if not project_id:
+        import re
+        project_id = re.sub(r"[^a-z0-9_-]", "-", name.lower())
+        project_id = re.sub(r"-+", "-", project_id).strip("-")
+    if not project_id:
+        return _error("Could not derive a valid project_id", 400)
+    if project_id == "default":
+        return _error("Cannot create project with reserved id 'default'", 400)
+
+    owner = getattr(request, "user_id", None) or "anonymous"
+    description = body.get("description", "")
+    tier = body.get("tier", "free")
+
+    try:
+        result = adp.create_project(
+            project_id=project_id, name=name, owner=owner,
+            description=description, tier=tier,
+        )
+        return jsonify(result), 201
+    except ValueError as exc:
+        return _error(str(exc), 409)
+    except Exception as exc:
+        logger.exception("create_project failed")
+        return _error(str(exc))
+
+
+@app.route("/api/projects/<path:project_id>", methods=["GET"])
+@require_auth
+def get_project(project_id):
+    """Get project metadata and usage.
+
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
+    """
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+    denied = _deny_if_project_forbidden(project_id)
+    if denied:
+        return denied
+    try:
+        proj = adp.get_project(project_id)
+        if not proj:
+            return _error(f"Project '{project_id}' not found", 404)
+        # Enrich with usage
+        usage = adp.get_usage(project_id=project_id)
+        proj["nodes"] = usage.get("nodes", 0)
+        proj["edges"] = usage.get("edges", 0)
+        proj["node_limit"] = TIER_LIMITS.get(proj.get("tier", "free"), 100)
+        return jsonify(proj)
+    except Exception as exc:
+        logger.exception("get_project failed for %s", project_id)
+        return _error(str(exc))
+
+
+@app.route("/api/projects/<path:project_id>", methods=["PATCH"])
+@require_auth
+def update_project(project_id):
+    """Update project metadata.
+
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
+
+    Body (JSON):
+        name: new display name (optional)
+        description: new description (optional)
+        tier: new tier (optional)
+    """
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+    denied = _deny_if_project_forbidden(project_id)
+    if denied:
+        return denied
+    body = request.get_json(silent=True) or {}
+    try:
+        result = adp.update_project(
+            project_id=project_id,
+            name=body.get("name"),
+            description=body.get("description"),
+            tier=body.get("tier"),
+        )
+        if not result.get("updated"):
+            return _error(result.get("error", "Update failed"), 404)
+        return jsonify(result)
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except Exception as exc:
+        logger.exception("update_project failed for %s", project_id)
+        return _error(str(exc))
+
+
+@app.route("/api/projects/<path:project_id>", methods=["DELETE"])
+@require_auth
+def delete_project(project_id):
+    """Delete a project and all its data.
+
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
+    WARNING: This is irreversible. Deletes all nodes, relationships, and metadata.
+    """
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+    denied = _deny_if_project_forbidden(project_id)
+    if denied:
+        return denied
+    if project_id == "default":
+        return _error("Cannot delete the default project", 400)
+    try:
+        counts = adp.delete_project_data(project_id=project_id)
+        return jsonify({"deleted": True, "project_id": project_id, **counts})
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except Exception as exc:
+        logger.exception("delete_project failed for %s", project_id)
         return _error(str(exc))
 
 
