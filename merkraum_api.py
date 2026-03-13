@@ -69,6 +69,7 @@ MAX_NODES_LIMIT = 500
 MAX_SEARCH_TOP = 50
 MAX_TRAVERSE_DEPTH = 5
 MAX_GRAPH_HOPS = 3
+MAX_GRAPH_EXPAND_LIMIT = 100
 
 
 def _allowed_origins() -> set[str]:
@@ -424,6 +425,162 @@ def _get_text_subgraph(adp, project_id: str, query: str, *, limit: int, hops: in
     }
 
 
+def _get_node_expansion(
+    adp,
+    project_id: str,
+    *,
+    node_id: str,
+    node_name: str,
+    node_type: str,
+    limit: int,
+) -> dict:
+    """Expand one node by fetching up to N direct neighbors and connecting edges."""
+    with adp._driver.session() as session:
+        seed_record = session.run(
+            """
+            MATCH (s {project_id: $pid})
+            WHERE any(lbl IN labels(s) WHERE lbl IN $node_types)
+              AND (
+                ($node_id <> '' AND coalesce(s.node_id, '') = $node_id)
+                OR
+                ($node_name <> '' AND s.name = $node_name
+                  AND ($node_type = '' OR $node_type IN labels(s)))
+              )
+            RETURN elementId(s) AS eid,
+                   s.name AS name,
+                   labels(s)[0] AS node_type,
+                   s.summary AS summary,
+                   s.node_id AS node_id,
+                   s.confidence AS confidence
+            LIMIT 1
+            """,
+            pid=project_id,
+            node_types=list(NODE_TYPES),
+            node_id=node_id,
+            node_name=node_name,
+            node_type=node_type,
+        ).single()
+
+        if not seed_record:
+            return {
+                "nodes": [],
+                "links": [],
+                "meta": {
+                    "mode": "node_expand",
+                    "seed_node_id": node_id or None,
+                    "seed_name": node_name or None,
+                    "returned_nodes": 0,
+                    "returned_links": 0,
+                    "truncated": False,
+                },
+            }
+
+        seed_eid = seed_record.get("eid")
+        total_neighbors_record = session.run(
+            """
+            MATCH (s)
+            WHERE elementId(s) = $seed_eid
+            MATCH (s)-[]-(n {project_id: $pid})
+            WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+            RETURN count(DISTINCT n) AS total
+            """,
+            seed_eid=seed_eid,
+            pid=project_id,
+            node_types=list(NODE_TYPES),
+        ).single()
+        total_neighbors = int((total_neighbors_record or {}).get("total") or 0)
+
+        neighbor_records = list(
+            session.run(
+                """
+                MATCH (s)
+                WHERE elementId(s) = $seed_eid
+                MATCH (s)-[]-(n {project_id: $pid})
+                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+                WITH DISTINCT n
+                LIMIT $limit
+                RETURN elementId(n) AS eid,
+                       n.name AS name,
+                       labels(n)[0] AS node_type,
+                       n.summary AS summary,
+                       n.node_id AS node_id,
+                       n.confidence AS confidence
+                """,
+                seed_eid=seed_eid,
+                pid=project_id,
+                node_types=list(NODE_TYPES),
+                limit=limit,
+            )
+        )
+
+        seed_node = {
+            "name": seed_record.get("name") or "",
+            "type": seed_record.get("node_type") or "Concept",
+            "summary": seed_record.get("summary") or "",
+            "node_id": seed_record.get("node_id"),
+            "confidence": seed_record.get("confidence"),
+        }
+        neighbor_nodes = [
+            {
+                "name": rec.get("name") or "",
+                "type": rec.get("node_type") or "Concept",
+                "summary": rec.get("summary") or "",
+                "node_id": rec.get("node_id"),
+                "confidence": rec.get("confidence"),
+            }
+            for rec in neighbor_records
+            if rec.get("eid") and rec.get("eid") != seed_eid
+        ]
+
+        included_eids = [seed_eid] + [
+            rec.get("eid")
+            for rec in neighbor_records
+            if rec.get("eid") and rec.get("eid") != seed_eid
+        ]
+
+        edge_limit = max(limit * 4, MAX_GRAPH_EXPAND_LIMIT)
+        edge_records = list(
+            session.run(
+                """
+                UNWIND $eids AS eid
+                MATCH (n)
+                WHERE elementId(n) = eid
+                WITH collect(n) AS nodes
+                UNWIND nodes AS a
+                MATCH (a)-[r]->(b)
+                WHERE b IN nodes
+                RETURN a.name AS source_name,
+                       b.name AS target_name,
+                       labels(a)[0] AS source_type,
+                       labels(b)[0] AS target_type,
+                       a.node_id AS source_node_id,
+                       b.node_id AS target_node_id,
+                       type(r) AS type,
+                       r.confidence AS confidence,
+                       r.reason AS reason
+                LIMIT $edge_limit
+                """,
+                eids=included_eids,
+                edge_limit=edge_limit,
+            )
+        )
+
+    return {
+        "nodes": [_map_node_for_graph(n) for n in [seed_node, *neighbor_nodes]],
+        "links": [_map_edge_for_graph(dict(rec)) for rec in edge_records],
+        "meta": {
+            "mode": "node_expand",
+            "seed_node_id": seed_node.get("node_id"),
+            "seed_name": seed_node.get("name"),
+            "returned_neighbors": len(neighbor_nodes),
+            "total_neighbors": total_neighbors,
+            "returned_nodes": len(neighbor_nodes) + 1,
+            "returned_links": len(edge_records),
+            "truncated": total_neighbors > len(neighbor_nodes),
+        },
+    }
+
+
 def _map_stats(raw: dict) -> dict:
     """Map adapter stats dict to frontend format.
 
@@ -632,6 +789,7 @@ def discover():
             {"path": "/api/beliefs", "method": "GET", "auth": True, "description": "List beliefs by status"},
             {"path": "/api/stats", "method": "GET", "auth": True, "description": "Graph statistics"},
             {"path": "/api/graph", "method": "GET", "auth": True, "description": "Full graph data for visualization"},
+            {"path": "/api/graph/expand", "method": "GET", "auth": True, "description": "Expand one node by loading direct neighbors"},
             {"path": "/api/nodes", "method": "GET", "auth": True, "description": "Query nodes by type"},
             {"path": "/api/node", "method": "PATCH", "auth": True, "description": "Update node attributes"},
             {"path": "/api/node", "method": "DELETE", "auth": True, "description": "Delete node and attached edges"},
@@ -1237,6 +1395,55 @@ def graph():
         return jsonify({"nodes": nodes, "links": links, "meta": {"mode": "full", "truncated": len(nodes) >= limit}})
     except Exception as exc:
         logger.exception("graph failed for project=%s", project)
+        return _error(str(exc))
+
+
+@app.route("/api/graph/expand", methods=["GET"])
+@require_auth
+@require_scope("read")
+def graph_expand():
+    """Expand a single node with direct neighbors.
+
+    Query params:
+        project: project id (default: "default")
+        node_id: node identifier (preferred)
+        node_name: fallback node name if node_id is unavailable
+        node_type: optional fallback node type when matching by name
+        limit: max neighbors to return (default/max: 100)
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    node_id = (request.args.get("node_id") or "").strip()
+    node_name = (request.args.get("node_name") or "").strip()
+    node_type = (request.args.get("node_type") or "").strip()
+    if not node_id and not node_name:
+        return _error("Query parameter 'node_id' or 'node_name' is required", 400)
+
+    try:
+        limit = int(request.args.get("limit", MAX_GRAPH_EXPAND_LIMIT))
+    except (TypeError, ValueError):
+        limit = MAX_GRAPH_EXPAND_LIMIT
+    limit = max(1, min(limit, MAX_GRAPH_EXPAND_LIMIT))
+
+    try:
+        return jsonify(
+            _get_node_expansion(
+                adapter,
+                project,
+                node_id=node_id,
+                node_name=node_name,
+                node_type=node_type,
+                limit=limit,
+            )
+        )
+    except Exception as exc:
+        logger.exception("graph_expand failed for project=%s node_id=%s", project, node_id)
         return _error(str(exc))
 
 
