@@ -419,7 +419,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                         params["confidence"] = ent.get("confidence", 0.7)
                         session.run(
                             """
-                            MERGE (n:Belief {{name: $name, project_id: $project_id}})
+                            MERGE (n:Belief {name: $name, project_id: $project_id})
                             ON CREATE SET
                                 n.summary = $summary, n.created_at = $now,
                                 n.updated_at = $now, n.source_cycle = $source_cycle,

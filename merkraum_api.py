@@ -702,6 +702,150 @@ def delete_project(project_id):
         return _error(str(exc))
 
 
+# ---------------------------------------------------------------------------
+# Sample data seeding — TechFlow GmbH demo project
+# ---------------------------------------------------------------------------
+
+SAMPLE_PROJECT_ID_SUFFIX = "techflow-demo"
+SAMPLE_PROJECT_NAME = "TechFlow GmbH — AI Deployment"
+
+SAMPLE_ENTITIES = [
+    {"name": "TechFlow GmbH", "node_type": "Organization",
+     "summary": "450-person company in Munich and Berlin, using AI for customer service since January 2026."},
+    {"name": "Maria Weber", "node_type": "Person",
+     "summary": "CTO of TechFlow GmbH, champion of the AI-First Support initiative."},
+    {"name": "AI-First Support", "node_type": "Project",
+     "summary": "ChatGPT-based customer service automation at TechFlow GmbH, launched January 2026."},
+    {"name": "Betriebsrat TechFlow", "node_type": "Organization",
+     "summary": "Works council at TechFlow GmbH, consulted during AI deployment planning."},
+    # Beliefs — Phase 1 (initial success)
+    {"name": "AI reduced ticket resolution time by 40%", "node_type": "Belief",
+     "summary": "Initial deployment of AI agents reduced ticket resolution time by 40%.",
+     "confidence": 0.85},
+    {"name": "Customer satisfaction improved from 3.2 to 4.1", "node_type": "Belief",
+     "summary": "Customer satisfaction scores improved from 3.2 to 4.1 out of 5 after AI deployment.",
+     "confidence": 0.82},
+    # Beliefs — Phase 2 (contradicting evidence from Q2 review)
+    {"name": "Complex escalations increased by 25%", "node_type": "Belief",
+     "summary": "While simple tickets improved, complex escalations increased by 25% since AI launch.",
+     "confidence": 0.78, "status": "active"},
+    {"name": "Support team satisfaction dropped to 2.9", "node_type": "Belief",
+     "summary": "Employee satisfaction in the support team dropped from 3.8 to 2.9 — agents feel deskilled.",
+     "confidence": 0.80, "status": "active"},
+    {"name": "Overall CSAT declined to 3.6 when including complex cases", "node_type": "Belief",
+     "summary": "When counting complex tickets, overall CSAT dropped from 4.1 to 3.6.",
+     "confidence": 0.75, "status": "active"},
+    # Beliefs — Phase 3 (VSM diagnostic)
+    {"name": "Dr. Meier", "node_type": "Person",
+     "summary": "Organizational consultant hired by TechFlow to assess the AI transition."},
+    {"name": "AI deployment optimized S1 but neglected S2 and S3", "node_type": "Belief",
+     "summary": "Operations (S1) improved but coordination (S2) and quality control (S3) of human-AI handoff were neglected.",
+     "confidence": 0.88, "status": "active"},
+]
+
+SAMPLE_RELATIONSHIPS = [
+    {"source": "Maria Weber", "target": "TechFlow GmbH",
+     "type": "AFFILIATED_WITH", "reason": "CTO", "confidence": 0.95},
+    {"source": "Maria Weber", "target": "AI-First Support",
+     "type": "PRODUCES", "reason": "Championed the initiative", "confidence": 0.90},
+    {"source": "AI-First Support", "target": "TechFlow GmbH",
+     "type": "PART_OF", "reason": "Company project", "confidence": 0.95},
+    {"source": "Betriebsrat TechFlow", "target": "TechFlow GmbH",
+     "type": "PART_OF", "reason": "Works council", "confidence": 0.95},
+    {"source": "Betriebsrat TechFlow", "target": "AI-First Support",
+     "type": "CONSTRAINS", "reason": "Signed Betriebsvereinbarung on AI use", "confidence": 0.85},
+    # Phase 1 beliefs support the project
+    {"source": "AI reduced ticket resolution time by 40%", "target": "AI-First Support",
+     "type": "SUPPORTS", "reason": "Initial deployment metric", "confidence": 0.85},
+    {"source": "Customer satisfaction improved from 3.2 to 4.1", "target": "AI-First Support",
+     "type": "SUPPORTS", "reason": "Customer feedback improvement", "confidence": 0.82},
+    # Phase 2 contradictions
+    {"source": "Complex escalations increased by 25%", "target": "AI reduced ticket resolution time by 40%",
+     "type": "CONTRADICTS", "reason": "Resolution time improvement masked escalation increase", "confidence": 0.78},
+    {"source": "Overall CSAT declined to 3.6 when including complex cases",
+     "target": "Customer satisfaction improved from 3.2 to 4.1",
+     "type": "CONTRADICTS", "reason": "Including complex tickets reverses the CSAT improvement", "confidence": 0.75},
+    {"source": "Support team satisfaction dropped to 2.9", "target": "AI-First Support",
+     "type": "CONSTRAINS", "reason": "Employee deskilling risk", "confidence": 0.80},
+    # Phase 3 — VSM diagnostic
+    {"source": "Dr. Meier", "target": "TechFlow GmbH",
+     "type": "APPLIES", "reason": "Hired as organizational consultant", "confidence": 0.95},
+    {"source": "AI deployment optimized S1 but neglected S2 and S3", "target": "AI-First Support",
+     "type": "CONSTRAINS", "reason": "VSM diagnostic finding", "confidence": 0.88},
+]
+
+
+@app.route("/api/projects/seed-sample", methods=["POST"])
+@require_auth
+@require_scope("projects")
+def seed_sample_project():
+    """Create a demo project pre-loaded with TechFlow GmbH sample data.
+
+    The sample project demonstrates belief tracking, contradiction detection,
+    and graph traversal using a realistic consulting scenario.
+
+    Returns the created project metadata and ingestion counts.
+    """
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+
+    owner = getattr(request, "user_id", None) or "anonymous"
+    project_id = f"{owner}:{SAMPLE_PROJECT_ID_SUFFIX}"
+
+    # Check if sample project already exists
+    existing = adp.get_project(project_id)
+    if existing:
+        return _error(
+            f"Sample project already exists ('{project_id}'). "
+            "Delete it first if you want to re-create it.",
+            409,
+        )
+
+    try:
+        # 1. Create the project
+        adp.create_project(
+            project_id=project_id,
+            name=SAMPLE_PROJECT_NAME,
+            owner=owner,
+            description=(
+                "Demo project: AI deployment at TechFlow GmbH. "
+                "Shows belief tracking, contradiction detection, and VSM diagnostics."
+            ),
+            tier="free",
+        )
+
+        # 2. Write entities
+        entities_written = adp.write_entities(
+            SAMPLE_ENTITIES,
+            source_cycle="sample-seed",
+            source_type="sample",
+            project_id=project_id,
+        )
+
+        # 3. Write relationships
+        relationships_written = adp.write_relationships(
+            SAMPLE_RELATIONSHIPS,
+            source_cycle="sample-seed",
+            source_type="sample",
+            project_id=project_id,
+        )
+
+        return jsonify({
+            "project_id": project_id,
+            "name": SAMPLE_PROJECT_NAME,
+            "entities_written": entities_written,
+            "relationships_written": relationships_written,
+            "message": "Sample project created with TechFlow GmbH demo data.",
+        }), 201
+
+    except ValueError as exc:
+        return _error(str(exc), 409)
+    except Exception as exc:
+        logger.exception("seed_sample_project failed")
+        return _error(str(exc))
+
+
 @app.route("/api/stats", methods=["GET"])
 @require_auth
 @require_scope("read")
