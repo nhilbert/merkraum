@@ -64,10 +64,11 @@ ALLOWED_ORIGINS = {
     "http://localhost:5173",
 }
 
-MAX_GRAPH_LIMIT = 1000
+MAX_GRAPH_LIMIT = 5000
 MAX_NODES_LIMIT = 500
 MAX_SEARCH_TOP = 50
 MAX_TRAVERSE_DEPTH = 5
+MAX_GRAPH_HOPS = 3
 
 
 def _allowed_origins() -> set[str]:
@@ -157,6 +158,13 @@ def _error(message: str, status: int = 500):
     return jsonify({'error': message}), status
 
 
+def _token_has_scope(scope: str) -> bool:
+    """Check PAT scope; Cognito JWT users are treated as fully scoped."""
+    pat_scopes = getattr(request, 'pat_scopes', None)
+    if pat_scopes is None:
+        return True
+    return scope in pat_scopes or 'admin' in pat_scopes
+
 
 def _get_all_edges(adp, project_id: str, limit: int = 1000) -> list:
     """Query all relationships for a project directly via Neo4j driver."""
@@ -192,6 +200,112 @@ def _get_all_edges(adp, project_id: str, limit: int = 1000) -> list:
                 }
             )
     return edges
+
+
+def _get_semantic_subgraph(adp, project_id: str, query: str, *, limit: int, hops: int, top: int) -> dict:
+    """Build a query-centered subgraph via semantic seeds + N-hop neighborhood."""
+    seed_hits = adp.vector_search(query_text=query, top_k=top, project_id=project_id)
+    seed_names: list[str] = []
+    for hit in seed_hits:
+        metadata = hit.get("metadata") if isinstance(hit, dict) else None
+        if not isinstance(metadata, dict):
+            continue
+        name = metadata.get("name")
+        if isinstance(name, str) and name.strip():
+            seed_names.append(name.strip())
+
+    # Preserve order while deduplicating.
+    seen = set()
+    deduped_seeds: list[str] = []
+    for name in seed_names:
+        if name in seen:
+            continue
+        seen.add(name)
+        deduped_seeds.append(name)
+
+    if not deduped_seeds:
+        return {"nodes": [], "links": [], "meta": {"mode": "semantic_subgraph", "query": query, "seed_count": 0, "hops": hops}}
+
+    # Variable length in Cypher needs literal bounds, so hops is validated and interpolated.
+    depth = max(0, min(hops, MAX_GRAPH_HOPS))
+    node_records = []
+    with adp._driver.session() as session:
+        node_records = list(session.run(
+            f"""
+            MATCH (s {{project_id: $pid}})
+            WHERE s.name IN $seed_names
+            MATCH p=(s)-[*0..{depth}]-(n {{project_id: $pid}})
+            WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+            WITH DISTINCT n
+            LIMIT $limit
+            RETURN elementId(n) AS eid,
+                   n.name AS name,
+                   labels(n)[0] AS node_type,
+                   n.summary AS summary,
+                   n.node_id AS node_id,
+                   n.confidence AS confidence
+            """,
+            pid=project_id,
+            seed_names=deduped_seeds,
+            node_types=list(NODE_TYPES),
+            limit=limit,
+        ))
+
+    nodes = [
+        {
+            "name": rec.get("name") or "",
+            "type": rec.get("node_type") or "Concept",
+            "summary": rec.get("summary") or "",
+            "node_id": rec.get("node_id"),
+            "confidence": rec.get("confidence"),
+        }
+        for rec in node_records
+    ]
+
+    element_ids = [rec.get("eid") for rec in node_records if rec.get("eid")]
+    if not element_ids:
+        return {"nodes": [], "links": [], "meta": {"mode": "semantic_subgraph", "query": query, "seed_count": len(deduped_seeds), "hops": depth}}
+
+    links = []
+    with adp._driver.session() as session:
+        edge_records = session.run(
+            """
+            UNWIND $eids AS eid
+            MATCH (n)
+            WHERE elementId(n) = eid
+            WITH collect(n) AS nodes
+            UNWIND nodes AS a
+            MATCH (a)-[r]->(b)
+            WHERE b IN nodes
+            RETURN a.name AS source_name,
+                   b.name AS target_name,
+                   labels(a)[0] AS source_type,
+                   labels(b)[0] AS target_type,
+                   a.node_id AS source_node_id,
+                   b.node_id AS target_node_id,
+                   type(r) AS type,
+                   r.confidence AS confidence,
+                   r.reason AS reason
+            LIMIT $limit
+            """,
+            eids=element_ids,
+            limit=limit,
+        )
+        links = [dict(rec) for rec in edge_records]
+
+    return {
+        "nodes": [_map_node_for_graph(n) for n in nodes],
+        "links": [_map_edge_for_graph(e) for e in links],
+        "meta": {
+            "mode": "semantic_subgraph",
+            "query": query,
+            "seed_count": len(deduped_seeds),
+            "hops": depth,
+            "returned_nodes": len(nodes),
+            "returned_links": len(links),
+            "truncated": len(nodes) >= limit,
+        },
+    }
 
 
 def _map_stats(raw: dict) -> dict:
@@ -946,11 +1060,14 @@ def beliefs():
 @require_auth
 @require_scope("read")
 def graph():
-    """All nodes + relationships for force-graph visualization.
+    """Graph data for visualization.
 
     Query params:
         project: project id (default: "default")
-        limit: max edges to return (default: 500)
+        limit: max nodes/edges to return (default: 500)
+        q: optional semantic query. When set, returns query-centered subgraph.
+        hops: neighborhood depth for semantic subgraph (default: 1, max: 3)
+        top: number of semantic seed hits (default: 12, max: 50)
     """
     if adapter is None:
         return _error("Adapter not initialized", 503)
@@ -964,14 +1081,33 @@ def graph():
         limit = 500
     limit = max(1, min(limit, MAX_GRAPH_LIMIT))
 
+    query = (request.args.get("q") or "").strip()
     try:
+        hops = int(request.args.get("hops", 1))
+    except (TypeError, ValueError):
+        hops = 1
+    hops = max(0, min(hops, MAX_GRAPH_HOPS))
+
+    try:
+        top = int(request.args.get("top", 12))
+    except (TypeError, ValueError):
+        top = 12
+    top = max(1, min(top, MAX_SEARCH_TOP))
+
+    if query and not _token_has_scope("search"):
+        return _error("Token lacks required scope: search", 403)
+
+    try:
+        if query:
+            return jsonify(_get_semantic_subgraph(adapter, project, query, limit=limit, hops=hops, top=top))
+
         raw_nodes = adapter.query_nodes(node_type=None, project_id=project, limit=limit)
         raw_edges = _get_all_edges(adapter, project, limit=limit)
 
         nodes = [_map_node_for_graph(n) for n in raw_nodes]
         links = [_map_edge_for_graph(e) for e in raw_edges]
 
-        return jsonify({"nodes": nodes, "links": links})
+        return jsonify({"nodes": nodes, "links": links, "meta": {"mode": "full", "truncated": len(nodes) >= limit}})
     except Exception as exc:
         logger.exception("graph failed for project=%s", project)
         return _error(str(exc))

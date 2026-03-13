@@ -71,5 +71,67 @@ class TestMcpClientBinding(unittest.TestCase):
             merkraum_mcp_server.MCP_ALLOWED_CLIENT_IDS = old_allowed
 
 
+class TestGraphQueryHardening(unittest.TestCase):
+    def test_semantic_graph_query_requires_search_scope_for_pat(self):
+        with patch.dict(os.environ, {"AUTH_REQUIRED": "false"}, clear=True):
+            import merkraum_api
+            previous_adapter = merkraum_api.adapter
+            try:
+                merkraum_api.adapter = object()
+                with merkraum_api.app.test_request_context("/api/graph?project=test-proj&q=risk"):
+                    from flask import request
+                    request.user_id = "user-123"
+                    request.groups = []
+                    request.pat_scopes = ["read"]
+                    request.pat_projects = ["test-proj"]
+                    request.pat_all_projects = False
+
+                    response, status = merkraum_api.graph()
+                    self.assertEqual(status, 403)
+                    self.assertEqual(response.get_json().get("error"), "Token lacks required scope: search")
+            finally:
+                merkraum_api.adapter = previous_adapter
+
+    def test_semantic_graph_query_clamps_params_and_calls_subgraph_builder(self):
+        with patch.dict(os.environ, {"AUTH_REQUIRED": "false"}, clear=True):
+            import merkraum_api
+            previous_adapter = merkraum_api.adapter
+            try:
+                merkraum_api.adapter = object()
+                with patch.object(
+                    merkraum_api,
+                    "_get_semantic_subgraph",
+                    return_value={
+                        "nodes": [],
+                        "links": [],
+                        "meta": {"mode": "semantic_subgraph", "truncated": False},
+                    },
+                ) as subgraph_mock:
+                    with merkraum_api.app.test_request_context(
+                        "/api/graph?project=test-proj&q=delta&hops=99&top=999&limit=99999"
+                    ):
+                        from flask import request
+                        request.user_id = "user-123"
+                        request.groups = []
+                        request.pat_scopes = ["read", "search"]
+                        request.pat_projects = ["test-proj"]
+                        request.pat_all_projects = False
+
+                        response = merkraum_api.graph()
+                        self.assertEqual(response.status_code, 200)
+                        payload = response.get_json()
+                        self.assertEqual(payload.get("meta", {}).get("mode"), "semantic_subgraph")
+
+                        subgraph_mock.assert_called_once_with(
+                            merkraum_api.adapter,
+                            "test-proj",
+                            "delta",
+                            limit=merkraum_api.MAX_GRAPH_LIMIT,
+                            hops=merkraum_api.MAX_GRAPH_HOPS,
+                            top=merkraum_api.MAX_SEARCH_TOP,
+                        )
+            finally:
+                merkraum_api.adapter = previous_adapter
+
 if __name__ == "__main__":
     unittest.main()
