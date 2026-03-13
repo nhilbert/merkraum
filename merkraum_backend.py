@@ -1419,9 +1419,11 @@ class Neo4jQdrantAdapter(Neo4jBaseAdapter):
             logger.warning("FastEmbed init failed: %s", e)
 
     def _get_collection_name(self, project_id, namespace=None):
+        # Qdrant collection names cannot contain ':'
+        safe_id = project_id.replace(':', '_')
         if namespace:
-            return f"{project_id}_{namespace}"
-        return project_id
+            return f"{safe_id}_{namespace}"
+        return safe_id
 
     def _ensure_collection(self, collection_name, vector_size=384):
         from qdrant_client import models
