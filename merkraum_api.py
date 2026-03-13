@@ -699,12 +699,17 @@ def create_project():
     project_id = body.get("project_id", "").strip()
     if not project_id:
         import re
-        project_id = re.sub(r"[^a-z0-9_-]", "-", name.lower())
+        project_id = re.sub(r"[^a-z0-9-]", "-", name.lower())
         project_id = re.sub(r"-+", "-", project_id).strip("-")
     if not project_id:
         return _error("Could not derive a valid project_id", 400)
     if project_id == "default":
         return _error("Cannot create project with reserved id 'default'", 400)
+    # The user-supplied suffix (after 'sub:') must not contain '_' because
+    # Qdrant collection names use '_' as the ':' replacement.
+    suffix = project_id.split(':', 1)[-1] if ':' in project_id else project_id
+    if '_' in suffix:
+        return _error("Project name must not contain '_' (underscores)", 400)
 
     owner = getattr(request, "user_id", None) or "anonymous"
     description = body.get("description", "")
