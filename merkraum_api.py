@@ -30,7 +30,7 @@ from typing import cast
 
 from merkraum_acl import is_auth_required, is_project_allowed, split_csv_env
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, current_app
 
 from merkraum_backend import (
     create_adapter, NODE_TYPES, RELATIONSHIP_TYPES, Neo4jBaseAdapter,
