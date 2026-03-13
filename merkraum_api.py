@@ -308,6 +308,122 @@ def _get_semantic_subgraph(adp, project_id: str, query: str, *, limit: int, hops
     }
 
 
+def _get_text_subgraph(adp, project_id: str, query: str, *, limit: int, hops: int, top: int) -> dict:
+    """Build a query-centered subgraph via text seeds + N-hop neighborhood."""
+    normalized_query = (query or "").strip().lower()
+    if not normalized_query:
+        return {"nodes": [], "links": [], "meta": {"mode": "text_subgraph", "query": query, "seed_count": 0, "hops": hops}}
+
+    seed_records = []
+    with adp._driver.session() as session:
+        seed_records = list(session.run(
+            """
+            MATCH (n {project_id: $pid})
+            WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+              AND (
+                toLower(coalesce(n.name, '')) CONTAINS $query
+                OR toLower(coalesce(n.summary, '')) CONTAINS $query
+              )
+            RETURN DISTINCT n.name AS name
+            ORDER BY
+              CASE WHEN toLower(coalesce(n.name, '')) = $query THEN 0 ELSE 1 END,
+              size(coalesce(n.name, '')) ASC,
+              n.name ASC
+            LIMIT $top
+            """,
+            pid=project_id,
+            node_types=list(NODE_TYPES),
+            query=normalized_query,
+            top=top,
+        ))
+
+    seed_names = [str(rec.get("name") or "").strip() for rec in seed_records]
+    seed_names = [name for name in seed_names if name]
+    if not seed_names:
+        return {"nodes": [], "links": [], "meta": {"mode": "text_subgraph", "query": query, "seed_count": 0, "hops": hops}}
+
+    # Variable length in Cypher needs literal bounds, so hops is validated and interpolated.
+    depth = max(0, min(hops, MAX_GRAPH_HOPS))
+    node_records = []
+    with adp._driver.session() as session:
+        node_records = list(session.run(
+            f"""
+            MATCH (s {{project_id: $pid}})
+            WHERE s.name IN $seed_names
+            MATCH p=(s)-[*0..{depth}]-(n {{project_id: $pid}})
+            WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+            WITH DISTINCT n
+            LIMIT $limit
+            RETURN elementId(n) AS eid,
+                   n.name AS name,
+                   labels(n)[0] AS node_type,
+                   n.summary AS summary,
+                   n.node_id AS node_id,
+                   n.confidence AS confidence
+            """,
+            pid=project_id,
+            seed_names=seed_names,
+            node_types=list(NODE_TYPES),
+            limit=limit,
+        ))
+
+    nodes = [
+        {
+            "name": rec.get("name") or "",
+            "type": rec.get("node_type") or "Concept",
+            "summary": rec.get("summary") or "",
+            "node_id": rec.get("node_id"),
+            "confidence": rec.get("confidence"),
+        }
+        for rec in node_records
+    ]
+
+    element_ids = [rec.get("eid") for rec in node_records if rec.get("eid")]
+    if not element_ids:
+        return {"nodes": [], "links": [], "meta": {"mode": "text_subgraph", "query": query, "seed_count": len(seed_names), "hops": depth}}
+
+    links = []
+    with adp._driver.session() as session:
+        edge_records = session.run(
+            """
+            UNWIND $eids AS eid
+            MATCH (n)
+            WHERE elementId(n) = eid
+            WITH collect(n) AS nodes
+            UNWIND nodes AS a
+            MATCH (a)-[r]->(b)
+            WHERE b IN nodes
+            RETURN a.name AS source_name,
+                   b.name AS target_name,
+                   labels(a)[0] AS source_type,
+                   labels(b)[0] AS target_type,
+                   a.node_id AS source_node_id,
+                   b.node_id AS target_node_id,
+                   type(r) AS type,
+                   r.confidence AS confidence,
+                   r.reason AS reason
+            LIMIT $limit
+            """,
+            eids=element_ids,
+            limit=limit,
+        )
+        links = [dict(rec) for rec in edge_records]
+
+    return {
+        "nodes": [_map_node_for_graph(n) for n in nodes],
+        "links": [_map_edge_for_graph(e) for e in links],
+        "meta": {
+            "mode": "text_subgraph",
+            "query": query,
+            "seed_count": len(seed_names),
+            "hops": depth,
+            "returned_nodes": len(nodes),
+            "returned_links": len(links),
+            "truncated": len(nodes) >= limit,
+        },
+    }
+
+
 def _map_stats(raw: dict) -> dict:
     """Map adapter stats dict to frontend format.
 
@@ -1071,6 +1187,7 @@ def graph():
         project: project id (default: "default")
         limit: max nodes/edges to return (default: 500)
         q: optional semantic query. When set, returns query-centered subgraph.
+        search_mode: semantic (default) or text
         hops: neighborhood depth for semantic subgraph (default: 1, max: 3)
         top: number of semantic seed hits (default: 12, max: 50)
     """
@@ -1087,6 +1204,9 @@ def graph():
     limit = max(1, min(limit, MAX_GRAPH_LIMIT))
 
     query = (request.args.get("q") or "").strip()
+    search_mode = (request.args.get("search_mode") or "semantic").strip().lower()
+    if search_mode not in {"semantic", "text"}:
+        return _error("Invalid search_mode. Use 'semantic' or 'text'.", 400)
     try:
         hops = int(request.args.get("hops", 1))
     except (TypeError, ValueError):
@@ -1104,6 +1224,8 @@ def graph():
 
     try:
         if query:
+            if search_mode == "text":
+                return jsonify(_get_text_subgraph(adapter, project, query, limit=limit, hops=hops, top=top))
             return jsonify(_get_semantic_subgraph(adapter, project, query, limit=limit, hops=hops, top=top))
 
         raw_nodes = adapter.query_nodes(node_type=None, project_id=project, limit=limit)
