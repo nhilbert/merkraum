@@ -314,8 +314,8 @@ def _get_semantic_subgraph(adp, project_id: str, query: str, *, limit: int, hops
 
 def _get_text_subgraph(adp, project_id: str, query: str, *, limit: int, hops: int, top: int) -> dict:
     """Build a query-centered subgraph via text seeds + N-hop neighborhood."""
-    normalized_query = (query or "").strip().lower()
-    if not normalized_query:
+    normalized_search = (query or "").strip().lower()
+    if not normalized_search:
         return {"nodes": [], "links": [], "meta": {"mode": "text_subgraph", "query": query, "seed_count": 0, "hops": hops}}
 
     seed_records = []
@@ -325,19 +325,19 @@ def _get_text_subgraph(adp, project_id: str, query: str, *, limit: int, hops: in
             MATCH (n {project_id: $pid})
             WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
               AND (
-                toLower(coalesce(n.name, '')) CONTAINS $query
-                OR toLower(coalesce(n.summary, '')) CONTAINS $query
+                toLower(coalesce(n.name, '')) CONTAINS $search_query
+                OR toLower(coalesce(n.summary, '')) CONTAINS $search_query
               )
             RETURN DISTINCT n.name AS name
             ORDER BY
-              CASE WHEN toLower(coalesce(n.name, '')) = $query THEN 0 ELSE 1 END,
+              CASE WHEN toLower(coalesce(n.name, '')) = $search_query THEN 0 ELSE 1 END,
               size(coalesce(n.name, '')) ASC,
               n.name ASC
             LIMIT $top
             """,
             pid=project_id,
             node_types=list(NODE_TYPES),
-            query=normalized_query,
+            search_query=normalized_search,
             top=top,
         ))
 
