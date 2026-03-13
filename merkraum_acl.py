@@ -69,24 +69,40 @@ def is_project_allowed(
     project: str,
     user_id: Optional[str],
     groups: Optional[set[str]] = None,
+    pat_projects: Optional[list[str]] = None,
+    pat_all_projects: Optional[bool] = None,
 ) -> bool:
     """Check if a user is allowed to access a project.
 
     Authorization rules (in order):
     1. AUTH_REQUIRED=false → allow all
     2. No user_id → deny
-    3. project=="default" and ALLOW_DEFAULT_PROJECT=true → allow
-    4. User in ADMIN_GROUPS → allow all projects
-    5. project == user_id or project starts with "{user_id}:" → allow (user namespace)
-    6. user_id in PROJECT_USER_ACL_JSON[project] → allow
-    7. Any user group in PROJECT_GROUP_ACL_JSON[project] → allow
-    8. Deny
+    3. PAT project restrictions (if PAT auth):
+       - all_projects=true → fall through to user-level ACL
+       - projects=[] with all_projects=false → deny (no project access)
+       - project not in pat_projects → deny
+    4. project=="default" and ALLOW_DEFAULT_PROJECT=true → allow
+    5. User in ADMIN_GROUPS → allow all projects
+    6. project == user_id or project starts with "{user_id}:" → allow (user namespace)
+    7. user_id in PROJECT_USER_ACL_JSON[project] → allow
+    8. Any user group in PROJECT_GROUP_ACL_JSON[project] → allow
+    9. Deny
     """
     if not is_auth_required():
         return True
 
     if not user_id:
         return False
+
+    # PAT project restrictions (Norman review: explicit all_projects flag)
+    if pat_projects is not None:  # PAT auth
+        if pat_all_projects:
+            pass  # fall through to user-level ACL
+        elif len(pat_projects) == 0:
+            # Empty list + all_projects=false = NO project access
+            return False
+        elif project not in pat_projects:
+            return False
 
     groups = groups or set()
 

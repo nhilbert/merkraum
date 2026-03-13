@@ -36,7 +36,7 @@ from merkraum_backend import (
     create_adapter, NODE_TYPES, RELATIONSHIP_TYPES, Neo4jBaseAdapter,
     NodeLimitExceeded, TIER_LIMITS,
 )
-from jwt_auth import get_cognito_validator, require_auth
+from jwt_auth import get_cognito_validator, require_auth, require_scope, PATValidator
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -130,7 +130,13 @@ def _split_csv_env(name: str) -> set[str]:
 def _is_project_allowed(project: str) -> bool:
     user_id = getattr(request, 'user_id', None)
     groups = set(getattr(request, 'groups', []) or [])
-    return is_project_allowed(project, user_id, groups)
+    pat_projects = getattr(request, 'pat_projects', None)
+    pat_all_projects = getattr(request, 'pat_all_projects', None)
+    return is_project_allowed(
+        project, user_id, groups,
+        pat_projects=pat_projects,
+        pat_all_projects=pat_all_projects,
+    )
 
 
 def _deny_if_project_forbidden(project: str):
@@ -455,6 +461,7 @@ def health():
 
 @app.route("/api/projects", methods=["GET"])
 @require_auth
+@require_scope("projects")
 def projects():
     """List projects with metadata.
 
@@ -552,6 +559,7 @@ def projects():
 
 @app.route("/api/projects", methods=["POST"])
 @require_auth
+@require_scope("projects")
 def create_project():
     """Create a new project (knowledge space).
 
@@ -603,6 +611,7 @@ def create_project():
 
 @app.route("/api/projects/<path:project_id>", methods=["GET"])
 @require_auth
+@require_scope("projects")
 def get_project(project_id):
     """Get project metadata and usage.
 
@@ -631,6 +640,7 @@ def get_project(project_id):
 
 @app.route("/api/projects/<path:project_id>", methods=["PATCH"])
 @require_auth
+@require_scope("projects")
 def update_project(project_id):
     """Update project metadata.
 
@@ -667,6 +677,7 @@ def update_project(project_id):
 
 @app.route("/api/projects/<path:project_id>", methods=["DELETE"])
 @require_auth
+@require_scope("projects")
 def delete_project(project_id):
     """Delete a project and all its data.
 
@@ -693,6 +704,7 @@ def delete_project(project_id):
 
 @app.route("/api/stats", methods=["GET"])
 @require_auth
+@require_scope("read")
 def stats():
     """Graph stats in frontend format: {entities, relationships, beliefs, contradictions}.
 
@@ -714,6 +726,7 @@ def stats():
 
 @app.route("/api/usage", methods=["GET"])
 @require_auth
+@require_scope("read")
 def usage():
     """Usage metrics for a project — node/edge counts and tier limits.
 
@@ -754,6 +767,7 @@ def usage():
 
 @app.route("/api/beliefs", methods=["GET"])
 @require_auth
+@require_scope("read")
 def beliefs():
     """Beliefs list filtered by status.
 
@@ -786,6 +800,7 @@ def beliefs():
 
 @app.route("/api/graph", methods=["GET"])
 @require_auth
+@require_scope("read")
 def graph():
     """All nodes + relationships for force-graph visualization.
 
@@ -820,6 +835,7 @@ def graph():
 
 @app.route("/api/nodes", methods=["GET"])
 @require_auth
+@require_scope("read")
 def nodes():
     """Query nodes, optionally filtered by type.
 
@@ -853,6 +869,7 @@ def nodes():
 
 @app.route("/api/traverse/<path:entity>", methods=["GET"])
 @require_auth
+@require_scope("read")
 def traverse(entity: str):
     """Multi-hop graph traversal from a named entity.
 
@@ -887,6 +904,7 @@ def traverse(entity: str):
 
 @app.route("/api/ingest", methods=["POST"])
 @require_auth
+@require_scope("ingest")
 def ingest():
     """Ingest entities and/or relationships into the graph.
 
@@ -965,6 +983,7 @@ def ingest():
 
 @app.route("/api/search", methods=["GET"])
 @require_auth
+@require_scope("search")
 def search():
     """Vector (semantic) search.
 
@@ -1002,6 +1021,7 @@ def search():
 
 @app.route("/api/ingest/text", methods=["POST"])
 @require_auth
+@require_scope("ingest")
 def ingest_text():
     """Extract entities and relationships from raw text via LLM, then ingest.
 
@@ -1130,6 +1150,7 @@ def ingest_text():
 
 @app.route("/api/relationship", methods=["POST"])
 @require_auth
+@require_scope("write")
 def add_relationship_api():
     """Add or update a relationship between two existing nodes."""
     if adapter is None:
@@ -1169,6 +1190,7 @@ def add_relationship_api():
 
 @app.route("/api/relationship", methods=["DELETE"])
 @require_auth
+@require_scope("write")
 def delete_relationship_api():
     """Delete a relationship between two nodes."""
     if adapter is None:
@@ -1203,6 +1225,7 @@ def delete_relationship_api():
 
 @app.route("/api/node", methods=["DELETE"])
 @require_auth
+@require_scope("write")
 def delete_node_api():
     """Delete one node (and attached edges) with audit/history and vector sync."""
     if adapter is None:
@@ -1226,6 +1249,7 @@ def delete_node_api():
 
 @app.route("/api/node", methods=["PATCH"])
 @require_auth
+@require_scope("write")
 def update_node_api():
     """Update node attributes and/or rename node with vector re-embedding."""
     if adapter is None:
@@ -1261,6 +1285,7 @@ def update_node_api():
 
 @app.route("/api/nodes/merge", methods=["POST"])
 @require_auth
+@require_scope("write")
 def merge_nodes_api():
     """Merge two nodes by keeping one and removing the other."""
     if adapter is None:
@@ -1293,6 +1318,125 @@ def merge_nodes_api():
     )
     status = 200 if result.get("ok") else 400
     return jsonify(result), status
+
+
+# ---------------------------------------------------------------------------
+# PAT Management Endpoints (Cognito JWT auth only — tokens don't manage themselves)
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/tokens", methods=["POST"])
+@require_auth
+def create_token():
+    """Create a new Personal Access Token.
+
+    Requires Cognito JWT auth (humans manage tokens).
+    Returns the full token plaintext ONCE in the response.
+
+    JSON body:
+        {
+            "name": "My Token",
+            "scopes": ["read", "write", "search"],
+            "projects": ["project-uuid"],
+            "all_projects": false,
+            "expires_in_days": 90
+        }
+    """
+    # PATs cannot create other PATs (only Cognito users can)
+    if getattr(request, "pat_scopes", None) is not None:
+        return _error("PATs cannot create tokens. Use Cognito JWT auth.", 403)
+
+    pat_validator = getattr(current_app, "_pat_validator", None)
+    if not pat_validator:
+        return _error("PAT system not configured", 503)
+
+    body = request.get_json(silent=True)
+    if not body:
+        return _error("Request body must be JSON", 400)
+
+    name = (body.get("name") or "").strip()
+    if not name:
+        return _error("'name' is required", 400)
+
+    scopes = body.get("scopes") or ["read", "search"]
+    if not isinstance(scopes, list):
+        return _error("'scopes' must be an array", 400)
+
+    projects = body.get("projects") or []
+    if not isinstance(projects, list):
+        return _error("'projects' must be an array", 400)
+
+    all_projects = bool(body.get("all_projects", False))
+
+    expires_in_days = body.get("expires_in_days")
+    expires_at = None
+    if expires_in_days is not None:
+        try:
+            days = int(expires_in_days)
+            if days < 1 or days > 365:
+                return _error("'expires_in_days' must be between 1 and 365", 400)
+            from datetime import datetime as dt, timezone as tz, timedelta
+            expires_at = (dt.now(tz.utc) + timedelta(days=days)).isoformat()
+        except (TypeError, ValueError):
+            return _error("'expires_in_days' must be an integer", 400)
+
+    tier = body.get("tier") or "free"
+
+    try:
+        result = pat_validator.create_token(
+            owner_id=request.user_id,
+            name=name,
+            scopes=scopes,
+            projects=projects,
+            all_projects=all_projects,
+            expires_at=expires_at,
+            tier=tier,
+        )
+        logger.info(
+            "PAT created: prefix=%s owner=%s scopes=%s",
+            result["token_prefix"], request.user_id, scopes,
+        )
+        return jsonify(result), 201
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except Exception as exc:
+        logger.exception("PAT creation failed")
+        return _error(f"Token creation failed: {exc}")
+
+
+@app.route("/api/tokens", methods=["GET"])
+@require_auth
+def list_tokens():
+    """List all PATs for the authenticated user (never returns plaintext)."""
+    if getattr(request, "pat_scopes", None) is not None:
+        return _error("PATs cannot list tokens. Use Cognito JWT auth.", 403)
+
+    pat_validator = getattr(current_app, "_pat_validator", None)
+    if not pat_validator:
+        return _error("PAT system not configured", 503)
+
+    tokens = pat_validator.list_tokens(request.user_id)
+    return jsonify(tokens)
+
+
+@app.route("/api/tokens/<token_prefix>", methods=["DELETE"])
+@require_auth
+def revoke_token(token_prefix: str):
+    """Revoke a PAT by its prefix."""
+    if getattr(request, "pat_scopes", None) is not None:
+        return _error("PATs cannot revoke tokens. Use Cognito JWT auth.", 403)
+
+    pat_validator = getattr(current_app, "_pat_validator", None)
+    if not pat_validator:
+        return _error("PAT system not configured", 503)
+
+    revoked = pat_validator.revoke_token(request.user_id, token_prefix)
+    if revoked:
+        logger.info(
+            "PAT revoked: prefix=%s owner=%s", token_prefix, request.user_id,
+        )
+        return jsonify({"ok": True, "message": "Token revoked"})
+    return _error("Token not found or already revoked", 404)
 
 
 # ---------------------------------------------------------------------------
@@ -1347,6 +1491,24 @@ def _init_cognito_auth():
         )
 
 
+def _init_pat_auth():
+    """Initialize PAT validation using the adapter's Neo4j driver. Called once at startup."""
+    if adapter is None:
+        logger.warning("Adapter not initialized — PAT auth disabled")
+        return
+    driver = getattr(adapter, "_driver", None)
+    if not driver:
+        logger.warning("No Neo4j driver available — PAT auth disabled")
+        return
+    try:
+        PATValidator.ensure_constraints(driver)
+        pat_validator = PATValidator(driver)
+        setattr(app, "_pat_validator", pat_validator)
+        logger.info("PAT validator initialized (Neo4j-backed)")
+    except Exception as exc:
+        logger.error("Failed to initialize PAT validator: %s", exc)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Merkraum REST API server",
@@ -1386,6 +1548,7 @@ def main():
         )
     _init_adapter()
     _init_cognito_auth()
+    _init_pat_auth()
 
     logger.info(
         "Starting Merkraum API on %s:%d (debug=%s)",

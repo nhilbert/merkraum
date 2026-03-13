@@ -1057,5 +1057,218 @@ class TestProjectManagementInterface(unittest.TestCase):
                             f"Neo4jPineconeAdapter missing {method}")
 
 
+# --- PAT (Personal Access Token) tests ---
+
+import hashlib
+from jwt_auth import PATValidator, PAT_PREFIX, PAT_SCOPES, require_scope
+from merkraum_acl import is_project_allowed
+
+
+class TestPATValidator(unittest.TestCase):
+    """Test PATValidator class with mocked Neo4j driver."""
+
+    def setUp(self):
+        self.mock_driver = MagicMock()
+        self.validator = PATValidator(self.mock_driver)
+
+    def test_validate_rejects_non_pat_token(self):
+        result = self.validator.validate("eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.xxx")
+        self.assertIsNone(result)
+        self.mock_driver.session.assert_not_called()
+
+    def test_validate_accepts_pat_prefix(self):
+        token = "mk_pat_" + "a1" * 32
+        mock_session = MagicMock()
+        mock_tx_result = MagicMock()
+        mock_tx_result.__getitem__ = MagicMock(side_effect=lambda k: {
+            "token_prefix": "mk_pat_a1b2",
+            "name": "Test Token",
+            "owner_id": "user-123",
+            "scopes": ["read", "write"],
+            "projects": ["proj-1"],
+            "all_projects": False,
+            "expires_at": None,
+        }[k])
+        # Make dict() work on the result
+        mock_tx_result.keys = MagicMock(return_value=[
+            "token_prefix", "name", "owner_id", "scopes", "projects", "all_projects", "expires_at"
+        ])
+
+        self.mock_driver.session.return_value.__enter__ = MagicMock(return_value=mock_session)
+        self.mock_driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+        # Mock execute_write to call the static method
+        def fake_execute_write(func, token_hash):
+            return {
+                "token_prefix": "mk_pat_a1b2",
+                "name": "Test Token",
+                "owner_id": "user-123",
+                "scopes": ["read", "write"],
+                "projects": ["proj-1"],
+                "all_projects": False,
+                "expires_at": None,
+            }
+        mock_session.execute_write = fake_execute_write
+
+        result = self.validator.validate(token)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["owner_id"], "user-123")
+        self.assertEqual(result["scopes"], ["read", "write"])
+
+    def test_validate_returns_none_for_invalid_token(self):
+        token = "mk_pat_" + "ff" * 32
+        mock_session = MagicMock()
+        mock_session.execute_write = MagicMock(return_value=None)
+        self.mock_driver.session.return_value.__enter__ = MagicMock(return_value=mock_session)
+        self.mock_driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+        result = self.validator.validate(token)
+        self.assertIsNone(result)
+
+    def test_token_hash_is_sha256(self):
+        token = "mk_pat_" + "ab" * 32
+        expected_hash = hashlib.sha256(token.encode()).hexdigest()
+        self.assertEqual(len(expected_hash), 64)
+        self.assertTrue(all(c in "0123456789abcdef" for c in expected_hash))
+
+    def test_create_token_validates_scopes(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.validator.create_token(
+                owner_id="user-1",
+                name="Bad Token",
+                scopes=["read", "destroy_everything"],
+                projects=[],
+            )
+        self.assertIn("Invalid scopes", str(ctx.exception))
+
+
+class TestPATConstants(unittest.TestCase):
+    """Test PAT-related constants."""
+
+    def test_pat_prefix(self):
+        self.assertEqual(PAT_PREFIX, "mk_pat_")
+
+    def test_known_scopes(self):
+        expected = {"read", "write", "search", "ingest", "projects", "admin"}
+        self.assertEqual(PAT_SCOPES, expected)
+
+
+class TestACLWithPAT(unittest.TestCase):
+    """Test is_project_allowed with PAT project restrictions."""
+
+    @patch.dict(os.environ, {"AUTH_REQUIRED": "true"})
+    def test_pat_empty_projects_no_all_projects_denies(self):
+        """Empty projects list with all_projects=False = no access."""
+        result = is_project_allowed(
+            "some-project", "user-123",
+            pat_projects=[], pat_all_projects=False,
+        )
+        self.assertFalse(result)
+
+    @patch.dict(os.environ, {"AUTH_REQUIRED": "true"})
+    def test_pat_project_not_in_list_denies(self):
+        result = is_project_allowed(
+            "project-b", "user-123",
+            pat_projects=["project-a"], pat_all_projects=False,
+        )
+        self.assertFalse(result)
+
+    @patch.dict(os.environ, {"AUTH_REQUIRED": "true"})
+    def test_pat_project_in_list_allows(self):
+        """PAT with matching project falls through to user-level ACL."""
+        result = is_project_allowed(
+            "user-123", "user-123",  # user namespace match
+            pat_projects=["user-123"], pat_all_projects=False,
+        )
+        self.assertTrue(result)
+
+    @patch.dict(os.environ, {"AUTH_REQUIRED": "true"})
+    def test_pat_all_projects_allows(self):
+        result = is_project_allowed(
+            "user-123", "user-123",
+            pat_projects=[], pat_all_projects=True,
+        )
+        self.assertTrue(result)
+
+    @patch.dict(os.environ, {"AUTH_REQUIRED": "false"})
+    def test_auth_not_required_allows_all(self):
+        result = is_project_allowed(
+            "any-project", None,
+            pat_projects=[], pat_all_projects=False,
+        )
+        self.assertTrue(result)
+
+    @patch.dict(os.environ, {"AUTH_REQUIRED": "true"})
+    def test_no_pat_context_uses_standard_acl(self):
+        """When pat_projects is None (Cognito auth), standard ACL applies."""
+        result = is_project_allowed(
+            "user-123", "user-123",
+            pat_projects=None, pat_all_projects=None,
+        )
+        self.assertTrue(result)
+
+
+class TestRequireScope(unittest.TestCase):
+    """Test require_scope decorator."""
+
+    def test_require_scope_allows_matching_scope(self):
+        from flask import Flask
+        test_app = Flask(__name__)
+
+        @require_scope("read")
+        def dummy():
+            return "ok"
+
+        with test_app.test_request_context():
+            from flask import request as req
+            req.pat_scopes = ["read", "search"]
+            result = dummy()
+            self.assertEqual(result, "ok")
+
+    def test_require_scope_denies_missing_scope(self):
+        from flask import Flask
+        test_app = Flask(__name__)
+
+        @require_scope("write")
+        def dummy():
+            return "ok"
+
+        with test_app.test_request_context():
+            from flask import request as req
+            req.pat_scopes = ["read", "search"]
+            result = dummy()
+            # Should return (jsonify(...), 403)
+            self.assertIsInstance(result, tuple)
+            self.assertEqual(result[1], 403)
+
+    def test_require_scope_admin_bypasses(self):
+        from flask import Flask
+        test_app = Flask(__name__)
+
+        @require_scope("write")
+        def dummy():
+            return "ok"
+
+        with test_app.test_request_context():
+            from flask import request as req
+            req.pat_scopes = ["admin"]
+            result = dummy()
+            self.assertEqual(result, "ok")
+
+    def test_require_scope_cognito_user_allowed(self):
+        from flask import Flask
+        test_app = Flask(__name__)
+
+        @require_scope("write")
+        def dummy():
+            return "ok"
+
+        with test_app.test_request_context():
+            from flask import request as req
+            req.pat_scopes = None  # Cognito user
+            result = dummy()
+            self.assertEqual(result, "ok")
+
+
 if __name__ == "__main__":
     unittest.main()

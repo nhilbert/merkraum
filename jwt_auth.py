@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Merkraum JWT Authentication — Cognito JWT validation middleware for Flask.
+Merkraum JWT Authentication — Cognito JWT + PAT validation middleware for Flask.
 
-Validates Authorization: Bearer <token> headers against AWS Cognito User Pool.
-Caches public keys to avoid repeated JWKS downloads.
+Validates Authorization: Bearer <token> headers against:
+1. Personal Access Tokens (mk_pat_ prefix) — validated against Neo4j
+2. AWS Cognito User Pool JWTs — validated against JWKS
 
 v1.0 — SUP-95 (2026-03-11)
+v2.0 — PAT support (2026-03-13): PATValidator, require_scope decorator
 """
 
+import hashlib
 import json
 import logging
 import os
+import secrets
 from functools import wraps
 from typing import Optional, Dict, Any
 from datetime import datetime, timezone
@@ -183,6 +187,255 @@ class CognitoJWTValidator:
             return None
 
 
+PAT_PREFIX = "mk_pat_"
+PAT_TOKEN_BYTES = 32  # 256 bits of entropy
+PAT_PREFIX_LENGTH = 12  # chars shown in UI for identification
+
+# Scope definitions
+PAT_SCOPES = {"read", "write", "search", "ingest", "projects", "admin"}
+
+# Per-tier token limits
+PAT_TIER_LIMITS = {
+    "free": 10,
+    "pro": 50,
+    "team": None,       # unlimited
+    "enterprise": None,  # unlimited
+}
+
+# Per-project hard limit on active tokens (across all users)
+PAT_PER_PROJECT_LIMIT = 20
+
+
+class PATValidator:
+    """Validates Personal Access Tokens against Neo4j storage."""
+
+    def __init__(self, neo4j_driver):
+        self.driver = neo4j_driver
+
+    def validate(self, token: str) -> Optional[Dict[str, Any]]:
+        """Validate a PAT and return its metadata, or None if invalid.
+
+        Uses a single atomic transaction for validation + last_used_at update
+        (Norman review fix: prevents race condition under load).
+        """
+        if not token.startswith(PAT_PREFIX):
+            return None
+
+        token_hash = hashlib.sha256(token.encode()).hexdigest()
+        with self.driver.session() as session:
+            result = session.execute_write(self._validate_and_touch, token_hash)
+            return result
+
+    @staticmethod
+    def _validate_and_touch(tx, token_hash: str) -> Optional[Dict[str, Any]]:
+        """Single transaction: match, validate, update last_used_at, return."""
+        result = tx.run(
+            """
+            MATCH (t:PersonalAccessToken {token_hash: $hash})
+            WHERE t.revoked = false
+              AND (t.expires_at IS NULL OR datetime(t.expires_at) > datetime())
+            SET t.last_used_at = toString(datetime())
+            RETURN t.token_prefix AS token_prefix,
+                   t.name AS name,
+                   t.owner_id AS owner_id,
+                   t.scopes AS scopes,
+                   t.projects AS projects,
+                   t.all_projects AS all_projects,
+                   t.expires_at AS expires_at
+            """,
+            hash=token_hash,
+        ).single()
+        if not result:
+            return None
+        return dict(result)
+
+    def create_token(
+        self,
+        owner_id: str,
+        name: str,
+        scopes: list[str],
+        projects: list[str],
+        all_projects: bool = False,
+        expires_at: Optional[str] = None,
+        tier: str = "free",
+    ) -> Optional[Dict[str, Any]]:
+        """Create a new PAT. Returns token metadata including the plaintext (shown once)."""
+        # Validate scopes
+        invalid_scopes = set(scopes) - PAT_SCOPES
+        if invalid_scopes:
+            raise ValueError(f"Invalid scopes: {invalid_scopes}")
+
+        # Check per-user token limit
+        limit = PAT_TIER_LIMITS.get(tier)
+        if limit is not None:
+            count = self._count_user_tokens(owner_id)
+            if count >= limit:
+                raise ValueError(
+                    f"Token limit reached: {count}/{limit} for tier '{tier}'"
+                )
+
+        # Check per-project limits
+        if projects and not all_projects:
+            for project in projects:
+                proj_count = self._count_project_tokens(project)
+                if proj_count >= PAT_PER_PROJECT_LIMIT:
+                    raise ValueError(
+                        f"Per-project token limit reached for '{project}': "
+                        f"{proj_count}/{PAT_PER_PROJECT_LIMIT}"
+                    )
+
+        # Generate token
+        raw_token = PAT_PREFIX + secrets.token_hex(PAT_TOKEN_BYTES)
+        token_hash = hashlib.sha256(raw_token.encode()).hexdigest()
+        token_prefix = raw_token[:PAT_PREFIX_LENGTH]
+
+        with self.driver.session() as session:
+            session.execute_write(
+                self._create_token_tx,
+                token_hash=token_hash,
+                token_prefix=token_prefix,
+                name=name,
+                owner_id=owner_id,
+                scopes=scopes,
+                projects=projects,
+                all_projects=all_projects,
+                expires_at=expires_at,
+            )
+
+        return {
+            "token": raw_token,  # shown ONCE
+            "token_prefix": token_prefix,
+            "name": name,
+            "scopes": scopes,
+            "projects": projects,
+            "all_projects": all_projects,
+            "expires_at": expires_at,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    @staticmethod
+    def _create_token_tx(
+        tx,
+        token_hash: str,
+        token_prefix: str,
+        name: str,
+        owner_id: str,
+        scopes: list[str],
+        projects: list[str],
+        all_projects: bool,
+        expires_at: Optional[str],
+    ):
+        tx.run(
+            """
+            CREATE (t:PersonalAccessToken {
+                token_hash: $hash,
+                token_prefix: $prefix,
+                name: $name,
+                owner_id: $owner_id,
+                scopes: $scopes,
+                projects: $projects,
+                all_projects: $all_projects,
+                expires_at: $expires_at,
+                created_at: toString(datetime()),
+                last_used_at: null,
+                revoked: false,
+                revoked_at: null
+            })
+            """,
+            hash=token_hash,
+            prefix=token_prefix,
+            name=name,
+            owner_id=owner_id,
+            scopes=scopes,
+            projects=projects,
+            all_projects=all_projects,
+            expires_at=expires_at,
+        )
+
+    def list_tokens(self, owner_id: str) -> list[Dict[str, Any]]:
+        """List all tokens for a user (never returns plaintext)."""
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (t:PersonalAccessToken {owner_id: $owner_id})
+                RETURN t.token_prefix AS token_prefix,
+                       t.name AS name,
+                       t.scopes AS scopes,
+                       t.projects AS projects,
+                       t.all_projects AS all_projects,
+                       t.expires_at AS expires_at,
+                       t.created_at AS created_at,
+                       t.last_used_at AS last_used_at,
+                       t.revoked AS revoked
+                ORDER BY t.created_at DESC
+                """,
+                owner_id=owner_id,
+            )
+            return [dict(r) for r in result]
+
+    def revoke_token(self, owner_id: str, token_prefix: str) -> bool:
+        """Revoke a token by prefix. Returns True if found and revoked."""
+        with self.driver.session() as session:
+            result = session.execute_write(
+                self._revoke_token_tx, owner_id, token_prefix
+            )
+            return result
+
+    @staticmethod
+    def _revoke_token_tx(tx, owner_id: str, token_prefix: str) -> bool:
+        result = tx.run(
+            """
+            MATCH (t:PersonalAccessToken {
+                owner_id: $owner_id,
+                token_prefix: $prefix,
+                revoked: false
+            })
+            SET t.revoked = true, t.revoked_at = toString(datetime())
+            RETURN count(t) AS revoked_count
+            """,
+            owner_id=owner_id,
+            prefix=token_prefix,
+        ).single()
+        return result and result["revoked_count"] > 0
+
+    def _count_user_tokens(self, owner_id: str) -> int:
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (t:PersonalAccessToken {owner_id: $owner_id, revoked: false})
+                RETURN count(t) AS cnt
+                """,
+                owner_id=owner_id,
+            ).single()
+            return result["cnt"] if result else 0
+
+    def _count_project_tokens(self, project: str) -> int:
+        with self.driver.session() as session:
+            result = session.run(
+                """
+                MATCH (t:PersonalAccessToken {revoked: false})
+                WHERE $project IN t.projects
+                RETURN count(t) AS cnt
+                """,
+                project=project,
+            ).single()
+            return result["cnt"] if result else 0
+
+    @staticmethod
+    def ensure_constraints(driver):
+        """Create Neo4j constraint and index for PAT nodes. Call once at startup."""
+        with driver.session() as session:
+            session.run(
+                "CREATE CONSTRAINT pat_hash_unique IF NOT EXISTS "
+                "FOR (t:PersonalAccessToken) REQUIRE t.token_hash IS UNIQUE"
+            )
+            session.run(
+                "CREATE INDEX pat_owner_index IF NOT EXISTS "
+                "FOR (t:PersonalAccessToken) ON (t.owner_id)"
+            )
+        logger.info("PAT Neo4j constraints and indexes ensured")
+
+
 def get_cognito_validator() -> Optional[CognitoJWTValidator]:
     """Create and return a CognitoJWTValidator from environment variables."""
     user_pool_id = os.environ.get("COGNITO_USER_POOL_ID")
@@ -276,7 +529,38 @@ def require_auth(f):
 
         token = auth_header[7:]  # Remove "Bearer " prefix
 
-        # Validate token
+        # PAT authentication path
+        if token.startswith(PAT_PREFIX):
+            pat_validator = getattr(current_app, "_pat_validator", None)
+            if not pat_validator:
+                return jsonify({"error": "PAT authentication not configured"}), 503
+
+            pat_data = pat_validator.validate(token)
+            if not pat_data:
+                logger.warning(
+                    "PAT validation failed for request from %s",
+                    request.remote_addr,
+                )
+                return jsonify({"error": "Invalid, expired, or revoked token"}), 401
+
+            # Set request context to look like Cognito auth
+            request.user_id = pat_data["owner_id"]
+            request.username = f"pat:{pat_data.get('name', 'unknown')}"
+            request.groups = []
+            request.user = {"sub": pat_data["owner_id"], "auth_type": "pat"}
+            request.pat_scopes = pat_data.get("scopes") or []
+            request.pat_projects = pat_data.get("projects") or []
+            request.pat_all_projects = pat_data.get("all_projects", False)
+
+            logger.info(
+                "PAT authenticated request from owner: %s (token: %s, scopes: %s)",
+                pat_data["owner_id"],
+                pat_data.get("token_prefix", "?"),
+                pat_data.get("scopes", []),
+            )
+            return f(*args, **kwargs)
+
+        # Cognito JWT authentication path
         claims = validator.validate_token(token)
         if not claims:
             logger.warning(
@@ -289,6 +573,10 @@ def require_auth(f):
         request.user_id = claims.get("sub")  # Cognito subject (unique user ID)
         request.username = claims.get("cognito:username")
         request.groups = claims.get("cognito:groups", [])
+        # Cognito users have no PAT restrictions
+        request.pat_scopes = None
+        request.pat_projects = None
+        request.pat_all_projects = None
 
         logger.info(
             "Authenticated request from user: %s (groups: %s)",
@@ -299,6 +587,27 @@ def require_auth(f):
         return f(*args, **kwargs)
 
     return decorated_function
+
+
+def require_scope(scope: str):
+    """Decorator: require specific scope for PAT-authenticated requests.
+
+    Cognito JWT users implicitly have all scopes. PAT users must have the
+    scope explicitly listed, or 'admin' scope which grants all.
+    """
+    def decorator(f):
+        @wraps(f)
+        def decorated(*args, **kwargs):
+            pat_scopes = getattr(request, "pat_scopes", None)
+            if pat_scopes is not None:  # PAT auth (not Cognito)
+                if scope not in pat_scopes and "admin" not in pat_scopes:
+                    return (
+                        jsonify({"error": f"Token lacks required scope: {scope}"}),
+                        403,
+                    )
+            return f(*args, **kwargs)
+        return decorated
+    return decorator
 
 
 # ============================================================================
