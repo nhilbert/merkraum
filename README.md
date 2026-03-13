@@ -15,11 +15,23 @@ Merkraum gives your AI agent a structured, inspectable knowledge graph where eve
 - **Belief tracking** — confidence scores, contradiction detection, belief supersession. Your AI doesn't silently overwrite knowledge — it reasons about change.
 - **Fixed schema** — 10 node types, 16 relationship types. Every operation is traceable and auditable. No open-vocabulary chaos.
 - **Contradiction detection** — typed relationships (CONTRADICTS, SUPERSEDES, SUPPORTS) make epistemic conflicts explicit, not implicit.
+- **Hybrid search behavior** — semantic retrieval stays primary, with deterministic text-search fallback for higher recall when vector seeds are sparse.
 - **Full audit trail** — every knowledge operation logged with who, what, when, and why. Built for environments where traceability matters.
 - **EU-hosted** — AWS Frankfurt (eu-central-1). Data never leaves the EU. GDPR Art. 17 (right to deletion) built in. No CLOUD Act exposure.
 - **Self-hosted option** — everything runs locally via Docker Compose. Own your knowledge infrastructure.
 - **MCP compatible** — works with Claude, Cursor, ChatGPT, and any MCP-compatible client.
 - **Graph dreaming** — periodic consolidation discovers patterns and strengthens connections while your agent is idle.
+
+## Search and Vector Indexing (Update 2026-03-14)
+
+- New entities are now vector-indexed during `write_entities`, so semantic search works immediately after ingest.
+- Existing projects can be reindexed with:
+  - `POST /api/projects/<project_id>/vectors/reindex`
+  - optional body: `{ "limit": 5000 }` (max `10000`)
+- Graph search supports explicit query modes via `/api/graph`:
+  - `search_mode=semantic` (default)
+  - `search_mode=text`
+  - plus `q`, `hops`, `top` parameters for query-centered subgraphs.
 
 ## Quick start
 

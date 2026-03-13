@@ -198,6 +198,16 @@ class BackendAdapter(ABC):
             {"nodes": int, "edges": int}
         """
 
+    @abstractmethod
+    def reindex_project_vectors(self, project_id: str = "default",
+                                limit: int = 5000) -> dict:
+        """Rebuild vector entries for project nodes.
+
+        Returns:
+            {"project_id": str, "total_nodes": int, "upserted": int,
+             "failed": int, "limit": int, "truncated": bool}
+        """
+
     # --- Project Management ---
 
     @abstractmethod
@@ -450,6 +460,31 @@ class Neo4jBaseAdapter(BackendAdapter):
                                 n.updated_at = $now
                             """,
                             **params,
+                        )
+                    vector_ok = self.vector_upsert(
+                        self._vector_id_for_node(
+                            project_id,
+                            ent["name"],
+                            node_type=node_type,
+                            node_id=node_id,
+                        ),
+                        self._vector_text_for_node(
+                            ent["name"],
+                            ent.get("summary", ""),
+                        ),
+                        {
+                            "name": ent["name"],
+                            "node_type": node_type,
+                            "source": source_type,
+                            "project_id": project_id,
+                        },
+                        project_id=project_id,
+                    )
+                    if not vector_ok:
+                        logger.warning(
+                            "Vector upsert failed for entity '%s' (project=%s)",
+                            ent.get("name"),
+                            project_id,
                         )
                     written += 1
                 except Exception as e:
@@ -774,6 +809,74 @@ class Neo4jBaseAdapter(BackendAdapter):
             )
             edge_count = edge_result.single()["c"]
         return {"nodes": node_count, "edges": edge_count}
+
+    def reindex_project_vectors(self, project_id="default", limit=5000):
+        self._ensure_project_node_ids(project_id)
+        safe_limit = max(1, int(limit))
+        stats = {
+            "project_id": project_id,
+            "total_nodes": 0,
+            "upserted": 0,
+            "failed": 0,
+            "limit": safe_limit,
+            "truncated": False,
+        }
+        with self._driver.session() as session:
+            records = session.run(
+                """
+                MATCH (n {project_id: $pid})
+                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+                RETURN n.name AS name,
+                       labels(n)[0] AS node_type,
+                       n.summary AS summary,
+                       n.node_id AS node_id
+                ORDER BY n.updated_at DESC, n.name ASC
+                LIMIT $limit
+                """,
+                pid=project_id,
+                node_types=list(NODE_TYPES),
+                limit=safe_limit,
+            )
+            for rec in records:
+                name = (rec.get("name") or "").strip()
+                node_type = rec.get("node_type") or "Concept"
+                if not name:
+                    continue
+                node_id = rec.get("node_id") or _string_to_uuid(
+                    f"{project_id}:{node_type}:{name}"
+                )
+                summary = rec.get("summary") or ""
+                stats["total_nodes"] += 1
+                ok = self.vector_upsert(
+                    self._vector_id_for_node(
+                        project_id, name, node_type=node_type, node_id=node_id
+                    ),
+                    self._vector_text_for_node(name, summary),
+                    {
+                        "name": name,
+                        "node_type": node_type,
+                        "source": "vector_reindex",
+                        "project_id": project_id,
+                    },
+                    project_id=project_id,
+                )
+                if ok:
+                    stats["upserted"] += 1
+                else:
+                    stats["failed"] += 1
+
+            total_result = session.run(
+                """
+                MATCH (n {project_id: $pid})
+                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+                RETURN count(n) AS c
+                """,
+                pid=project_id,
+                node_types=list(NODE_TYPES),
+            ).single()
+            total_nodes_in_project = int(total_result["c"]) if total_result else 0
+            stats["truncated"] = total_nodes_in_project > stats["total_nodes"]
+        return stats
 
     def update_belief(self, name, project_id="default", confidence=None,
                       status=None, summary=None):

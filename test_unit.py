@@ -143,6 +143,7 @@ class TestWriteEntities(unittest.TestCase):
         self.session = MagicMock()
         self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
         self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        self.adapter.vector_upsert = MagicMock(return_value=True)
 
     def test_write_valid_entity(self):
         entities = [{"name": "TestConcept", "node_type": "Concept", "summary": "A test"}]
@@ -206,6 +207,20 @@ class TestWriteEntities(unittest.TestCase):
         self.adapter.write_entities(entities, "Z1337", project_id="my_project")
         call_kwargs = self.session.run.call_args[1]
         self.assertEqual(call_kwargs["project_id"], "my_project")
+
+    def test_entity_write_triggers_vector_upsert(self):
+        entities = [{"name": "Vectorized", "node_type": "Concept", "summary": "Embedding"}]
+        self.adapter.write_entities(entities, "Z1337", project_id="my_project")
+        self.adapter.vector_upsert.assert_called_once()
+        call_kwargs = self.adapter.vector_upsert.call_args[1]
+        self.assertEqual(call_kwargs["project_id"], "my_project")
+        self.assertEqual(call_kwargs["metadata"]["name"], "Vectorized")
+
+    def test_vector_upsert_failure_does_not_block_entity_write(self):
+        self.adapter.vector_upsert.return_value = False
+        entities = [{"name": "NoVector", "node_type": "Concept"}]
+        count = self.adapter.write_entities(entities, "Z1337", project_id="test")
+        self.assertEqual(count, 1)
 
 
 class TestWriteRelationships(unittest.TestCase):
@@ -582,6 +597,7 @@ class TestBackendAdapterInterface(unittest.TestCase):
             "update_node", "delete_node", "add_relationship", "delete_relationship",
             "merge_nodes", "vector_search", "vector_upsert", "vector_delete",
             "create_project", "get_project", "update_project", "list_projects",
+            "reindex_project_vectors",
         ]
         for method in required:
             self.assertTrue(hasattr(Neo4jQdrantAdapter, method),
@@ -667,6 +683,7 @@ class TestWriteEntitiesWithLimit(unittest.TestCase):
         self.session = MagicMock()
         self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
         self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        self.adapter.vector_upsert = MagicMock(return_value=True)
 
     def _mock_usage(self, node_count, extra_writes=10):
         """Set up get_usage to return a specific node count, then allow writes."""
@@ -729,6 +746,63 @@ class TestWriteEntitiesWithLimit(unittest.TestCase):
             entities, "Z1341", project_id="test", node_limit=100
         )
         self.assertEqual(count, 5)
+
+
+class TestReindexProjectVectors(unittest.TestCase):
+    """Test vector reindexing for existing project nodes."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        self.adapter.vector_upsert = MagicMock(return_value=True)
+        self.adapter._ensure_project_node_ids = MagicMock(return_value=None)
+
+    def _total_result(self, count):
+        result = MagicMock()
+        result.single.return_value = {"c": count}
+        return result
+
+    def test_reindex_counts_successes(self):
+        self.session.run.side_effect = [
+            [
+                {"name": "Albert Einstein", "node_type": "Person", "summary": "Physicist", "node_id": "id-1"},
+                {"name": "Quantenphysik", "node_type": "Concept", "summary": "Topic", "node_id": "id-2"},
+            ],
+            self._total_result(2),
+        ]
+        result = self.adapter.reindex_project_vectors(project_id="proj", limit=100)
+        self.assertEqual(result["project_id"], "proj")
+        self.assertEqual(result["total_nodes"], 2)
+        self.assertEqual(result["upserted"], 2)
+        self.assertEqual(result["failed"], 0)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(self.adapter.vector_upsert.call_count, 2)
+
+    def test_reindex_marks_truncated(self):
+        self.session.run.side_effect = [
+            [
+                {"name": "Node A", "node_type": "Concept", "summary": "", "node_id": "id-a"},
+            ],
+            self._total_result(5),
+        ]
+        result = self.adapter.reindex_project_vectors(project_id="proj", limit=1)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["total_nodes"], 1)
+
+    def test_reindex_counts_failures(self):
+        self.adapter.vector_upsert.side_effect = [True, False]
+        self.session.run.side_effect = [
+            [
+                {"name": "Node A", "node_type": "Concept", "summary": "", "node_id": "id-a"},
+                {"name": "Node B", "node_type": "Concept", "summary": "", "node_id": "id-b"},
+            ],
+            self._total_result(2),
+        ]
+        result = self.adapter.reindex_project_vectors(project_id="proj", limit=10)
+        self.assertEqual(result["upserted"], 1)
+        self.assertEqual(result["failed"], 1)
 
 
 class TestBackendAdapterUsageInterface(unittest.TestCase):

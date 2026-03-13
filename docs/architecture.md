@@ -86,6 +86,16 @@ Vector search and graph traversal answer fundamentally different questions:
 
 Using both gives agents both retrieval quality and reasoning capability.
 
+### Vector Lifecycle and Search Reliability (2026-03-14)
+
+To keep semantic retrieval reliable over time, Merkraum now treats vector freshness as a first-class backend concern:
+
+- **Write-time vector sync**: `write_entities` now triggers vector upsert per written node.
+- **Project reindex endpoint**: `POST /api/projects/<id>/vectors/reindex` rebuilds vectors for existing nodes.
+- **Mode-aware graph search**: `/api/graph` supports `search_mode=semantic|text` with `q`, `hops`, and `top`.
+
+Operationally, this reduces the common failure mode where nodes exist in Neo4j but are missing in the vector index, which previously caused semantic misses despite valid graph data.
+
 ## Belief Tracking
 
 Every knowledge claim in Merkraum can become a **Belief** — a first-class node with:

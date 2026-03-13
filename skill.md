@@ -4,11 +4,12 @@
 
 ## What Merkraum Does
 
-Merkraum provides persistent, structured memory for AI agents via a knowledge graph (Neo4j) and semantic search (Pinecone). Unlike flat key-value memory stores, Merkraum tracks **beliefs** — propositions with confidence scores, provenance, and explicit contradiction relationships.
+Merkraum provides persistent, structured memory for AI agents via a knowledge graph (Neo4j) and semantic/vector search (Qdrant or Pinecone, depending on deployment). Unlike flat key-value memory stores, Merkraum tracks **beliefs** — propositions with confidence scores, provenance, and explicit contradiction relationships.
 
 ### Core Capabilities
 
 - **Semantic Search**: Vector-based retrieval across your knowledge graph
+- **Hybrid Query Strategy**: Semantic-first retrieval with deterministic text-search fallback for recall-critical use cases
 - **Knowledge Ingestion**: Extract entities and relationships from text via LLM pipeline
 - **Graph Traversal**: Multi-hop exploration of entity relationships
 - **Belief Tracking**: Store beliefs with confidence, status (active/uncertain/contradicted/superseded), and provenance
@@ -20,6 +21,7 @@ Merkraum provides persistent, structured memory for AI agents via a knowledge gr
 | Operation | Method | Endpoint | Description |
 |-----------|--------|----------|-------------|
 | Search | GET | `/api/search?q=<query>` | Semantic vector search |
+| Graph Search | GET | `/api/graph?q=<query>&search_mode=semantic|text` | Query-centered subgraph retrieval (supports `hops` and `top`) |
 | Ingest (structured) | POST | `/api/ingest` | Write entities and relationships |
 | Ingest (text) | POST | `/api/ingest/text` | LLM extraction + graph write |
 | Traverse | GET | `/api/traverse/<entity>` | Multi-hop graph walk |
@@ -29,6 +31,13 @@ Merkraum provides persistent, structured memory for AI agents via a knowledge gr
 | Nodes | GET | `/api/nodes` | Query nodes by type |
 | Health | GET | `/api/health` | Service health check |
 | Discover | GET | `/api/discover` | Machine-readable capabilities |
+| Vector Reindex | POST | `/api/projects/<id>/vectors/reindex` | Rebuild vector index for existing project nodes |
+
+## Vector Freshness
+
+- New nodes are vector-indexed during entity writes (`write_entities`) to keep semantic retrieval up to date.
+- Existing/legacy nodes can be reindexed per project via `POST /api/projects/<id>/vectors/reindex`.
+- Reindex response includes: `upserted`, `failed`, `total_nodes`, `truncated`, and `limit`.
 
 ## Schema
 

@@ -70,6 +70,7 @@ MAX_SEARCH_TOP = 50
 MAX_TRAVERSE_DEPTH = 5
 MAX_GRAPH_HOPS = 3
 MAX_GRAPH_EXPAND_LIMIT = 100
+MAX_VECTOR_REINDEX_LIMIT = 10000
 
 
 def _allowed_origins() -> set[str]:
@@ -821,6 +822,7 @@ def discover():
             {"path": "/api/projects/<id>", "method": "GET", "auth": True, "description": "Get project metadata and usage"},
             {"path": "/api/projects/<id>", "method": "PATCH", "auth": True, "description": "Update project metadata"},
             {"path": "/api/projects/<id>", "method": "DELETE", "auth": True, "description": "Delete project and all data"},
+            {"path": "/api/projects/<id>/vectors/reindex", "method": "POST", "auth": True, "description": "Rebuild vector index for one project"},
         ],
         "operator": {
             "name": "Supervision Rheinland",
@@ -1110,6 +1112,40 @@ def delete_project(project_id):
         return _error(str(exc), 400)
     except Exception as exc:
         logger.exception("delete_project failed for %s", project_id)
+        return _error(str(exc))
+
+
+@app.route("/api/projects/<path:project_id>/vectors/reindex", methods=["POST"])
+@require_auth
+@require_scope("projects")
+def reindex_project_vectors(project_id):
+    """Rebuild vector index for a project.
+
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
+
+    Body (JSON, optional):
+        limit: max number of nodes to reindex (default: 5000, max: 10000)
+    """
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+    denied = _deny_if_project_forbidden(project_id)
+    if denied:
+        return denied
+
+    body = request.get_json(silent=True) or {}
+    try:
+        limit = int(body.get("limit", 5000))
+    except (TypeError, ValueError):
+        limit = 5000
+    limit = max(1, min(limit, MAX_VECTOR_REINDEX_LIMIT))
+
+    try:
+        result = adp.reindex_project_vectors(project_id=project_id, limit=limit)
+        status = 207 if result.get("failed", 0) > 0 else 200
+        return jsonify(result), status
+    except Exception as exc:
+        logger.exception("project vector reindex failed for %s", project_id)
         return _error(str(exc))
 
 
