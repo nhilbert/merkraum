@@ -302,9 +302,11 @@ def _get_semantic_subgraph(adp, project_id: str, query: str, *, limit: int, hops
             "query": query,
             "seed_count": len(deduped_seeds),
             "hops": depth,
+            "requested_limit": limit,
             "returned_nodes": len(nodes),
             "returned_links": len(links),
             "truncated": len(nodes) >= limit,
+            "cap_reason": "node_limit" if len(nodes) >= limit else None,
         },
     }
 
@@ -418,9 +420,11 @@ def _get_text_subgraph(adp, project_id: str, query: str, *, limit: int, hops: in
             "query": query,
             "seed_count": len(seed_names),
             "hops": depth,
+            "requested_limit": limit,
             "returned_nodes": len(nodes),
             "returned_links": len(links),
             "truncated": len(nodes) >= limit,
+            "cap_reason": "node_limit" if len(nodes) >= limit else None,
         },
     }
 
@@ -469,9 +473,14 @@ def _get_node_expansion(
                     "mode": "node_expand",
                     "seed_node_id": node_id or None,
                     "seed_name": node_name or None,
+                    "requested_limit": limit,
+                    "max_neighbor_limit": MAX_GRAPH_EXPAND_LIMIT,
                     "returned_nodes": 0,
                     "returned_links": 0,
+                    "returned_neighbors": 0,
+                    "total_neighbors": 0,
                     "truncated": False,
+                    "cap_reason": None,
                 },
             }
 
@@ -572,11 +581,20 @@ def _get_node_expansion(
             "mode": "node_expand",
             "seed_node_id": seed_node.get("node_id"),
             "seed_name": seed_node.get("name"),
+            "requested_limit": limit,
+            "max_neighbor_limit": MAX_GRAPH_EXPAND_LIMIT,
             "returned_neighbors": len(neighbor_nodes),
             "total_neighbors": total_neighbors,
             "returned_nodes": len(neighbor_nodes) + 1,
             "returned_links": len(edge_records),
             "truncated": total_neighbors > len(neighbor_nodes),
+            "cap_reason": (
+                "server_neighbor_limit"
+                if total_neighbors > len(neighbor_nodes) and limit >= MAX_GRAPH_EXPAND_LIMIT
+                else "request_limit"
+                if total_neighbors > len(neighbor_nodes)
+                else None
+            ),
         },
     }
 
@@ -1392,7 +1410,20 @@ def graph():
         nodes = [_map_node_for_graph(n) for n in raw_nodes]
         links = [_map_edge_for_graph(e) for e in raw_edges]
 
-        return jsonify({"nodes": nodes, "links": links, "meta": {"mode": "full", "truncated": len(nodes) >= limit}})
+        return jsonify(
+            {
+                "nodes": nodes,
+                "links": links,
+                "meta": {
+                    "mode": "full",
+                    "requested_limit": limit,
+                    "returned_nodes": len(nodes),
+                    "returned_links": len(links),
+                    "truncated": len(nodes) >= limit,
+                    "cap_reason": "node_limit" if len(nodes) >= limit else None,
+                },
+            }
+        )
     except Exception as exc:
         logger.exception("graph failed for project=%s", project)
         return _error(str(exc))
