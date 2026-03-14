@@ -229,7 +229,10 @@ class BackendAdapter(ABC):
     def update_project(self, project_id: str,
                        name: Optional[str] = None,
                        description: Optional[str] = None,
-                       tier: Optional[str] = None) -> dict:
+                       tier: Optional[str] = None,
+                       dreaming_enabled: Optional[bool] = None,
+                       dreaming_schedule: Optional[str] = None,
+                       dreaming_config: Optional[dict] = None) -> dict:
         """Update project metadata. Returns updated project dict."""
 
     @abstractmethod
@@ -753,9 +756,13 @@ class Neo4jBaseAdapter(BackendAdapter):
             return props
 
     def update_project(self, project_id, name=None, description=None,
-                       tier=None):
+                       tier=None, dreaming_enabled=None,
+                       dreaming_schedule=None, dreaming_config=None):
+        VALID_SCHEDULES = {"manual", "daily", "weekly"}
         if tier is not None and tier not in TIER_LIMITS:
             raise ValueError(f"Invalid tier: {tier}. Valid: {list(TIER_LIMITS.keys())}")
+        if dreaming_schedule is not None and dreaming_schedule not in VALID_SCHEDULES:
+            raise ValueError(f"Invalid dreaming_schedule: {dreaming_schedule}. Valid: {sorted(VALID_SCHEDULES)}")
         now = datetime.now(timezone.utc).isoformat()
         set_clauses = ["pm.updated_at = $now"]
         params: dict = {"pid": project_id, "now": now}
@@ -768,6 +775,16 @@ class Neo4jBaseAdapter(BackendAdapter):
         if tier is not None:
             set_clauses.append("pm.tier = $tier")
             params["tier"] = tier
+        if dreaming_enabled is not None:
+            set_clauses.append("pm.dreaming_enabled = $dreaming_enabled")
+            params["dreaming_enabled"] = bool(dreaming_enabled)
+        if dreaming_schedule is not None:
+            set_clauses.append("pm.dreaming_schedule = $dreaming_schedule")
+            params["dreaming_schedule"] = dreaming_schedule
+        if dreaming_config is not None:
+            import json as _json
+            set_clauses.append("pm.dreaming_config = $dreaming_config")
+            params["dreaming_config"] = _json.dumps(dreaming_config)
 
         with self._driver.session() as session:
             result = session.run(
@@ -778,7 +795,15 @@ class Neo4jBaseAdapter(BackendAdapter):
             ).single()
             if not result:
                 return {"updated": False, "error": f"Project '{project_id}' not found"}
-            return {"updated": True, **dict(result["pm"])}
+            props = dict(result["pm"])
+            # Parse dreaming_config back from JSON string
+            if "dreaming_config" in props and isinstance(props["dreaming_config"], str):
+                try:
+                    import json as _json
+                    props["dreaming_config"] = _json.loads(props["dreaming_config"])
+                except (ValueError, TypeError):
+                    pass
+            return {"updated": True, **props}
 
     def list_projects(self, owner=None):
         with self._driver.session() as session:

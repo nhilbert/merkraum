@@ -1105,6 +1105,9 @@ def update_project(project_id):
         name: new display name (optional)
         description: new description (optional)
         tier: new tier (optional)
+        dreaming_enabled: bool (optional)
+        dreaming_schedule: "manual" | "daily" | "weekly" (optional)
+        dreaming_config: dict with replay_walks, replay_hops, consolidation_threshold (optional)
     """
     adp = adapter
     if adp is None:
@@ -1119,6 +1122,9 @@ def update_project(project_id):
             name=body.get("name"),
             description=body.get("description"),
             tier=body.get("tier"),
+            dreaming_enabled=body.get("dreaming_enabled"),
+            dreaming_schedule=body.get("dreaming_schedule"),
+            dreaming_config=body.get("dreaming_config"),
         )
         if not result.get("updated"):
             return _error(result.get("error", "Update failed"), 404)
@@ -1154,6 +1160,92 @@ def delete_project(project_id):
         return _error(str(exc), 400)
     except Exception as exc:
         logger.exception("delete_project failed for %s", project_id)
+        return _error(str(exc))
+
+
+@app.route("/api/projects/<path:project_id>/dreaming", methods=["GET"])
+@require_auth
+@require_scope("read")
+def get_dreaming_config(project_id):
+    """Get dreaming configuration for a project.
+
+    Returns: dreaming_enabled, dreaming_schedule, dreaming_config
+    """
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+    denied = _deny_if_project_forbidden(project_id)
+    if denied:
+        return denied
+    try:
+        project = adp.get_project(project_id)
+        if not project:
+            return _error(f"Project '{project_id}' not found", 404)
+        dreaming_config_raw = project.get("dreaming_config")
+        if isinstance(dreaming_config_raw, str):
+            try:
+                dreaming_config_raw = json.loads(dreaming_config_raw)
+            except (ValueError, TypeError):
+                dreaming_config_raw = {}
+        return jsonify({
+            "project_id": project_id,
+            "dreaming_enabled": project.get("dreaming_enabled", False),
+            "dreaming_schedule": project.get("dreaming_schedule", "manual"),
+            "dreaming_config": dreaming_config_raw or {
+                "replay_walks": 3,
+                "replay_hops": 5,
+                "consolidation_threshold": 0.75,
+            },
+        })
+    except Exception as exc:
+        logger.exception("get_dreaming_config failed for %s", project_id)
+        return _error(str(exc))
+
+
+@app.route("/api/projects/<path:project_id>/dreaming", methods=["PATCH"])
+@require_auth
+@require_scope("projects")
+def update_dreaming_config(project_id):
+    """Update dreaming configuration for a project.
+
+    Body (JSON):
+        dreaming_enabled: bool (optional)
+        dreaming_schedule: "manual" | "daily" | "weekly" (optional)
+        dreaming_config: dict with replay_walks, replay_hops, consolidation_threshold (optional)
+    """
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+    denied = _deny_if_project_forbidden(project_id)
+    if denied:
+        return denied
+    body = request.get_json(silent=True) or {}
+    try:
+        result = adp.update_project(
+            project_id=project_id,
+            dreaming_enabled=body.get("dreaming_enabled"),
+            dreaming_schedule=body.get("dreaming_schedule"),
+            dreaming_config=body.get("dreaming_config"),
+        )
+        if not result.get("updated"):
+            return _error(result.get("error", "Update failed"), 404)
+        # Return clean dreaming config
+        dreaming_config_val = result.get("dreaming_config")
+        if isinstance(dreaming_config_val, str):
+            try:
+                dreaming_config_val = json.loads(dreaming_config_val)
+            except (ValueError, TypeError):
+                dreaming_config_val = {}
+        return jsonify({
+            "project_id": project_id,
+            "dreaming_enabled": result.get("dreaming_enabled", False),
+            "dreaming_schedule": result.get("dreaming_schedule", "manual"),
+            "dreaming_config": dreaming_config_val or {},
+        })
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except Exception as exc:
+        logger.exception("update_dreaming_config failed for %s", project_id)
         return _error(str(exc))
 
 
