@@ -34,7 +34,7 @@ LLM_REGION = os.environ.get("MERKRAUM_LLM_REGION", "eu-central-1")
 
 # Default models per provider
 _DEFAULT_MODELS = {
-    "bedrock": "eu.mistral.mistral-large-2411-v1:0",
+    "bedrock": "anthropic.claude-3-haiku-20240307-v1:0",
     "openai": "gpt-4o-mini",
 }
 
