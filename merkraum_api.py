@@ -23,6 +23,9 @@ import importlib
 import json
 import logging
 import os
+import queue
+import threading
+import time
 import urllib.request
 import urllib.error
 from functools import lru_cache
@@ -2184,6 +2187,250 @@ def revoke_token(token_prefix: str):
         )
         return jsonify({"ok": True, "message": "Token revoked"})
     return _error("Token not found or already revoked", 404)
+
+
+# ---------------------------------------------------------------------------
+# Dreaming — async graph dreaming with SSE progress streaming
+# ---------------------------------------------------------------------------
+
+from merkraum_dreaming import dream as _dream_engine
+
+# In-memory dream job store (same pattern as MCP ingestion jobs)
+_dream_jobs: dict[str, dict] = {}
+_dream_jobs_lock = threading.Lock()
+_dream_queue: queue.Queue | None = None
+MAX_DREAM_JOBS = 20
+
+
+def _ensure_dream_worker():
+    """Lazy-create the dreaming background worker thread."""
+    global _dream_queue
+    if _dream_queue is not None:
+        return
+    _dream_queue = queue.Queue()
+
+    def _worker():
+        while True:
+            job_id = _dream_queue.get()
+            _run_dream_job(job_id)
+            _dream_queue.task_done()
+
+    t = threading.Thread(target=_worker, daemon=True, name="dreaming-worker")
+    t.start()
+
+
+def _run_dream_job(job_id: str):
+    """Execute a dream session, storing progress messages for SSE streaming."""
+    with _dream_jobs_lock:
+        job = _dream_jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+
+    adp = adapter
+    if not adp:
+        with _dream_jobs_lock:
+            job["status"] = "failed"
+            job["error"] = "Backend not available"
+        return
+
+    start = time.time()
+    try:
+        gen = _dream_engine(
+            adp,
+            project_id=job["project_id"],
+            phases=job.get("phases"),
+            replay_hops=job.get("replay_hops", 5),
+            replay_walks=job.get("replay_walks", 3),
+            consolidation_threshold=job.get("consolidation_threshold", 0.75),
+            consolidation_dry_run=job.get("consolidation_dry_run", False),
+            seed=job.get("seed"),
+        )
+        result = None
+        try:
+            while True:
+                progress = next(gen)
+                with _dream_jobs_lock:
+                    job.setdefault("messages", []).append(progress)
+        except StopIteration as e:
+            result = e.value
+
+        with _dream_jobs_lock:
+            job["status"] = "completed"
+            job["result"] = result or {}
+            job["duration_ms"] = int((time.time() - start) * 1000)
+    except Exception as e:
+        logger.error("Dream job %s failed: %s", job_id, e, exc_info=True)
+        with _dream_jobs_lock:
+            job["status"] = "failed"
+            job["error"] = str(e)
+            job["duration_ms"] = int((time.time() - start) * 1000)
+
+
+@app.route("/api/dream", methods=["POST"])
+@require_auth
+@require_scope("write")
+def dream_trigger():
+    """Trigger a dream session (async). Returns job_id for status polling / SSE.
+
+    Request body (all optional):
+        phases: ["replay", "consolidation", "reflection"]
+        replay_hops: int (default 5)
+        replay_walks: int (default 3)
+        consolidation_threshold: float (default 0.75)
+        consolidation_dry_run: bool (default false)
+        seed: str (optional starting entity for replay)
+    """
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    body = request.get_json(silent=True) or {}
+
+    # Limit concurrent dream jobs per project
+    with _dream_jobs_lock:
+        active = [j for j in _dream_jobs.values()
+                  if j["project_id"] == project and j["status"] in ("queued", "running")]
+        if active:
+            return _error("A dream session is already running for this project", 409)
+
+        # Evict old jobs
+        if len(_dream_jobs) >= MAX_DREAM_JOBS:
+            oldest = sorted(_dream_jobs.keys(),
+                            key=lambda k: _dream_jobs[k].get("created_at", "")
+                            )[:MAX_DREAM_JOBS // 2]
+            for k in oldest:
+                if _dream_jobs[k]["status"] not in ("queued", "running"):
+                    del _dream_jobs[k]
+
+        import uuid
+        job_id = str(uuid.uuid4())[:12]
+        _dream_jobs[job_id] = {
+            "job_id": job_id,
+            "project_id": project,
+            "status": "queued",
+            "created_at": time.time(),
+            "messages": [],
+            "phases": body.get("phases"),
+            "replay_hops": min(body.get("replay_hops", 5), 10),
+            "replay_walks": min(body.get("replay_walks", 3), 5),
+            "consolidation_threshold": body.get("consolidation_threshold", 0.75),
+            "consolidation_dry_run": body.get("consolidation_dry_run", False),
+            "seed": body.get("seed"),
+        }
+
+    _ensure_dream_worker()
+    _dream_queue.put(job_id)
+
+    return jsonify({"job_id": job_id, "status": "queued"}), 202
+
+
+@app.route("/api/dream/status", methods=["GET"])
+@require_auth
+@require_scope("read")
+def dream_status():
+    """Check dream session status. Query param: job_id (required).
+
+    Returns status, messages since last_index, and result if complete.
+    Query params:
+        job_id: str (required)
+        since: int (message index to start from, for incremental polling)
+    """
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return _error("job_id parameter required", 400)
+
+    with _dream_jobs_lock:
+        job = _dream_jobs.get(job_id)
+        if not job:
+            return _error("Dream job not found", 404)
+
+        project = job["project_id"]
+        denied = _deny_if_project_forbidden(project)
+        if denied:
+            return denied
+
+        since = int(request.args.get("since", 0))
+        messages = job.get("messages", [])[since:]
+
+        resp = {
+            "job_id": job_id,
+            "status": job["status"],
+            "messages": messages,
+            "message_count": len(job.get("messages", [])),
+        }
+        if job["status"] == "completed":
+            resp["result"] = job.get("result", {})
+            resp["duration_ms"] = job.get("duration_ms")
+        elif job["status"] == "failed":
+            resp["error"] = job.get("error")
+
+    return jsonify(resp)
+
+
+@app.route("/api/dream/stream", methods=["GET"])
+@require_auth
+@require_scope("read")
+def dream_stream():
+    """SSE (Server-Sent Events) stream of dream progress messages.
+
+    Query param: job_id (required).
+    Streams messages as they arrive, then sends a 'complete' event.
+    """
+    from flask import Response
+
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return _error("job_id parameter required", 400)
+
+    with _dream_jobs_lock:
+        job = _dream_jobs.get(job_id)
+        if not job:
+            return _error("Dream job not found", 404)
+
+        project = job["project_id"]
+        denied = _deny_if_project_forbidden(project)
+        if denied:
+            return denied
+
+    def generate():
+        last_index = 0
+        while True:
+            with _dream_jobs_lock:
+                job = _dream_jobs.get(job_id)
+                if not job:
+                    yield f"data: {json.dumps({'event': 'error', 'detail': 'Job not found'})}\n\n"
+                    return
+
+                messages = job.get("messages", [])[last_index:]
+                status = job["status"]
+
+            for msg in messages:
+                yield f"data: {json.dumps(msg)}\n\n"
+                last_index += 1
+
+            if status == "completed":
+                with _dream_jobs_lock:
+                    result = job.get("result", {})
+                yield f"data: {json.dumps({'event': 'complete', 'result': result})}\n\n"
+                return
+            elif status == "failed":
+                with _dream_jobs_lock:
+                    error = job.get("error", "Unknown error")
+                yield f"data: {json.dumps({'event': 'error', 'detail': error})}\n\n"
+                return
+
+            time.sleep(0.5)
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 # ---------------------------------------------------------------------------

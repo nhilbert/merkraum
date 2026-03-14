@@ -203,6 +203,57 @@ def llm_extract(
     }
 
 
+def llm_call(
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.3,
+    max_tokens: int = 4000,
+    provider: str | None = None,
+    model: str | None = None,
+    api_key: str | None = None,
+) -> dict | None:
+    """General-purpose LLM call that returns parsed JSON.
+
+    Unlike llm_extract(), this does not assume entities/relationships schema.
+    Returns the parsed JSON dict, or None on failure.
+    """
+    prov = (provider or LLM_PROVIDER).lower()
+
+    try:
+        if prov == "bedrock":
+            raw = _llm_call_bedrock(
+                system_prompt, user_prompt,
+                model=model, temperature=temperature, max_tokens=max_tokens,
+            )
+        elif prov == "openai":
+            raw = _llm_call_openai(
+                system_prompt, user_prompt,
+                model=model, temperature=temperature, max_tokens=max_tokens,
+                api_key=api_key,
+            )
+        else:
+            raise ValueError(f"Unknown LLM provider: {prov}")
+    except Exception as e:
+        logger.error("LLM call failed (provider=%s): %s", prov, e)
+        return None
+
+    if not raw:
+        return None
+
+    text = raw.strip()
+    if text.startswith("```"):
+        first_newline = text.index("\n") if "\n" in text else len(text)
+        text = text[first_newline + 1:]
+        if text.endswith("```"):
+            text = text[:-3].strip()
+
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        logger.error("Failed to parse LLM JSON response: %s", e)
+        return None
+
+
 def get_provider_info() -> dict:
     """Return current LLM configuration for diagnostics."""
     return {
