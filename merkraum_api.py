@@ -28,6 +28,8 @@ import urllib.error
 from functools import lru_cache
 from typing import cast
 
+from merkraum_llm import llm_extract, get_provider_info
+
 from merkraum_acl import is_auth_required, is_project_allowed, split_csv_env
 
 from flask import Flask, jsonify, request, current_app
@@ -735,40 +737,29 @@ def _load_env_value(key: str) -> str | None:
     return None
 
 
-def _llm_extract(text: str, api_key: str, model: str = "gpt-4o-mini") -> dict:
-    """Call OpenAI to extract entities and relationships from text."""
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "response_format": {"type": "json_object"},
-        "temperature": 0.3,
-        "max_completion_tokens": 8000,
-        "messages": [
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Extract entities and relationships from the following text:\n\n{text[:8000]}"},
-        ],
-    }
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.loads(resp.read())
-        content = data["choices"][0]["message"].get("content", "")
-        if not content:
-            return {"entities": [], "relationships": []}
-        result = json.loads(content)
-        # Validate structure
-        entities = result.get("entities", [])
-        relationships = result.get("relationships", [])
-        # Filter to valid types
-        valid_node_types = set(NODE_TYPES)
-        valid_rel_types = set(RELATIONSHIP_TYPES)
-        entities = [e for e in entities if e.get("node_type") in valid_node_types]
-        relationships = [r for r in relationships if r.get("type") in valid_rel_types]
-        return {"entities": entities, "relationships": relationships}
+def _llm_extract_text(text: str) -> dict:
+    """Extract entities and relationships from text using configured LLM provider.
+
+    Uses merkraum_llm module for provider-agnostic extraction (Bedrock or OpenAI).
+    """
+    user_prompt = f"Extract entities and relationships from the following text:\n\n{text[:8000]}"
+    api_key = _get_openai_key()
+
+    result = llm_extract(
+        system_prompt=EXTRACTION_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        temperature=0.3,
+        api_key=api_key,
+    )
+
+    # Filter to valid types
+    entities = result.get("entities", [])
+    relationships = result.get("relationships", [])
+    valid_node_types = set(NODE_TYPES)
+    valid_rel_types = set(RELATIONSHIP_TYPES)
+    entities = [e for e in entities if e.get("node_type") in valid_node_types]
+    relationships = [r for r in relationships if r.get("type") in valid_rel_types]
+    return {"entities": entities, "relationships": relationships}
 
 
 # ---------------------------------------------------------------------------
@@ -799,6 +790,7 @@ def discover():
             "node_types": list(NODE_TYPES),
             "relationship_types": list(RELATIONSHIP_TYPES),
         },
+        "llm": get_provider_info(),
         "tiers": {k: {"node_limit": v} for k, v in TIER_LIMITS.items()},
         "endpoints": [
             {"path": "/api/search", "method": "GET", "auth": True, "description": "Semantic vector search"},
@@ -1738,16 +1730,18 @@ def ingest_text():
         return denied
     source = body.get("source") or "text_ingestion"
 
-    api_key = _get_openai_key()
-    if not api_key:
+    # Check provider-specific prerequisites
+    provider_info = get_provider_info()
+    if provider_info["provider"] == "openai" and not _get_openai_key():
         return _error(
-            "OPENAI_API_KEY not configured. Set it in .env or environment.",
+            "OPENAI_API_KEY not configured. Set it in .env or environment, "
+            "or switch to Bedrock provider (MERKRAUM_LLM_PROVIDER=bedrock).",
             503,
         )
 
-    # Step 1: LLM extraction
+    # Step 1: LLM extraction (provider-agnostic via merkraum_llm)
     try:
-        extracted = _llm_extract(text, api_key)
+        extracted = _llm_extract_text(text)
     except urllib.error.HTTPError as exc:
         logger.exception("LLM extraction HTTP error")
         return _error(f"LLM extraction failed: HTTP {exc.code}", 502)

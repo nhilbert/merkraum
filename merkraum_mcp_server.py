@@ -46,6 +46,7 @@ from fastmcp.server.dependencies import get_access_token
 from merkraum_backend import (
     create_adapter, BackendAdapter, NODE_TYPES, RELATIONSHIP_TYPES, TIER_LIMITS,
 )
+from merkraum_llm import llm_extract, get_provider_info
 
 # --- Configuration ---
 
@@ -83,9 +84,9 @@ DEFAULT_PROJECT = os.environ.get("MERKRAUM_PROJECT", "default")
 HTTP_PORT = int(os.environ.get("MERKRAUM_MCP_PORT", "8090"))
 HTTP_HOST = os.environ.get("MERKRAUM_MCP_HOST", "127.0.0.1")
 
-# LLM for knowledge extraction (optional)
+# LLM for knowledge extraction — now configurable via merkraum_llm module
+# Legacy OPENAI_API_KEY still read for backward compatibility when provider=openai
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-EXTRACTION_MODEL = os.environ.get("MERKRAUM_EXTRACTION_MODEL", "gpt-4o-mini")
 
 # --- Logging ---
 
@@ -921,12 +922,19 @@ def _run_ingestion_job(job_id: str, text: str, project: str):
 
 
 def _extract_and_write(text: str, project: str = None) -> dict:
-    """Extract entities/relationships from text via LLM, write to graph."""
-    api_key = OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        return {"error": "OPENAI_API_KEY not set"}
+    """Extract entities/relationships from text via LLM, write to graph.
 
-    prompt = f"""Extract structured knowledge from this text. Return JSON:
+    Uses merkraum_llm module for provider-agnostic extraction (Bedrock or OpenAI).
+    """
+    provider_info = get_provider_info()
+    if provider_info["provider"] == "openai":
+        api_key = OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            return {"error": "OPENAI_API_KEY not set (or switch to MERKRAUM_LLM_PROVIDER=bedrock)"}
+    else:
+        api_key = None
+
+    system_prompt = f"""Extract structured knowledge from this text. Return JSON:
 {{
   "entities": [
     {{"name": "...", "node_type": "...", "summary": "..."}}
@@ -937,31 +945,16 @@ def _extract_and_write(text: str, project: str = None) -> dict:
 }}
 
 Valid node_types: {json.dumps(NODE_TYPES)}
-Valid relationship types: {json.dumps(RELATIONSHIP_TYPES)}
+Valid relationship types: {json.dumps(RELATIONSHIP_TYPES)}"""
 
-Text:
-{text[:8000]}"""
+    user_prompt = f"Extract structured knowledge from this text:\n\n{text[:8000]}"
 
-    req_body = json.dumps({
-        "model": EXTRACTION_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-    }).encode()
-
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=req_body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
+    extracted = llm_extract(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.1,
+        api_key=api_key,
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read())
-
-    content = data["choices"][0]["message"]["content"]
-    extracted = json.loads(content)
 
     adapter = _get_adapter()
     entities = extracted.get("entities", [])
