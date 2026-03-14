@@ -206,6 +206,53 @@ def _get_all_edges(adp, project_id: str, limit: int = 1000) -> list:
     return edges
 
 
+def _get_contradiction_pairs(adp, project_id: str) -> list:
+    """Query actual CONTRADICTS relationship pairs from Neo4j.
+
+    Returns a list of dicts, each with belief_a, belief_b, reason, and relationship metadata.
+    Uses directed match with DISTINCT to avoid duplicate pairs.
+    """
+    pairs = []
+    with adp._driver.session() as session:
+        records = session.run(
+            """
+            MATCH (a:Belief {project_id: $pid})-[r:CONTRADICTS]->(b:Belief {project_id: $pid})
+            WHERE a.active = true AND b.active = true
+            RETURN a.name AS a_name, a.summary AS a_summary,
+                   a.confidence AS a_confidence, a.source_cycle AS a_cycle,
+                   a.node_id AS a_node_id,
+                   b.name AS b_name, b.summary AS b_summary,
+                   b.confidence AS b_confidence, b.source_cycle AS b_cycle,
+                   b.node_id AS b_node_id,
+                   r.reason AS reason, r.confidence AS rel_confidence,
+                   type(r) AS rel_type
+            """,
+            pid=project_id,
+        )
+        for rec in records:
+            pairs.append({
+                "belief_a": {
+                    "name": rec["a_name"] or "",
+                    "summary": rec["a_summary"] or "",
+                    "confidence": rec["a_confidence"] or 0,
+                    "status": "contradicted",
+                    "source": rec["a_cycle"] or "",
+                    "node_id": rec["a_node_id"] or "",
+                },
+                "belief_b": {
+                    "name": rec["b_name"] or "",
+                    "summary": rec["b_summary"] or "",
+                    "confidence": rec["b_confidence"] or 0,
+                    "status": "contradicted",
+                    "source": rec["b_cycle"] or "",
+                    "node_id": rec["b_node_id"] or "",
+                },
+                "reason": rec["reason"] or "Conflicting evidence detected",
+                "rel_confidence": rec["rel_confidence"] or 0,
+            })
+    return pairs
+
+
 def _get_semantic_subgraph(adp, project_id: str, query: str, *, limit: int, hops: int, top: int) -> dict:
     """Build a query-centered subgraph via semantic seeds + N-hop neighborhood."""
     seed_hits = adp.vector_search(query_text=query, top_k=top, project_id=project_id)
@@ -1378,6 +1425,31 @@ def beliefs():
         return jsonify([_map_belief(b) for b in raw])
     except Exception as exc:
         logger.exception("beliefs failed for project=%s status=%s", project, status)
+        return _error(str(exc))
+
+
+@app.route("/api/contradictions", methods=["GET"])
+@require_auth
+@require_scope("read")
+def contradictions():
+    """Contradiction pairs — returns actual CONTRADICTS relationship pairs.
+
+    Each pair contains both beliefs and the relationship reason.
+
+    Query params:
+        project: project id (default: "default")
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+    try:
+        pairs = _get_contradiction_pairs(adapter, project)
+        return jsonify(pairs)
+    except Exception as exc:
+        logger.exception("contradictions failed for project=%s", project)
         return _error(str(exc))
 
 
