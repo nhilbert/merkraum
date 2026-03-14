@@ -1,0 +1,30 @@
+# VCS
+.git/
+.gitignore
+
+# Secrets and local env
+.env
+.env.*
+!.env.example
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.venv/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local/dev-only files
+test_*.py
+demo_*.py
+*.log
+
+# Misc
+.DS_Store
