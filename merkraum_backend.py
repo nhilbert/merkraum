@@ -730,38 +730,24 @@ class Neo4jBaseAdapter(BackendAdapter):
     def get_beliefs(self, project_id="default", status="active"):
         beliefs = []
         with self._driver.session() as session:
-            if status == "uncertain":
-                cypher = """
-                MATCH (b:Belief {project_id: $pid})
-                WHERE b.active = true AND b.confidence < 0.5
-                RETURN b.name AS name, b.summary AS summary,
-                       b.confidence AS confidence, b.source_cycle AS cycle
-                ORDER BY b.confidence ASC
-                """
-            elif status == "contradicted":
-                cypher = """
-                MATCH (b1:Belief {project_id: $pid})-[:CONTRADICTS]-(b2:Belief {project_id: $pid})
-                WHERE b1.active = true AND b2.active = true
-                RETURN DISTINCT b1.name AS name, b1.summary AS summary,
-                       b1.confidence AS confidence, b1.source_cycle AS cycle
-                """
-            elif status == "superseded":
-                cypher = """
-                MATCH (b:Belief {project_id: $pid})
-                WHERE b.status = 'superseded'
-                RETURN b.name AS name, b.summary AS summary,
-                       b.confidence AS confidence, b.source_cycle AS cycle
-                ORDER BY b.updated_at DESC LIMIT 20
-                """
-            else:
+            if status == "active":
                 cypher = """
                 MATCH (b:Belief {project_id: $pid})
                 WHERE b.active = true
+                  AND (b.status IS NULL OR b.status = 'active')
                 RETURN b.name AS name, b.summary AS summary,
                        b.confidence AS confidence, b.source_cycle AS cycle
                 ORDER BY b.confidence DESC
                 """
-            records = session.run(cypher, pid=project_id)
+            else:
+                cypher = """
+                MATCH (b:Belief {project_id: $pid})
+                WHERE b.status = $status
+                RETURN b.name AS name, b.summary AS summary,
+                       b.confidence AS confidence, b.source_cycle AS cycle
+                ORDER BY b.updated_at DESC
+                """
+            records = session.run(cypher, pid=project_id, status=status)
             for rec in records:
                 beliefs.append({
                     "name": rec["name"],
