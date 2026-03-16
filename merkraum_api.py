@@ -743,6 +743,15 @@ Use ONLY the following fixed vocabulary.
 6. If the text contains no extractable knowledge, return empty arrays.
 7. Do NOT invent relationships not stated or clearly implied in the text.
 
+## CONTRADICTION RULES (for CONTRADICTS relationships):
+8. Only use CONTRADICTS when two beliefs are about the SAME subject with SAME scope.
+9. Different scopes are NOT contradictions. Examples of different scopes:
+   - "German market grew 30%" vs "International market declined" — different geographic scopes
+   - "Revenue increased in Q1" vs "Revenue decreased in Q4" — different time periods
+   - "Product A sales up" vs "Product B sales down" — different subjects
+10. Before emitting CONTRADICTS, verify: same entity, same scope, same time frame, genuinely incompatible claims.
+11. Include the specific reason in the "reason" field explaining WHY the beliefs conflict.
+
 ## OUTPUT FORMAT:
 Return a JSON object with two arrays: "entities" and "relationships".
 
