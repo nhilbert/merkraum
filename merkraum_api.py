@@ -2367,6 +2367,125 @@ def revoke_token(token_prefix: str):
 
 
 # ---------------------------------------------------------------------------
+# Terms acceptance — DSGVO-compliant terms + privacy acceptance tracking
+# ---------------------------------------------------------------------------
+
+
+@app.route("/api/terms", methods=["POST"])
+@require_auth
+def accept_terms():
+    """Record that the authenticated user accepted terms.
+
+    JSON body:
+        {
+            "terms_version": "2026-03-16-v1",
+            "terms_accepted_at": "2026-03-16T12:00:00.000Z"
+        }
+
+    Both fields are required. The frontend sends the exact timestamp of
+    acceptance and the version string of the terms document the user saw.
+    """
+    if not adapter:
+        return _error("Backend not available", 503)
+
+    body = request.get_json(silent=True)
+    if not body:
+        return _error("Request body must be JSON", 400)
+
+    terms_version = (body.get("terms_version") or "").strip()
+    if not terms_version:
+        return _error("'terms_version' is required", 400)
+
+    terms_accepted_at = (body.get("terms_accepted_at") or "").strip()
+    if not terms_accepted_at:
+        return _error("'terms_accepted_at' is required", 400)
+
+    user_id = request.user_id or ("dev-user" if not _is_auth_required() else None)
+    if not user_id:
+        return _error("User identity required", 401)
+
+    try:
+        with adapter._driver.session() as session:
+            session.execute_write(
+                _upsert_terms_acceptance,
+                user_id=user_id,
+                terms_version=terms_version,
+                terms_accepted_at=terms_accepted_at,
+            )
+        logger.info(
+            "Terms accepted: user=%s version=%s at=%s",
+            user_id, terms_version, terms_accepted_at,
+        )
+        return jsonify({
+            "ok": True,
+            "user_id": user_id,
+            "terms_version": terms_version,
+            "terms_accepted_at": terms_accepted_at,
+        }), 201
+    except Exception as exc:
+        logger.exception("Failed to record terms acceptance")
+        return _error(f"Failed to record terms acceptance: {exc}")
+
+
+@app.route("/api/terms", methods=["GET"])
+@require_auth
+def get_terms_acceptance():
+    """Check whether the authenticated user has accepted terms.
+
+    Returns the most recent acceptance record, or 404 if none exists.
+    """
+    if not adapter:
+        return _error("Backend not available", 503)
+
+    user_id = request.user_id or ("dev-user" if not _is_auth_required() else None)
+    if not user_id:
+        return _error("User identity required", 401)
+
+    try:
+        with adapter._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (t:TermsAcceptance {user_id: $user_id})
+                RETURN t.user_id AS user_id,
+                       t.terms_version AS terms_version,
+                       t.terms_accepted_at AS terms_accepted_at,
+                       t.recorded_at AS recorded_at
+                ORDER BY t.recorded_at DESC
+                LIMIT 1
+                """,
+                user_id=user_id,
+            ).single()
+
+        if not result:
+            return _error("No terms acceptance found for this user", 404)
+
+        return jsonify({
+            "user_id": result["user_id"],
+            "terms_version": result["terms_version"],
+            "terms_accepted_at": result["terms_accepted_at"],
+            "recorded_at": result["recorded_at"],
+        })
+    except Exception as exc:
+        logger.exception("Failed to check terms acceptance")
+        return _error(f"Failed to check terms acceptance: {exc}")
+
+
+def _upsert_terms_acceptance(tx, user_id: str, terms_version: str, terms_accepted_at: str):
+    """Create or update a terms acceptance record for the user."""
+    tx.run(
+        """
+        MERGE (t:TermsAcceptance {user_id: $user_id})
+        SET t.terms_version = $terms_version,
+            t.terms_accepted_at = $terms_accepted_at,
+            t.recorded_at = toString(datetime())
+        """,
+        user_id=user_id,
+        terms_version=terms_version,
+        terms_accepted_at=terms_accepted_at,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Dreaming — async graph dreaming with SSE progress streaming
 # ---------------------------------------------------------------------------
 
@@ -2680,6 +2799,24 @@ def _init_pat_auth():
         logger.error("Failed to initialize PAT validator: %s", exc)
 
 
+def _init_terms_constraints():
+    """Ensure Neo4j index for TermsAcceptance nodes. Called once at startup."""
+    if adapter is None:
+        return
+    driver = getattr(adapter, "_driver", None)
+    if not driver:
+        return
+    try:
+        with driver.session() as session:
+            session.run(
+                "CREATE CONSTRAINT terms_user_unique IF NOT EXISTS "
+                "FOR (t:TermsAcceptance) REQUIRE t.user_id IS UNIQUE"
+            )
+        logger.info("TermsAcceptance Neo4j constraints ensured")
+    except Exception as exc:
+        logger.error("Failed to create TermsAcceptance constraints: %s", exc)
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Merkraum REST API server",
@@ -2720,6 +2857,7 @@ def main():
     _init_adapter()
     _init_cognito_auth()
     _init_pat_auth()
+    _init_terms_constraints()
 
     logger.info(
         "Starting Merkraum API on %s:%d (debug=%s)",
