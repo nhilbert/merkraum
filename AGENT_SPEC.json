@@ -1,0 +1,528 @@
+{
+  "$schema": "https://merkraum.de/schemas/agent-spec/v1.0",
+  "spec_version": "1.0.0",
+  "name": "Merkraum",
+  "description": "Structured knowledge graph memory for AI agents with belief tracking, contradiction detection, and provenance. Unlike flat key-value memory stores, Merkraum treats knowledge as propositions with confidence, status, and epistemic relationships.",
+  "version": "1.0",
+  "homepage": "https://merkraum.de",
+  "documentation": "https://www.merkraum.de/docs",
+  "operator": {
+    "name": "Supervision Rheinland",
+    "contact": "Dr. Norman Hilbert",
+    "email": "info@merkraum.de",
+    "jurisdiction": "Bonn, Germany"
+  },
+
+  "interfaces": {
+    "rest_api": {
+      "base_url": "https://agent.nhilbert.de/api/merkraum",
+      "protocol": "HTTPS",
+      "content_type": "application/json",
+      "discovery": "GET /api/discover",
+      "health": "GET /api/health"
+    },
+    "mcp": {
+      "endpoint": "https://agent.nhilbert.de/mcp/merkraum/",
+      "protocol": "MCP over HTTP",
+      "transport": ["http", "stdio"],
+      "well_known": "https://agent.nhilbert.de/.well-known/skill.md"
+    }
+  },
+
+  "authentication": {
+    "type": "oauth2",
+    "provider": "aws_cognito",
+    "region": "eu-central-1",
+    "flows": ["authorization_code_pkce"],
+    "token_header": "Authorization: Bearer <jwt_token>",
+    "pat_supported": true,
+    "pat_prefix": "mk_pat_",
+    "pat_header": "Authorization: Bearer mk_pat_<token>",
+    "scopes": ["read", "search", "ingest", "projects"],
+    "data_sovereignty": "All data stored in eu-central-1 (Frankfurt). No data leaves EU."
+  },
+
+  "schema": {
+    "node_types": [
+      "Person", "Organization", "Project", "Concept",
+      "Regulation", "Event", "Belief", "Artifact",
+      "Interview", "Quote"
+    ],
+    "relationship_types": [
+      "SUPPORTS", "CONTRADICTS", "COMPLEMENTS", "SUPERSEDES",
+      "EXTENDS", "REFINES", "CREATED_BY", "AFFILIATED_WITH",
+      "APPLIES", "IMPLEMENTS", "PARTICIPATED_IN", "PRODUCES",
+      "REFERENCES", "TEMPORAL", "MENTIONS", "PART_OF"
+    ],
+    "belief_statuses": ["active", "uncertain", "contradicted", "superseded"],
+    "belief_fields": {
+      "confidence": { "type": "float", "range": [0.0, 1.0] },
+      "status": { "type": "enum", "values": ["active", "uncertain", "contradicted", "superseded"] },
+      "provenance": { "type": "string", "description": "Source label for traceability" }
+    }
+  },
+
+  "capabilities": {
+    "semantic_search": {
+      "description": "Vector-based retrieval across the knowledge graph",
+      "backends": ["qdrant"],
+      "embedding_model": "bge-small-en-v1.5 (FastEmbed, local)"
+    },
+    "knowledge_ingestion": {
+      "description": "Extract entities and relationships from text via LLM pipeline",
+      "modes": ["structured", "text_extraction"],
+      "llm_providers": ["bedrock", "openai"],
+      "max_text_length": 16000
+    },
+    "graph_traversal": {
+      "description": "Multi-hop exploration of entity relationships",
+      "max_depth": 5,
+      "backends": ["neo4j"]
+    },
+    "belief_tracking": {
+      "description": "Store propositions with confidence, status, provenance, and explicit contradiction relationships. Unique differentiator: no other system offers structured belief objects with decay and human-auditable epistemics.",
+      "features": ["confidence_scoring", "contradiction_detection", "status_lifecycle", "provenance_tracking"]
+    },
+    "project_isolation": {
+      "description": "Separate knowledge spaces per project with access control",
+      "auto_provision": true
+    },
+    "dreaming": {
+      "description": "Neuroscience-inspired knowledge consolidation: replay, weave, and reflect on graph structure",
+      "modes": ["manual", "scheduled"],
+      "configurable": true
+    }
+  },
+
+  "endpoints": {
+    "discovery": {
+      "path": "/api/discover",
+      "method": "GET",
+      "auth": false,
+      "scope": null,
+      "description": "Machine-readable capabilities, auth info, and schema"
+    },
+    "health": {
+      "path": "/api/health",
+      "method": "GET",
+      "auth": true,
+      "scope": null,
+      "description": "Service health check"
+    },
+    "search": {
+      "path": "/api/search",
+      "method": "GET",
+      "auth": true,
+      "scope": "search",
+      "description": "Semantic vector search",
+      "parameters": {
+        "q": { "type": "string", "required": true, "description": "Search query (natural language)" },
+        "project": { "type": "string", "required": false, "default": "user's default project" },
+        "top": { "type": "integer", "required": false, "default": 5, "max": 50 }
+      },
+      "response": {
+        "type": "array",
+        "items": { "fields": ["name", "node_type", "summary", "score", "metadata"] }
+      }
+    },
+    "graph_search": {
+      "path": "/api/graph",
+      "method": "GET",
+      "auth": true,
+      "scope": "read",
+      "description": "Query-centered subgraph retrieval with semantic or text search mode",
+      "parameters": {
+        "q": { "type": "string", "required": false, "description": "Search query" },
+        "search_mode": { "type": "string", "required": false, "enum": ["semantic", "text"], "default": "semantic" },
+        "hops": { "type": "integer", "required": false, "default": 1, "max": 3 },
+        "top": { "type": "integer", "required": false, "default": 10 },
+        "project": { "type": "string", "required": false }
+      }
+    },
+    "graph_expand": {
+      "path": "/api/graph/expand",
+      "method": "GET",
+      "auth": true,
+      "scope": "read",
+      "description": "Expand one node by loading its direct neighbors",
+      "parameters": {
+        "node_id": { "type": "string", "required": true },
+        "project": { "type": "string", "required": false },
+        "limit": { "type": "integer", "required": false, "default": 50, "max": 100 }
+      }
+    },
+    "traverse": {
+      "path": "/api/traverse/<entity>",
+      "method": "GET",
+      "auth": true,
+      "scope": "read",
+      "description": "Multi-hop graph traversal from a named entity",
+      "parameters": {
+        "entity": { "type": "string", "required": true, "in": "path", "description": "Entity name" },
+        "project": { "type": "string", "required": false },
+        "depth": { "type": "integer", "required": false, "default": 2, "max": 5 }
+      }
+    },
+    "beliefs": {
+      "path": "/api/beliefs",
+      "method": "GET",
+      "auth": true,
+      "scope": "read",
+      "description": "List beliefs filtered by status",
+      "parameters": {
+        "status": { "type": "string", "required": false, "enum": ["active", "uncertain", "contradicted", "superseded"], "default": "active" },
+        "project": { "type": "string", "required": false }
+      }
+    },
+    "contradictions": {
+      "path": "/api/contradictions",
+      "method": "GET",
+      "auth": true,
+      "scope": "read",
+      "description": "List contradicted belief pairs for triage",
+      "parameters": {
+        "project": { "type": "string", "required": false }
+      }
+    },
+    "ingest_structured": {
+      "path": "/api/ingest",
+      "method": "POST",
+      "auth": true,
+      "scope": "ingest",
+      "description": "Ingest pre-structured entities and relationships",
+      "body": {
+        "entities": {
+          "type": "array",
+          "items": {
+            "required": ["name", "node_type", "summary"],
+            "optional": ["confidence"]
+          }
+        },
+        "relationships": {
+          "type": "array",
+          "items": {
+            "required": ["source", "target", "type"],
+            "optional": ["reason", "confidence"]
+          }
+        },
+        "source": { "type": "string", "description": "Provenance label" },
+        "project": { "type": "string" }
+      },
+      "response": {
+        "fields": ["entities_written", "relationships_written", "project"]
+      }
+    },
+    "ingest_text": {
+      "path": "/api/ingest/text",
+      "method": "POST",
+      "auth": true,
+      "scope": "ingest",
+      "description": "Extract knowledge from raw text via LLM and ingest into graph",
+      "body": {
+        "text": { "type": "string", "required": true, "max_length": 16000 },
+        "project": { "type": "string", "required": false },
+        "source": { "type": "string", "required": false, "default": "text_ingestion" }
+      },
+      "response": {
+        "fields": ["extracted", "ingested", "project", "message"]
+      }
+    },
+    "nodes": {
+      "path": "/api/nodes",
+      "method": "GET",
+      "auth": true,
+      "scope": "read",
+      "description": "Query nodes by type",
+      "parameters": {
+        "type": { "type": "string", "required": false, "enum_ref": "schema.node_types" },
+        "project": { "type": "string", "required": false },
+        "limit": { "type": "integer", "required": false, "default": 50, "max": 500 }
+      }
+    },
+    "node_update": {
+      "path": "/api/node",
+      "method": "PATCH",
+      "auth": true,
+      "scope": "read",
+      "description": "Update node attributes"
+    },
+    "node_delete": {
+      "path": "/api/node",
+      "method": "DELETE",
+      "auth": true,
+      "scope": "read",
+      "description": "Delete node and all attached edges"
+    },
+    "relationship_add": {
+      "path": "/api/relationship",
+      "method": "POST",
+      "auth": true,
+      "scope": "read",
+      "description": "Add or update a relationship between two entities"
+    },
+    "relationship_delete": {
+      "path": "/api/relationship",
+      "method": "DELETE",
+      "auth": true,
+      "scope": "read",
+      "description": "Delete a relationship"
+    },
+    "nodes_merge": {
+      "path": "/api/nodes/merge",
+      "method": "POST",
+      "auth": true,
+      "scope": "read",
+      "description": "Merge two nodes (deduplication)"
+    },
+    "stats": {
+      "path": "/api/stats",
+      "method": "GET",
+      "auth": true,
+      "scope": "read",
+      "description": "Graph statistics: node counts by type, edge counts, totals"
+    },
+    "usage": {
+      "path": "/api/usage",
+      "method": "GET",
+      "auth": true,
+      "scope": "read",
+      "description": "Usage metrics and tier limits"
+    },
+    "projects_list": {
+      "path": "/api/projects",
+      "method": "GET",
+      "auth": true,
+      "scope": "projects",
+      "description": "List projects (knowledge spaces)"
+    },
+    "projects_create": {
+      "path": "/api/projects",
+      "method": "POST",
+      "auth": true,
+      "scope": "projects",
+      "description": "Create a new project (knowledge space)"
+    },
+    "project_get": {
+      "path": "/api/projects/<id>",
+      "method": "GET",
+      "auth": true,
+      "scope": "projects",
+      "description": "Get project metadata and usage"
+    },
+    "project_update": {
+      "path": "/api/projects/<id>",
+      "method": "PATCH",
+      "auth": true,
+      "scope": "projects",
+      "description": "Update project metadata"
+    },
+    "project_delete": {
+      "path": "/api/projects/<id>",
+      "method": "DELETE",
+      "auth": true,
+      "scope": "projects",
+      "description": "Delete project and all data"
+    },
+    "project_dreaming_config": {
+      "path": "/api/projects/<id>/dreaming",
+      "methods": ["GET", "PATCH"],
+      "auth": true,
+      "scope": "read/projects",
+      "description": "Get or update dreaming configuration for a project"
+    },
+    "vector_reindex": {
+      "path": "/api/projects/<id>/vectors/reindex",
+      "method": "POST",
+      "auth": true,
+      "scope": "projects",
+      "description": "Rebuild vector index for existing project nodes"
+    },
+    "dream": {
+      "path": "/api/dream",
+      "method": "POST",
+      "auth": true,
+      "scope": "read",
+      "description": "Trigger a dreaming cycle (knowledge consolidation)"
+    },
+    "dream_status": {
+      "path": "/api/dream/status",
+      "method": "GET",
+      "auth": true,
+      "scope": "read",
+      "description": "Check dreaming cycle status"
+    },
+    "tokens_create": {
+      "path": "/api/tokens",
+      "method": "POST",
+      "auth": true,
+      "scope": null,
+      "description": "Create a Personal Access Token (PAT) with scoped permissions"
+    },
+    "tokens_list": {
+      "path": "/api/tokens",
+      "method": "GET",
+      "auth": true,
+      "scope": null,
+      "description": "List active PATs"
+    },
+    "tokens_delete": {
+      "path": "/api/tokens/<token_prefix>",
+      "method": "DELETE",
+      "auth": true,
+      "scope": null,
+      "description": "Revoke a PAT"
+    }
+  },
+
+  "mcp_tools": [
+    {
+      "name": "search_knowledge",
+      "description": "Semantic vector search across the knowledge graph",
+      "parameters": {
+        "query": { "type": "string", "required": true },
+        "top_k": { "type": "integer", "default": 5, "max": 20 },
+        "project": { "type": "string", "required": false }
+      }
+    },
+    {
+      "name": "traverse_graph",
+      "description": "Walk the knowledge graph from an entity, following relationships",
+      "parameters": {
+        "entity": { "type": "string", "required": true },
+        "depth": { "type": "integer", "default": 2, "max": 4 },
+        "project": { "type": "string", "required": false }
+      }
+    },
+    {
+      "name": "list_beliefs",
+      "description": "List beliefs filtered by status",
+      "parameters": {
+        "status": { "type": "string", "default": "active", "enum": ["active", "uncertain", "superseded", "contradicted"] },
+        "project": { "type": "string", "required": false }
+      }
+    },
+    {
+      "name": "get_graph_stats",
+      "description": "Graph statistics: node counts by type, edge counts, totals",
+      "parameters": {
+        "project": { "type": "string", "required": false }
+      }
+    },
+    {
+      "name": "query_nodes",
+      "description": "Query entities, optionally filtered by node type",
+      "parameters": {
+        "node_type": { "type": "string", "required": false, "enum_ref": "schema.node_types" },
+        "limit": { "type": "integer", "default": 50, "max": 200 },
+        "project": { "type": "string", "required": false }
+      }
+    },
+    {
+      "name": "add_knowledge",
+      "description": "Add a single entity to the knowledge graph",
+      "parameters": {
+        "name": { "type": "string", "required": true },
+        "summary": { "type": "string", "required": true },
+        "node_type": { "type": "string", "default": "Concept", "enum_ref": "schema.node_types" },
+        "confidence": { "type": "float", "default": 0.7, "range": [0.0, 1.0], "description": "For Beliefs only" },
+        "project": { "type": "string", "required": false }
+      }
+    },
+    {
+      "name": "add_relationship",
+      "description": "Link two entities with a typed relationship",
+      "parameters": {
+        "entity_a": { "type": "string", "required": true },
+        "entity_b": { "type": "string", "required": true },
+        "relationship_type": { "type": "string", "required": true, "enum_ref": "schema.relationship_types" },
+        "reason": { "type": "string", "required": false },
+        "project": { "type": "string", "required": false }
+      }
+    },
+    {
+      "name": "update_belief",
+      "description": "Update an existing belief's confidence, status, or summary",
+      "parameters": {
+        "name": { "type": "string", "required": true },
+        "confidence": { "type": "float", "required": false, "range": [0.0, 1.0] },
+        "status": { "type": "string", "required": false, "enum": ["active", "superseded"] },
+        "summary": { "type": "string", "required": false },
+        "project": { "type": "string", "required": false }
+      }
+    },
+    {
+      "name": "ingest_knowledge",
+      "description": "Ingest free text into the knowledge graph via LLM extraction (async — returns job_id)",
+      "parameters": {
+        "text": { "type": "string", "required": true, "max_length": 10240 },
+        "project": { "type": "string", "required": false }
+      }
+    },
+    {
+      "name": "check_ingestion_status",
+      "description": "Check status of an async ingestion job",
+      "parameters": {
+        "job_id": { "type": "string", "required": true }
+      }
+    },
+    {
+      "name": "health_check",
+      "description": "Check if knowledge graph backends are healthy",
+      "parameters": {}
+    },
+    {
+      "name": "get_usage",
+      "description": "Get usage metrics and tier limits",
+      "parameters": {
+        "tier": { "type": "string", "default": "free", "enum": ["free", "pro", "team", "enterprise"] },
+        "project": { "type": "string", "required": false }
+      }
+    }
+  ],
+
+  "pricing": {
+    "model": "freemium",
+    "tiers": {
+      "free": { "node_limit": 100, "price": "EUR 0/month", "description": "Evaluation and personal projects" },
+      "pro": { "node_limit": 1000, "price": "EUR 19/month", "description": "Individual professionals" },
+      "team": { "node_limit": 5000, "price": "EUR 49/month", "description": "Small teams" },
+      "enterprise": { "node_limit": 50000, "price": "Custom", "description": "Organizations" }
+    },
+    "enforcement": "server-side node limit per project"
+  },
+
+  "safety": {
+    "project_isolation": "All data is project-isolated. Agents cannot access other projects without explicit grants.",
+    "authentication_required": true,
+    "rate_limiting": true,
+    "data_sovereignty": "EU-only (eu-central-1). Neo4j and Qdrant run on-instance. No external data transfer."
+  },
+
+  "integration_quickstart": {
+    "mcp": {
+      "description": "Add to your MCP client configuration (Claude Desktop, Cursor, etc.)",
+      "config": {
+        "mcpServers": {
+          "merkraum": {
+            "url": "https://agent.nhilbert.de/mcp/merkraum/",
+            "auth": {
+              "type": "oauth2",
+              "provider": "cognito",
+              "domain": "merkraum.auth.eu-central-1.amazoncognito.com"
+            }
+          }
+        }
+      }
+    },
+    "rest": {
+      "steps": [
+        "1. Discover capabilities: GET https://agent.nhilbert.de/api/merkraum/api/discover",
+        "2. Authenticate: Obtain JWT via Cognito OAuth PKCE flow, or create a PAT via the web UI",
+        "3. Search: GET /api/search?q=your+query (Authorization: Bearer <token>)",
+        "4. Ingest text: POST /api/ingest/text {\"text\": \"...\"}",
+        "5. Traverse: GET /api/traverse/entity_name",
+        "6. Check beliefs: GET /api/beliefs?status=active"
+      ]
+    }
+  }
+}

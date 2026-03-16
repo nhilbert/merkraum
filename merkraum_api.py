@@ -829,6 +829,7 @@ def discover():
         "base_url": "https://agent.nhilbert.de/api/merkraum",
         "mcp_url": "https://agent.nhilbert.de/mcp/merkraum/",
         "skill_md": "https://agent.nhilbert.de/.well-known/skill.md",
+        "agent_spec": "https://agent.nhilbert.de/.well-known/agent-spec.json",
         "authentication": {
             "type": "oauth2",
             "provider": "aws_cognito",
@@ -883,6 +884,17 @@ def well_known_skill():
     with open(skill_path) as f:
         content = f.read()
     return content, 200, {"Content-Type": "text/markdown; charset=utf-8"}
+
+
+@app.route("/.well-known/agent-spec.json", methods=["GET"])
+def well_known_agent_spec():
+    """Serve AGENT_SPEC.json — machine-readable integration specification."""
+    spec_path = os.path.join(os.path.dirname(__file__), "AGENT_SPEC.json")
+    if not os.path.exists(spec_path):
+        return _error("AGENT_SPEC.json not found", 404)
+    with open(spec_path) as f:
+        content = f.read()
+    return content, 200, {"Content-Type": "application/json; charset=utf-8"}
 
 
 # ---------------------------------------------------------------------------
