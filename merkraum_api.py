@@ -743,6 +743,16 @@ Use ONLY the following fixed vocabulary.
 6. If the text contains no extractable knowledge, return empty arrays.
 7. Do NOT invent relationships not stated or clearly implied in the text.
 
+## VSM LEVEL CLASSIFICATION:
+Classify each entity by its organizational function using the Viable System Model (S1-S5):
+- S1 (Operational): Task-specific facts, in-progress data, current values, scratch notes. Fast-cycling.
+- S2 (Coordination): Rules, procedures, process descriptions, scheduling, "how things connect." Valid while processes exist.
+- S3 (Control): Performance metrics, quality assessments, resource capacities, priorities. Updated at reviews.
+- S4 (Strategic): Environmental models, competitive intelligence, market trends, research findings. Slow-cycling.
+- S5 (Identity): Core values, policy rules, identity claims, normative commitments. Near-permanent.
+Set "vsm_level" to one of: S1, S2, S3, S4, S5. When uncertain, omit it (null).
+Heuristics: task data → S1, process docs → S2, metrics/assessments → S3, external research → S4, values/policy → S5.
+
 ## TEMPORAL VALIDITY:
 For entities with a known expiration or temporal boundary, set "valid_until" (ISO 8601 date).
 - Events: set valid_until to the event date (knowledge becomes historical after).
@@ -751,6 +761,7 @@ For entities with a known expiration or temporal boundary, set "valid_until" (IS
 - Beliefs about current state: set valid_until ~30 days if the domain changes rapidly.
 - Permanent concepts, people, organizations: omit valid_until (null = no expiration).
 - Only set valid_until when the text provides temporal cues. When uncertain, omit it.
+- If vsm_level is set but valid_until is omitted, a default TTL is applied based on the level (S1=30d, S2=90d, S3=180d, S4=365d, S5=none).
 
 ## CONTRADICTION RULES (for CONTRADICTS relationships):
 8. Only use CONTRADICTS when two beliefs are about the SAME subject with SAME scope.
@@ -771,7 +782,8 @@ Return a JSON object with two arrays: "entities" and "relationships".
       "node_type": "one of the node types above",
       "summary": "one-paragraph description, max 500 chars",
       "confidence": 0.9,
-      "valid_until": "2026-06-30T00:00:00Z or null"
+      "valid_until": "2026-06-30T00:00:00Z or null",
+      "vsm_level": "S1 or S2 or S3 or S4 or S5 or null"
     }}
   ],
   "relationships": [
@@ -1708,11 +1720,12 @@ def graph_expand():
 @require_auth
 @require_scope("read")
 def nodes():
-    """Query nodes, optionally filtered by type.
+    """Query nodes, optionally filtered by type and VSM level.
 
     Query params:
         project: project id (default: "default")
         type: node type label, e.g. Belief, Concept, Person (optional)
+        vsm_level: VSM system level filter, e.g. S1, S2, S3, S4, S5 (optional)
         limit: max results (default: 100)
     """
     if adapter is None:
@@ -1722,6 +1735,7 @@ def nodes():
     if denied:
         return denied
     node_type = request.args.get("type") or None
+    vsm_level = request.args.get("vsm_level") or None
     try:
         limit = int(request.args.get("limit", 100))
     except (TypeError, ValueError):
@@ -1730,7 +1744,8 @@ def nodes():
 
     try:
         results = adapter.query_nodes(
-            node_type=node_type, project_id=project, limit=limit
+            node_type=node_type, project_id=project, limit=limit,
+            vsm_level=vsm_level,
         )
         return jsonify(results)
     except Exception as exc:

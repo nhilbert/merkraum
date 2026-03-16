@@ -45,6 +45,7 @@ from fastmcp.server.dependencies import get_access_token
 
 from merkraum_backend import (
     create_adapter, BackendAdapter, NODE_TYPES, RELATIONSHIP_TYPES, TIER_LIMITS,
+    VSM_LEVELS,
 )
 from merkraum_llm import llm_extract, get_provider_info
 
@@ -680,14 +681,17 @@ async def get_graph_stats(project: str = None) -> dict:
 @mcp.tool()
 async def query_nodes(
     node_type: str = None,
+    vsm_level: str = None,
     limit: int = 50,
     project: str = None,
 ) -> dict:
-    """Query entities in the knowledge graph, optionally filtered by type.
+    """Query entities in the knowledge graph, optionally filtered by type and VSM level.
 
     Args:
         node_type: Filter by type (Person, Organization, Project, Concept,
             Regulation, Event, Belief, Artifact, Interview, Quote). None = all.
+        vsm_level: Filter by VSM system level (S1=operational, S2=coordination,
+            S3=control, S4=strategic, S5=identity). None = all.
         limit: Max results (1-200, default 50)
         project: Project ID (default: your personal space)
     """
@@ -697,15 +701,20 @@ async def query_nodes(
         return {"error": _err}
     if node_type and node_type not in NODE_TYPES:
         return {"error": f"Unknown node_type: {node_type}. Valid: {NODE_TYPES}"}
+    if vsm_level and vsm_level not in VSM_LEVELS:
+        return {"error": f"Unknown vsm_level: {vsm_level}. Valid: {VSM_LEVELS}"}
     limit = max(1, min(200, limit))
     adapter = _get_adapter()
     start = time.time()
     try:
-        nodes = await _run_sync(adapter.query_nodes, node_type, project, limit)
+        nodes = await _run_sync(adapter.query_nodes, node_type, project, limit,
+                                vsm_level)
         audit_log("query_nodes", "authed",
-                  {"node_type": node_type, "limit": limit, "project": project},
+                  {"node_type": node_type, "vsm_level": vsm_level,
+                   "limit": limit, "project": project},
                   int((time.time() - start) * 1000), "ok")
         return {"nodes": nodes, "count": len(nodes), "node_type_filter": node_type,
+                "vsm_level_filter": vsm_level,
                 "duration_ms": int((time.time() - start) * 1000)}
     except Exception as e:
         audit_log("query_nodes", "authed",
@@ -720,6 +729,7 @@ async def add_knowledge(
     node_type: str = "Concept",
     confidence: float = 0.7,
     valid_until: str = None,
+    vsm_level: str = None,
     project: str = None,
 ) -> dict:
     """Add a single entity to the knowledge graph.
@@ -731,6 +741,8 @@ async def add_knowledge(
             Event, Belief, Artifact, Interview, Quote
         confidence: For Beliefs only (0.0-1.0, default 0.7)
         valid_until: ISO 8601 date when this knowledge expires (optional, null = no expiration)
+        vsm_level: VSM system level (S1=operational, S2=coordination, S3=control,
+            S4=strategic, S5=identity). Determines default TTL if valid_until not set.
         project: Project ID (default: your personal space)
     """
     project = _resolve_project(project)
@@ -739,12 +751,16 @@ async def add_knowledge(
         return {"error": _err}
     if node_type not in NODE_TYPES:
         return {"error": f"Unknown node_type: {node_type}. Valid: {NODE_TYPES}"}
+    if vsm_level and vsm_level not in VSM_LEVELS:
+        return {"error": f"Unknown vsm_level: {vsm_level}. Valid: {VSM_LEVELS}"}
     adapter = _get_adapter()
     entity = {"name": name, "summary": summary, "node_type": node_type}
     if node_type == "Belief":
         entity["confidence"] = max(0.0, min(1.0, confidence))
     if valid_until:
         entity["valid_until"] = valid_until
+    if vsm_level:
+        entity["vsm_level"] = vsm_level
     start = time.time()
     try:
         written = await _run_sync(
@@ -944,7 +960,7 @@ def _extract_and_write(text: str, project: str = None) -> dict:
     system_prompt = f"""Extract structured knowledge from this text. Return JSON:
 {{
   "entities": [
-    {{"name": "...", "node_type": "...", "summary": "..."}}
+    {{"name": "...", "node_type": "...", "summary": "...", "vsm_level": "S1|S2|S3|S4|S5|null"}}
   ],
   "relationships": [
     {{"source": "...", "target": "...", "type": "...", "reason": "..."}}
@@ -952,7 +968,13 @@ def _extract_and_write(text: str, project: str = None) -> dict:
 }}
 
 Valid node_types: {json.dumps(NODE_TYPES)}
-Valid relationship types: {json.dumps(RELATIONSHIP_TYPES)}"""
+Valid relationship types: {json.dumps(RELATIONSHIP_TYPES)}
+VSM levels (optional, classify by organizational function):
+- S1 (Operational): task data, current values, in-progress notes
+- S2 (Coordination): rules, procedures, process descriptions
+- S3 (Control): metrics, quality assessments, priorities
+- S4 (Strategic): environmental models, competitive intel, research
+- S5 (Identity): core values, policies, identity claims"""
 
     user_prompt = f"Extract structured knowledge from this text:\n\n{text[:8000]}"
 
@@ -975,10 +997,13 @@ Valid relationship types: {json.dumps(RELATIONSHIP_TYPES)}"""
         name = ent.get("name", "")
         summary = ent.get("summary", "")
         if name:
+            vec_meta = {"name": name, "node_type": ent.get("node_type", "Concept"),
+                        "source": "extraction"}
+            if ent.get("vsm_level"):
+                vec_meta["vsm_level"] = ent["vsm_level"]
             adapter.vector_upsert(
                 f"{project}:{name}", f"{name}: {summary}",
-                {"name": name, "node_type": ent.get("node_type", "Concept"),
-                 "source": "extraction"}, project,
+                vec_meta, project,
             )
 
     return {

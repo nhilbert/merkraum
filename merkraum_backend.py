@@ -71,6 +71,17 @@ RELATIONSHIP_TYPES = [
 
 SYMMETRIC_TYPES = {"CONTRADICTS", "COMPLEMENTS"}
 
+VSM_LEVELS = ["S1", "S2", "S3", "S4", "S5"]
+
+# Default TTLs by VSM level (days). None = no expiration.
+VSM_DEFAULT_TTL_DAYS = {
+    "S1": 30,    # Operational — fast-cycling task data
+    "S2": 90,    # Coordination — valid while processes exist
+    "S3": 180,   # Control — performance metrics, superseded not deleted
+    "S4": 365,   # Strategic — environmental models, must be refreshed
+    "S5": None,  # Identity — near-permanent, only explicit S5 revision
+}
+
 
 class BackendAdapter(ABC):
     """Abstract interface for Merkraum graph + vector backends."""
@@ -110,8 +121,9 @@ class BackendAdapter(ABC):
     @abstractmethod
     def query_nodes(self, node_type: Optional[str] = None,
                     project_id: str = "default",
-                    limit: int = 100) -> list:
-        """Query nodes, optionally filtered by type and project."""
+                    limit: int = 100,
+                    vsm_level: Optional[str] = None) -> list:
+        """Query nodes, optionally filtered by type, project, and VSM level."""
 
     @abstractmethod
     def traverse(self, entity_name: str, project_id: str = "default",
@@ -420,6 +432,17 @@ class Neo4jBaseAdapter(BackendAdapter):
                         continue
                     node_id = _string_to_uuid(f"{project_id}:{node_type}:{ent['name']}")
                     valid_until = ent.get("valid_until") or None
+                    vsm_level = ent.get("vsm_level") or None
+                    if vsm_level and vsm_level not in VSM_LEVELS:
+                        vsm_level = None
+                    # Apply default TTL from VSM level if no explicit valid_until
+                    if not valid_until and vsm_level:
+                        ttl_days = VSM_DEFAULT_TTL_DAYS.get(vsm_level)
+                        if ttl_days is not None:
+                            valid_until = (
+                                datetime.now(timezone.utc) +
+                                timedelta(days=ttl_days)
+                            ).isoformat()
                     params = dict(
                         name=ent["name"],
                         summary=ent.get("summary", ""),
@@ -429,6 +452,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                         project_id=project_id,
                         node_id=node_id,
                         valid_until=valid_until,
+                        vsm_level=vsm_level,
                     )
                     if node_type == "Belief":
                         params["confidence"] = ent.get("confidence", 0.7)
@@ -441,14 +465,17 @@ class Neo4jBaseAdapter(BackendAdapter):
                                 n.source_type = $source_type, n.active = true,
                                 n.status = 'active', n.confidence = $confidence,
                                 n.project_id = $project_id, n.node_id = $node_id,
-                                n.valid_until = $valid_until
+                                n.valid_until = $valid_until,
+                                n.vsm_level = $vsm_level
                             ON MATCH SET
                                 n.summary = $summary, n.updated_at = $now,
                                 n.node_id = coalesce(n.node_id, $node_id),
                                 n.confidence = CASE WHEN $confidence > n.confidence
                                     THEN $confidence ELSE n.confidence END,
                                 n.valid_until = CASE WHEN $valid_until IS NOT NULL
-                                    THEN $valid_until ELSE n.valid_until END
+                                    THEN $valid_until ELSE n.valid_until END,
+                                n.vsm_level = CASE WHEN $vsm_level IS NOT NULL
+                                    THEN $vsm_level ELSE n.vsm_level END
                             """,
                             **params,
                         )
@@ -461,17 +488,28 @@ class Neo4jBaseAdapter(BackendAdapter):
                                 n.updated_at = $now, n.source_cycle = $source_cycle,
                                 n.source_type = $source_type,
                                 n.project_id = $project_id, n.node_id = $node_id,
-                                n.valid_until = $valid_until
+                                n.valid_until = $valid_until,
+                                n.vsm_level = $vsm_level
                             ON MATCH SET
                                 n.summary = CASE WHEN size($summary) > size(coalesce(n.summary, ''))
                                     THEN $summary ELSE n.summary END,
                                 n.node_id = coalesce(n.node_id, $node_id),
                                 n.updated_at = $now,
                                 n.valid_until = CASE WHEN $valid_until IS NOT NULL
-                                    THEN $valid_until ELSE n.valid_until END
+                                    THEN $valid_until ELSE n.valid_until END,
+                                n.vsm_level = CASE WHEN $vsm_level IS NOT NULL
+                                    THEN $vsm_level ELSE n.vsm_level END
                             """,
                             **params,
                         )
+                    vec_meta = {
+                        "name": ent["name"],
+                        "node_type": node_type,
+                        "source": source_type,
+                        "project_id": project_id,
+                    }
+                    if vsm_level:
+                        vec_meta["vsm_level"] = vsm_level
                     vector_ok = self.vector_upsert(
                         self._vector_id_for_node(
                             project_id,
@@ -483,12 +521,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                             ent["name"],
                             ent.get("summary", ""),
                         ),
-                        {
-                            "name": ent["name"],
-                            "node_type": node_type,
-                            "source": source_type,
-                            "project_id": project_id,
-                        },
+                        vec_meta,
                         project_id=project_id,
                     )
                     if not vector_ok:
@@ -567,30 +600,37 @@ class Neo4jBaseAdapter(BackendAdapter):
                                    rel.get("source"), rel.get("target"), e)
         return written
 
-    def query_nodes(self, node_type=None, project_id="default", limit=100):
+    def query_nodes(self, node_type=None, project_id="default", limit=100,
+                    vsm_level=None):
         self._ensure_project_node_ids(project_id)
         results = []
         with self._driver.session() as session:
+            vsm_filter = ""
+            if vsm_level and vsm_level in VSM_LEVELS:
+                vsm_filter = " AND n.vsm_level = $vsm_level"
             if node_type and node_type in NODE_TYPES:
                 cypher = f"""
                 MATCH (n:{node_type} {{project_id: $pid}})
+                WHERE true{vsm_filter}
                 RETURN n.name AS name, n.summary AS summary,
                        labels(n)[0] AS type, n.created_at AS created,
                        n.node_id AS node_id, n.confidence AS confidence,
-                       n.valid_until AS valid_until
+                       n.valid_until AS valid_until, n.vsm_level AS vsm_level
                 ORDER BY n.updated_at DESC LIMIT $limit
                 """
             else:
-                cypher = """
-                MATCH (n {project_id: $pid})
-                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+                cypher = f"""
+                MATCH (n {{project_id: $pid}})
+                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types){vsm_filter}
                 RETURN n.name AS name, n.summary AS summary,
                        labels(n)[0] AS type, n.created_at AS created,
                        n.node_id AS node_id, n.confidence AS confidence,
-                       n.valid_until AS valid_until
+                       n.valid_until AS valid_until, n.vsm_level AS vsm_level
                 ORDER BY n.updated_at DESC LIMIT $limit
                 """
             params = {"pid": project_id, "limit": limit}
+            if vsm_level and vsm_level in VSM_LEVELS:
+                params["vsm_level"] = vsm_level
             if not (node_type and node_type in NODE_TYPES):
                 params["node_types"] = list(NODE_TYPES)
             records = session.run(cypher, **params)
@@ -605,6 +645,8 @@ class Neo4jBaseAdapter(BackendAdapter):
                 }
                 if rec.get("valid_until"):
                     entry["valid_until"] = rec["valid_until"]
+                if rec.get("vsm_level"):
+                    entry["vsm_level"] = rec["vsm_level"]
                 results.append(entry)
         return results
 
@@ -627,6 +669,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                    labels(n)[0] AS type, n.valid_until AS valid_until,
                    n.created_at AS created, n.updated_at AS updated,
                    n.node_id AS node_id, n.confidence AS confidence,
+                   n.vsm_level AS vsm_level,
                    CASE WHEN n.valid_until < $now THEN true ELSE false END AS expired
             ORDER BY n.valid_until ASC LIMIT $limit
             """
@@ -635,7 +678,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                 limit=limit, node_types=list(NODE_TYPES),
             )
             for rec in records:
-                results.append({
+                entry = {
                     "name": rec["name"],
                     "summary": rec["summary"],
                     "type": rec["type"],
@@ -645,7 +688,10 @@ class Neo4jBaseAdapter(BackendAdapter):
                     "node_id": rec.get("node_id"),
                     "confidence": rec.get("confidence"),
                     "expired": rec["expired"],
-                })
+                }
+                if rec.get("vsm_level"):
+                    entry["vsm_level"] = rec["vsm_level"]
+                results.append(entry)
         return results
 
     def traverse(self, entity_name, project_id="default", max_depth=2):
@@ -664,11 +710,14 @@ class Neo4jBaseAdapter(BackendAdapter):
                 for node in path.nodes:
                     nid = node.element_id
                     if nid not in nodes:
-                        nodes[nid] = {
+                        n_entry = {
                             "name": node.get("name", ""),
                             "type": list(node.labels)[0] if node.labels else "Unknown",
                             "summary": node.get("summary", ""),
                         }
+                        if node.get("vsm_level"):
+                            n_entry["vsm_level"] = node["vsm_level"]
+                        nodes[nid] = n_entry
                 for rel in path.relationships:
                     edges.append({
                         "source": rel.start_node.get("name", ""),
@@ -723,7 +772,8 @@ class Neo4jBaseAdapter(BackendAdapter):
         return beliefs
 
     def get_stats(self, project_id="default"):
-        stats = {"nodes": {}, "edges": {}, "total_nodes": 0, "total_edges": 0}
+        stats = {"nodes": {}, "edges": {}, "total_nodes": 0, "total_edges": 0,
+                 "vsm_levels": {}}
         with self._driver.session() as session:
             for nt in NODE_TYPES:
                 result = session.run(
@@ -744,6 +794,17 @@ class Neo4jBaseAdapter(BackendAdapter):
                 if count > 0:
                     stats["edges"][rt] = count
                     stats["total_edges"] += count
+            # VSM level distribution
+            result = session.run(
+                """MATCH (n {project_id: $pid})
+                WHERE n.vsm_level IS NOT NULL
+                  AND any(lbl IN labels(n) WHERE lbl IN $node_types)
+                RETURN n.vsm_level AS level, count(n) AS c
+                ORDER BY n.vsm_level""",
+                pid=project_id, node_types=list(NODE_TYPES),
+            )
+            for rec in result:
+                stats["vsm_levels"][rec["level"]] = rec["c"]
         return stats
 
     def delete_project_data(self, project_id):
