@@ -719,6 +719,7 @@ async def add_knowledge(
     summary: str,
     node_type: str = "Concept",
     confidence: float = 0.7,
+    valid_until: str = None,
     project: str = None,
 ) -> dict:
     """Add a single entity to the knowledge graph.
@@ -729,6 +730,7 @@ async def add_knowledge(
         node_type: One of Person, Organization, Project, Concept, Regulation,
             Event, Belief, Artifact, Interview, Quote
         confidence: For Beliefs only (0.0-1.0, default 0.7)
+        valid_until: ISO 8601 date when this knowledge expires (optional, null = no expiration)
         project: Project ID (default: your personal space)
     """
     project = _resolve_project(project)
@@ -741,6 +743,8 @@ async def add_knowledge(
     entity = {"name": name, "summary": summary, "node_type": node_type}
     if node_type == "Belief":
         entity["confidence"] = max(0.0, min(1.0, confidence))
+    if valid_until:
+        entity["valid_until"] = valid_until
     start = time.time()
     try:
         written = await _run_sync(
@@ -814,15 +818,17 @@ async def update_belief(
     confidence: float = None,
     status: str = None,
     summary: str = None,
+    valid_until: str = None,
     project: str = None,
 ) -> dict:
-    """Update an existing belief's confidence, status, or summary.
+    """Update an existing belief's confidence, status, summary, or temporal validity.
 
     Args:
         name: Belief name (must already exist)
         confidence: New confidence score (0.0-1.0). None = no change.
         status: New status — active or superseded. None = no change.
         summary: New summary text. None = no change.
+        valid_until: ISO 8601 date when this belief expires (e.g. "2026-06-30"). None = no change.
         project: Project ID (default: your personal space)
     """
     project = _resolve_project(project)
@@ -835,6 +841,7 @@ async def update_belief(
         result = await _run_sync(
             adapter.update_belief, name, project,
             confidence=confidence, status=status, summary=summary,
+            valid_until=valid_until,
         )
         result["duration_ms"] = int((time.time() - start) * 1000)
         audit_log("update_belief", "authed",

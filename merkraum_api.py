@@ -743,6 +743,15 @@ Use ONLY the following fixed vocabulary.
 6. If the text contains no extractable knowledge, return empty arrays.
 7. Do NOT invent relationships not stated or clearly implied in the text.
 
+## TEMPORAL VALIDITY:
+For entities with a known expiration or temporal boundary, set "valid_until" (ISO 8601 date).
+- Events: set valid_until to the event date (knowledge becomes historical after).
+- Regulations with enforcement dates: set valid_until to when they take effect or are superseded.
+- Market data, statistics, competitive assessments: set valid_until ~90 days from the text date.
+- Beliefs about current state: set valid_until ~30 days if the domain changes rapidly.
+- Permanent concepts, people, organizations: omit valid_until (null = no expiration).
+- Only set valid_until when the text provides temporal cues. When uncertain, omit it.
+
 ## CONTRADICTION RULES (for CONTRADICTS relationships):
 8. Only use CONTRADICTS when two beliefs are about the SAME subject with SAME scope.
 9. Different scopes are NOT contradictions. Examples of different scopes:
@@ -761,7 +770,8 @@ Return a JSON object with two arrays: "entities" and "relationships".
       "name": "canonical name",
       "node_type": "one of the node types above",
       "summary": "one-paragraph description, max 500 chars",
-      "confidence": 0.9
+      "confidence": 0.9,
+      "valid_until": "2026-06-30T00:00:00Z or null"
     }}
   ],
   "relationships": [
@@ -1725,6 +1735,45 @@ def nodes():
         return jsonify(results)
     except Exception as exc:
         logger.exception("nodes failed for project=%s type=%s", project, node_type)
+        return _error(str(exc))
+
+
+@app.route("/api/nodes/expiring", methods=["GET"])
+@require_auth
+@require_scope("read")
+def nodes_expiring():
+    """Find nodes with valid_until set that are expiring soon or already expired.
+
+    Query params:
+        project: project id (default: "default")
+        horizon: days ahead to look (default: 30)
+        limit: max results (default: 100)
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+    try:
+        horizon = int(request.args.get("horizon", 30))
+    except (TypeError, ValueError):
+        horizon = 30
+    horizon = max(1, min(horizon, 365))
+    try:
+        limit = int(request.args.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, MAX_NODES_LIMIT))
+
+    try:
+        results = adapter.query_expiring(
+            project_id=project, horizon_days=horizon, limit=limit,
+        )
+        return jsonify({"expiring": results, "horizon_days": horizon,
+                        "total": len(results)})
+    except Exception as exc:
+        logger.exception("nodes_expiring failed for project=%s", project)
         return _error(str(exc))
 
 
