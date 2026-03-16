@@ -22,6 +22,7 @@ v1.0 — SUP-146/SUP-147 (2026-03-14)
 """
 
 import json
+import os
 import logging
 import random
 import time
@@ -227,7 +228,7 @@ def replay(
             f"Walk path: {walk_text}\n\nSubgraph:\n{subgraph_text}",
             temperature=0.4,
             json_schema=_replay_schema,
-            model="eu.anthropic.claude-haiku-4-5-20251001-v1:0",
+            model=os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL"),
         )
 
         walk_result = {
@@ -391,7 +392,7 @@ def consolidate(
             f"Consolidate these related beliefs:\n{beliefs_text}",
             temperature=0.3,
             json_schema=_consolidation_schema,
-            model="eu.anthropic.claude-sonnet-4-6",
+            model=os.environ.get("MERKRAUM_DREAMING_CONSOLIDATION_MODEL"),
         )
 
         if not result or "abstract_belief" not in result:
