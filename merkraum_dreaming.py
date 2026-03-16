@@ -200,15 +200,33 @@ def replay(
                     f"(conf: {n['conf']})\n"
                 )
 
+        _replay_schema = {
+            "type": "object",
+            "properties": {
+                "observations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "enum": ["surprising_connection", "missing_relationship", "redundancy", "insight"]},
+                            "description": {"type": "string"},
+                            "entities_involved": {"type": "array", "items": {"type": "string"}},
+                            "suggested_action": {"type": "string"},
+                        },
+                        "required": ["type", "description", "entities_involved"],
+                    },
+                },
+                "walk_quality": {"type": "string", "enum": ["productive", "routine", "dead_end"]},
+                "summary": {"type": "string", "description": "One-paragraph synthesis of the walk"},
+            },
+            "required": ["observations", "walk_quality", "summary"],
+        }
         analysis = llm_call(
-            "You analyze knowledge graph walks to find surprising patterns. "
-            "Return JSON: {\"observations\": [{\"type\": \"surprising_connection"
-            "|missing_relationship|redundancy|insight\", \"description\": \"...\", "
-            "\"entities_involved\": [\"e1\",\"e2\"], \"suggested_action\": \"...\"}], "
-            "\"walk_quality\": \"productive|routine|dead_end\", "
-            "\"summary\": \"one-paragraph synthesis\"}",
+            "You analyze knowledge graph walks to find surprising patterns, "
+            "missing relationships, redundancies, and insights.",
             f"Walk path: {walk_text}\n\nSubgraph:\n{subgraph_text}",
             temperature=0.4,
+            json_schema=_replay_schema,
         )
 
         walk_result = {
@@ -355,15 +373,23 @@ def consolidate(
 
         # LLM consolidation
         beliefs_text = "\n".join(f"  - {m}" for m in members)
+        _consolidation_schema = {
+            "type": "object",
+            "properties": {
+                "abstract_belief": {"type": "string", "maxLength": 200, "description": "Single falsifiable proposition"},
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "reasoning": {"type": "string", "description": "Brief explanation"},
+            },
+            "required": ["abstract_belief", "confidence", "reasoning"],
+        }
         result = llm_call(
             "Convert episodic beliefs (specific observations) into one "
             "abstract belief (generalizable knowledge). The abstract belief "
             "should be a single falsifiable proposition, max 200 characters, "
-            "faithful to the evidence.\n\n"
-            "Return JSON: {\"abstract_belief\": \"...\", "
-            "\"confidence\": 0.0-1.0, \"reasoning\": \"brief explanation\"}",
+            "faithful to the evidence.",
             f"Consolidate these related beliefs:\n{beliefs_text}",
             temperature=0.3,
+            json_schema=_consolidation_schema,
         )
 
         if not result or "abstract_belief" not in result:

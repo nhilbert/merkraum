@@ -56,38 +56,53 @@ def _llm_call_bedrock(
     model: str | None = None,
     temperature: float = 0.3,
     max_tokens: int = 8000,
+    json_schema: dict | None = None,
 ) -> str:
-    """Call AWS Bedrock Converse API and return the text response."""
+    """Call AWS Bedrock Converse API using Tool Use for guaranteed JSON output.
+
+    When json_schema is provided, defines a tool with that exact schema
+    so Claude returns structured JSON matching the expected format.
+    """
     import boto3
 
     model_id = model or _get_model()
-    region = LLM_REGION
-
-    client = boto3.client("bedrock-runtime", region_name=region)
+    client = boto3.client("bedrock-runtime", region_name=LLM_REGION)
 
     messages = [{"role": "user", "content": [{"text": user_prompt}]}]
+
+    schema = json_schema or {"type": "object"}
+    tool_config = {
+        "tools": [{
+            "toolSpec": {
+                "name": "json_response",
+                "description": "Return the result as structured JSON.",
+                "inputSchema": {"json": schema},
+            }
+        }],
+        "toolChoice": {"tool": {"name": "json_response"}},
+    }
 
     kwargs = {
         "modelId": model_id,
         "messages": messages,
+        "toolConfig": tool_config,
         "inferenceConfig": {
             "temperature": temperature,
             "maxTokens": max_tokens,
         },
     }
-    # System prompt — Bedrock Converse API uses top-level system parameter
     if system_prompt:
         kwargs["system"] = [{"text": system_prompt}]
 
     response = client.converse(**kwargs)
-    output = response.get("output", {})
-    message = output.get("message", {})
-    content_blocks = message.get("content", [])
+    content_blocks = response.get("output", {}).get("message", {}).get("content", [])
 
+    for block in content_blocks:
+        if "toolUse" in block:
+            return json.dumps(block["toolUse"]["input"])
     for block in content_blocks:
         if "text" in block:
             return block["text"]
-
     return ""
 
 
@@ -211,10 +226,12 @@ def llm_call(
     provider: str | None = None,
     model: str | None = None,
     api_key: str | None = None,
+    json_schema: dict | None = None,
 ) -> dict | None:
     """General-purpose LLM call that returns parsed JSON.
 
     Unlike llm_extract(), this does not assume entities/relationships schema.
+    Pass json_schema to enforce a specific output structure via Tool Use.
     Returns the parsed JSON dict, or None on failure.
     """
     prov = (provider or LLM_PROVIDER).lower()
@@ -224,6 +241,7 @@ def llm_call(
             raw = _llm_call_bedrock(
                 system_prompt, user_prompt,
                 model=model, temperature=temperature, max_tokens=max_tokens,
+                json_schema=json_schema,
             )
         elif prov == "openai":
             raw = _llm_call_openai(
