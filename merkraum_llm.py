@@ -250,7 +250,7 @@ def llm_call(
     try:
         return json.loads(text)
     except json.JSONDecodeError as e:
-        logger.error("Failed to parse LLM JSON response: %s", e)
+        logger.error("Failed to parse LLM JSON response: %s | raw=%r", e, text[:200])
         return None
 
 
