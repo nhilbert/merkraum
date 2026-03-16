@@ -227,6 +227,7 @@ def replay(
             f"Walk path: {walk_text}\n\nSubgraph:\n{subgraph_text}",
             temperature=0.4,
             json_schema=_replay_schema,
+            model="eu.anthropic.claude-haiku-4-5-20251001-v1:0",
         )
 
         walk_result = {
@@ -390,6 +391,7 @@ def consolidate(
             f"Consolidate these related beliefs:\n{beliefs_text}",
             temperature=0.3,
             json_schema=_consolidation_schema,
+            model="eu.anthropic.claude-sonnet-4-6",
         )
 
         if not result or "abstract_belief" not in result:
