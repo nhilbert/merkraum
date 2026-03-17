@@ -286,28 +286,35 @@ def consolidate(
                f"Scanning for similar beliefs (threshold: {similarity_threshold})")
     now = datetime.now(timezone.utc).isoformat()
 
+    # Fetch active beliefs, then compute similarity in Python (no APOC dependency)
     with adapter._driver.session() as session:
-        # Find similar belief pairs using Jaro-Winkler distance
-        pairs = session.run(
-            "MATCH (a:Belief {project_id: $pid}), (b:Belief {project_id: $pid}) "
-            "WHERE (a.status IS NULL OR a.status = 'active') "
-            "AND (b.status IS NULL OR b.status = 'active') "
-            "AND (a.active = true OR a.active IS NULL) "
+        all_beliefs = session.run(
+            "MATCH (b:Belief {project_id: $pid}) "
+            "WHERE (b.status IS NULL OR b.status = 'active') "
             "AND (b.active = true OR b.active IS NULL) "
-            "AND id(a) < id(b) "
-            "WITH a, b, "
-            "CASE WHEN a.name STARTS WITH 'Belief: ' "
-            "THEN substring(a.name, 8) ELSE a.name END AS na, "
-            "CASE WHEN b.name STARTS WITH 'Belief: ' "
-            "THEN substring(b.name, 8) ELSE b.name END AS nb "
-            "WITH a, b, 1.0 - apoc.text.jaroWinklerDistance(na, nb) AS sim "
-            "WHERE sim >= $threshold "
-            "RETURN a.name AS name_a, a.confidence AS conf_a, "
-            "b.name AS name_b, b.confidence AS conf_b, "
-            "round(sim * 1000) / 1000.0 AS similarity "
-            "ORDER BY sim DESC",
-            pid=project_id, threshold=similarity_threshold,
+            "RETURN b.name AS name, b.confidence AS confidence",
+            pid=project_id,
         ).data()
+
+    def _strip_prefix(name):
+        return name[8:] if name.startswith("Belief: ") else name
+
+    from difflib import SequenceMatcher
+    pairs = []
+    for i in range(len(all_beliefs)):
+        na = _strip_prefix(all_beliefs[i]["name"])
+        for j in range(i + 1, len(all_beliefs)):
+            nb = _strip_prefix(all_beliefs[j]["name"])
+            sim = SequenceMatcher(None, na.lower(), nb.lower()).ratio()
+            if sim >= similarity_threshold:
+                pairs.append({
+                    "name_a": all_beliefs[i]["name"],
+                    "conf_a": all_beliefs[i]["confidence"],
+                    "name_b": all_beliefs[j]["name"],
+                    "conf_b": all_beliefs[j]["confidence"],
+                    "similarity": round(sim, 3),
+                })
+    pairs.sort(key=lambda p: p["similarity"], reverse=True)
 
     if not pairs:
         yield _msg("consolidation", "done", "No consolidation candidates found")
