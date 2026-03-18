@@ -271,15 +271,83 @@ def audit_log(tool_name: str, sub: str, params: dict,
     logger.info("AUDIT %s", json.dumps(entry))
 
 
+# --- PAT Validation ---
+
+PAT_PREFIX = "mk_pat_"
+
+def _validate_pat(token: str) -> dict | None:
+    """Validate a Personal Access Token against Neo4j. Returns metadata or None."""
+    import hashlib
+    adapter = _get_adapter()
+    driver = getattr(adapter, "_driver", None)
+    if not driver:
+        logger.warning("PAT validation: no Neo4j driver available")
+        return None
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (t:PersonalAccessToken {token_hash: $hash})
+            WHERE t.revoked = false
+              AND (t.expires_at IS NULL OR datetime(t.expires_at) > datetime())
+            SET t.last_used_at = toString(datetime())
+            RETURN t.token_prefix AS token_prefix,
+                   t.name AS name,
+                   t.owner_id AS owner_id,
+                   t.scopes AS scopes,
+                   t.projects AS projects,
+                   t.all_projects AS all_projects,
+                   t.expires_at AS expires_at
+            """,
+            hash=token_hash,
+        ).single()
+        if not result:
+            return None
+        return dict(result)
+
+
 # --- Token Verifier ---
 
 class CognitoTokenVerifier(TokenVerifier):
-    """Validates Cognito JWT access tokens."""
+    """Validates Cognito JWT access tokens and Personal Access Tokens (mk_pat_)."""
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Called by FastMCP for every authenticated request."""
         if not token:
             return None
+
+        # PAT tokens: validate against Neo4j
+        if token.startswith(PAT_PREFIX):
+            try:
+                pat_meta = await asyncio.get_event_loop().run_in_executor(
+                    None, _validate_pat, token
+                )
+                if not pat_meta:
+                    logger.warning("PAT validation failed: token not found or expired")
+                    return None
+                scopes = pat_meta.get("scopes") or []
+                if isinstance(scopes, str):
+                    scopes = scopes.split(",")
+                logger.info("PAT authenticated: owner=%s name=%s",
+                            pat_meta.get("owner_id", "?"), pat_meta.get("name", "?"))
+                return AccessToken(
+                    token=token,
+                    client_id=f"pat:{pat_meta.get('owner_id', 'unknown')}",
+                    scopes=scopes,
+                    expires_at=None,
+                    claims={
+                        "sub": pat_meta.get("owner_id", "unknown"),
+                        "token_type": "pat",
+                        "pat_name": pat_meta.get("name", ""),
+                        "projects": pat_meta.get("projects") or [],
+                        "all_projects": pat_meta.get("all_projects", False),
+                    },
+                )
+            except Exception as e:
+                logger.warning("PAT validation error: %s", e)
+                return None
+
+        # Cognito JWT tokens
         try:
             claims = validate_jwt(token)
             return AccessToken(
@@ -842,7 +910,7 @@ async def update_belief(
     Args:
         name: Belief name (must already exist)
         confidence: New confidence score (0.0-1.0). None = no change.
-        status: New status — active or superseded. None = no change.
+        status: New status — active, uncertain, contradicted, or superseded. None = no change.
         summary: New summary text. None = no change.
         valid_until: ISO 8601 date when this belief expires (e.g. "2026-06-30"). None = no change.
         project: Project ID (default: your personal space)
