@@ -1302,6 +1302,8 @@ def reindex_project_vectors(project_id):
 
     Body (JSON, optional):
         limit: max number of nodes to reindex (default: 5000, max: 10000)
+        cleanup_legacy_ids: delete legacy vector ids (`project:name`,
+            `project:node_type:name`) after canonical upsert (default: false)
     """
     adp = adapter
     if adp is None:
@@ -1316,9 +1318,20 @@ def reindex_project_vectors(project_id):
     except (TypeError, ValueError):
         limit = 5000
     limit = max(1, min(limit, MAX_VECTOR_REINDEX_LIMIT))
+    cleanup_raw = body.get("cleanup_legacy_ids", False)
+    if isinstance(cleanup_raw, str):
+        cleanup_legacy_ids = cleanup_raw.strip().lower() in ("true", "1", "yes", "on")
+    elif isinstance(cleanup_raw, (int, float)):
+        cleanup_legacy_ids = bool(cleanup_raw)
+    else:
+        cleanup_legacy_ids = bool(cleanup_raw)
 
     try:
-        result = adp.reindex_project_vectors(project_id=project_id, limit=limit)
+        result = adp.reindex_project_vectors(
+            project_id=project_id,
+            limit=limit,
+            cleanup_legacy_ids=cleanup_legacy_ids,
+        )
         status = 207 if result.get("failed", 0) > 0 else 200
         return jsonify(result), status
     except Exception as exc:

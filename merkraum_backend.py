@@ -212,12 +212,13 @@ class BackendAdapter(ABC):
 
     @abstractmethod
     def reindex_project_vectors(self, project_id: str = "default",
-                                limit: int = 5000) -> dict:
+                                limit: int = 5000,
+                                cleanup_legacy_ids: bool = False) -> dict:
         """Rebuild vector entries for project nodes.
 
         Returns:
             {"project_id": str, "total_nodes": int, "upserted": int,
-             "failed": int, "limit": int, "truncated": bool}
+             "failed": int, "legacy_deleted": int, "limit": int, "truncated": bool}
         """
 
     # --- Project Management ---
@@ -331,6 +332,44 @@ class Neo4jBaseAdapter(BackendAdapter):
 
     def _vector_text_for_node(self, name: str, summary: str) -> str:
         return f"{name}: {summary or ''}".strip()
+
+    def _legacy_vector_ids_for_node(self, project_id: str, name: str,
+                                    node_type: str) -> list[str]:
+        """Legacy vector ids kept for migration cleanup."""
+        return [
+            f"{project_id}:{name}",
+            f"{project_id}:{node_type}:{name}",
+        ]
+
+    def _dedupe_vector_results(self, results: list, project_id: str,
+                               top_k: int) -> list:
+        """Deduplicate semantic search results and keep the highest score."""
+        best_by_key: dict[tuple, dict] = {}
+        for item in results:
+            score = float(item.get("score") or 0.0)
+            metadata = item.get("metadata") or {}
+            node_id = (metadata.get("node_id") or "").strip()
+            if node_id:
+                key = ("node_id", node_id)
+            else:
+                name = (metadata.get("name") or "").strip().lower()
+                node_type = (metadata.get("node_type") or "").strip() or "Concept"
+                metadata_project = (metadata.get("project_id") or project_id).strip()
+                if name:
+                    key = ("fallback", metadata_project, node_type, name)
+                else:
+                    key = ("id", str(item.get("id", "")))
+
+            existing = best_by_key.get(key)
+            if existing is None or score > float(existing.get("score") or 0.0):
+                best_by_key[key] = item
+
+        deduped = sorted(
+            best_by_key.values(),
+            key=lambda x: float(x.get("score") or 0.0),
+            reverse=True,
+        )
+        return deduped[:top_k]
 
     def _log_operation(self, tx, op_id: str, op_type: str, actor: str,
                        project_id: str, payload: dict,
@@ -507,6 +546,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                         "node_type": node_type,
                         "source": source_type,
                         "project_id": project_id,
+                        "node_id": node_id,
                     }
                     if vsm_level:
                         vec_meta["vsm_level"] = vsm_level
@@ -937,7 +977,8 @@ class Neo4jBaseAdapter(BackendAdapter):
             edge_count = edge_result.single()["c"]
         return {"nodes": node_count, "edges": edge_count}
 
-    def reindex_project_vectors(self, project_id="default", limit=5000):
+    def reindex_project_vectors(self, project_id="default", limit=5000,
+                                cleanup_legacy_ids=False):
         self._ensure_project_node_ids(project_id)
         safe_limit = max(1, int(limit))
         stats = {
@@ -945,6 +986,7 @@ class Neo4jBaseAdapter(BackendAdapter):
             "total_nodes": 0,
             "upserted": 0,
             "failed": 0,
+            "legacy_deleted": 0,
             "limit": safe_limit,
             "truncated": False,
         }
@@ -991,6 +1033,12 @@ class Neo4jBaseAdapter(BackendAdapter):
                     stats["upserted"] += 1
                 else:
                     stats["failed"] += 1
+                if cleanup_legacy_ids:
+                    for legacy_id in self._legacy_vector_ids_for_node(
+                        project_id, name, node_type
+                    ):
+                        if self.vector_delete(legacy_id, project_id=project_id):
+                            stats["legacy_deleted"] += 1
 
             total_result = session.run(
                 """
@@ -1236,6 +1284,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                             "name": name,
                             "node_type": old_type,
                             "source": "api_rollback",
+                            "node_id": node_props.get("node_id"),
                         },
                         project_id=project_id,
                     )
@@ -1306,6 +1355,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                     "name": after_name,
                     "node_type": node_type,
                     "source": "api_update",
+                    "node_id": after_node_id,
                 }
                 ok = self.vector_upsert(
                     vector_id_new,
@@ -1356,6 +1406,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                             "name": name,
                             "node_type": old_type,
                             "source": "api_rollback",
+                            "node_id": old_node.get("node_id"),
                         },
                         project_id=project_id,
                     )
@@ -1516,7 +1567,12 @@ class Neo4jBaseAdapter(BackendAdapter):
                                              node_type=resolved_keep_type,
                                              node_id=keep_props.get("node_id")),
                     self._vector_text_for_node(keep_name, keep_props.get("summary", "")),
-                    {"name": keep_name, "node_type": resolved_keep_type, "source": "api_merge"},
+                    {
+                        "name": keep_name,
+                        "node_type": resolved_keep_type,
+                        "source": "api_merge",
+                        "node_id": keep_props.get("node_id"),
+                    },
                     project_id=project_id,
                 )
                 if not vec_ok:
@@ -1573,6 +1629,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                             "name": keep_name,
                             "node_type": resolved_keep_type,
                             "source": "api_rollback",
+                            "node_id": old_keep.get("node_id"),
                         },
                         project_id=project_id,
                     )
@@ -1587,6 +1644,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                             "name": remove_name,
                             "node_type": resolved_remove_type,
                             "source": "api_rollback",
+                            "node_id": old_remove.get("node_id"),
                         },
                         project_id=project_id,
                     )
@@ -1718,14 +1776,25 @@ class Neo4jQdrantAdapter(Neo4jBaseAdapter):
             return []
         collection = self._get_collection_name(project_id, namespace)
         try:
+            from qdrant_client import models
             embedding = self._embed_text(query_text)
             if not embedding:
                 return []
             self._ensure_collection(collection, vector_size=len(embedding))
+            effective_top_k = max(top_k, min(top_k * 3, 100))
+            project_filter = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="project_id",
+                        match=models.MatchValue(value=project_id),
+                    )
+                ]
+            )
             hits = self._qdrant.query_points(
                 collection_name=collection,
                 query=embedding,
-                limit=top_k,
+                query_filter=project_filter,
+                limit=effective_top_k,
                 with_payload=True,
             ).points
             results = []
@@ -1737,7 +1806,7 @@ class Neo4jQdrantAdapter(Neo4jBaseAdapter):
                     "content": payload.get("content", ""),
                     "metadata": payload,
                 })
-            return results
+            return self._dedupe_vector_results(results, project_id=project_id, top_k=top_k)
         except Exception as e:
             logger.warning("Qdrant search failed: %s", e)
             return []
@@ -1866,14 +1935,18 @@ class Neo4jPineconeAdapter(Neo4jBaseAdapter):
             embedding = self._embed_text(query_text)
             if not embedding:
                 return []
+            effective_top_k = max(top_k, min(top_k * 3, 100))
             headers = {
                 "Api-Key": self._pinecone_api_key,
                 "Content-Type": "application/json",
             }
             body = json.dumps({
                 "vector": embedding,
-                "topK": top_k,
+                "topK": effective_top_k,
                 "namespace": ns,
+                "filter": {
+                    "project_id": {"$eq": project_id},
+                },
                 "includeMetadata": True,
             })
             req = urllib.request.Request(
@@ -1891,7 +1964,7 @@ class Neo4jPineconeAdapter(Neo4jBaseAdapter):
                     "content": m.get("metadata", {}).get("content", ""),
                     "metadata": m.get("metadata", {}),
                 })
-            return results
+            return self._dedupe_vector_results(results, project_id=project_id, top_k=top_k)
         except Exception as e:
             logger.warning("Pinecone search failed: %s", e)
             return []

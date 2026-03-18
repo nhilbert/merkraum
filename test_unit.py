@@ -805,6 +805,79 @@ class TestReindexProjectVectors(unittest.TestCase):
         self.assertEqual(result["upserted"], 1)
         self.assertEqual(result["failed"], 1)
 
+    def test_reindex_cleanup_legacy_ids_enabled(self):
+        self.adapter.vector_delete = MagicMock(return_value=True)
+        self.session.run.side_effect = [
+            [
+                {"name": "Node A", "node_type": "Concept", "summary": "", "node_id": "id-a"},
+            ],
+            self._total_result(1),
+        ]
+        result = self.adapter.reindex_project_vectors(
+            project_id="proj",
+            limit=10,
+            cleanup_legacy_ids=True,
+        )
+        self.assertEqual(result["legacy_deleted"], 2)
+        self.assertEqual(self.adapter.vector_delete.call_count, 2)
+        self.adapter.vector_delete.assert_any_call("proj:Node A", project_id="proj")
+        self.adapter.vector_delete.assert_any_call("proj:Concept:Node A", project_id="proj")
+
+    def test_reindex_cleanup_legacy_ids_disabled(self):
+        self.adapter.vector_delete = MagicMock(return_value=True)
+        self.session.run.side_effect = [
+            [
+                {"name": "Node A", "node_type": "Concept", "summary": "", "node_id": "id-a"},
+            ],
+            self._total_result(1),
+        ]
+        result = self.adapter.reindex_project_vectors(
+            project_id="proj",
+            limit=10,
+            cleanup_legacy_ids=False,
+        )
+        self.assertEqual(result["legacy_deleted"], 0)
+        self.adapter.vector_delete.assert_not_called()
+
+
+class TestVectorResultDedupe(unittest.TestCase):
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+
+    def test_dedupe_prefers_highest_score_for_same_node_id(self):
+        results = [
+            {"id": "1", "score": 0.61, "metadata": {"node_id": "n-1", "name": "Kant"}},
+            {"id": "2", "score": 0.92, "metadata": {"node_id": "n-1", "name": "Immanuel Kant"}},
+            {"id": "3", "score": 0.70, "metadata": {"node_id": "n-2", "name": "Bundeskartellamt"}},
+        ]
+        deduped = self.adapter._dedupe_vector_results(results, project_id="proj", top_k=10)
+        self.assertEqual(len(deduped), 2)
+        self.assertEqual(deduped[0]["id"], "2")
+
+    def test_dedupe_fallback_by_name_type_project(self):
+        results = [
+            {
+                "id": "a",
+                "score": 0.52,
+                "metadata": {"name": "Bundeskartellamt", "node_type": "Organization", "project_id": "proj"},
+            },
+            {
+                "id": "b",
+                "score": 0.84,
+                "metadata": {"name": " bundeskartellamt ", "node_type": "Organization", "project_id": "proj"},
+            },
+            {
+                "id": "c",
+                "score": 0.50,
+                "metadata": {"name": "Bundeskartellamt", "node_type": "Organization", "project_id": "other"},
+            },
+        ]
+        deduped = self.adapter._dedupe_vector_results(results, project_id="proj", top_k=10)
+        self.assertEqual(len(deduped), 2)
+        ids = {x["id"] for x in deduped}
+        self.assertIn("b", ids)
+        self.assertIn("c", ids)
+
 
 class TestBackendAdapterUsageInterface(unittest.TestCase):
     """Verify get_usage is in the abstract interface."""

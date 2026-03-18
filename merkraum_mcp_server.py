@@ -550,18 +550,67 @@ def _run_sync(func, *args, **kwargs):
 
 
 
-def _get_authenticated_user() -> tuple[str | None, set[str]]:
-    """Extract user_id (Cognito sub) and groups from the FastMCP access token."""
+def _normalize_pat_projects(raw_projects) -> list[str] | None:
+    if raw_projects is None:
+        return None
+    if isinstance(raw_projects, list):
+        return [str(p).strip() for p in raw_projects if str(p).strip()]
+    if isinstance(raw_projects, str):
+        return [p.strip() for p in raw_projects.split(",") if p.strip()]
+    return None
+
+
+def _get_auth_context() -> dict:
+    """Extract auth context from FastMCP access token (JWT or PAT)."""
     token = get_access_token()
     if token is None:
-        return None, set()
+        return {
+            "user_id": None,
+            "groups": set(),
+            "token_type": None,
+            "scopes": set(),
+            "pat_projects": None,
+            "pat_all_projects": None,
+        }
+
     claims = getattr(token, "claims", {}) or {}
-    user_id = claims.get("sub")
-    groups = set(claims.get("cognito:groups", []) or [])
-    return user_id, groups
+    token_type = claims.get("token_type") or "jwt"
+    scopes = set(getattr(token, "scopes", []) or [])
+    if not scopes and claims.get("scope"):
+        scopes = {s for s in str(claims.get("scope", "")).split() if s}
+    context = {
+        "user_id": claims.get("sub"),
+        "groups": set(claims.get("cognito:groups", []) or []),
+        "token_type": token_type,
+        "scopes": scopes,
+        "pat_projects": None,
+        "pat_all_projects": None,
+    }
+    if token_type == "pat":
+        context["pat_projects"] = _normalize_pat_projects(claims.get("projects"))
+        context["pat_all_projects"] = bool(claims.get("all_projects", False))
+    return context
 
 
-def _resolve_project(project: str | None) -> str:
+def _get_authenticated_user() -> tuple[str | None, set[str]]:
+    """Extract user_id and groups from the auth context."""
+    auth_ctx = _get_auth_context()
+    return auth_ctx["user_id"], auth_ctx["groups"]
+
+
+def _require_pat_scope(required_scope: str | None, auth_ctx: dict) -> str | None:
+    """Enforce PAT scopes only; Cognito/JWT tokens are treated as fully scoped."""
+    if not required_scope:
+        return None
+    if auth_ctx.get("token_type") != "pat":
+        return None
+    scopes = auth_ctx.get("scopes", set()) or set()
+    if "admin" in scopes or required_scope in scopes:
+        return None
+    return f"Token lacks required scope: {required_scope}"
+
+
+def _resolve_project(project: str | None, auth_ctx: dict | None = None) -> str:
     """Resolve project ID: explicit value > authenticated user's Cognito sub > DEFAULT_PROJECT.
 
     Norman's directive (Z1439): When connecting via MCP, the default project
@@ -570,7 +619,9 @@ def _resolve_project(project: str | None) -> str:
     """
     if project and project.strip():
         return project.strip()
-    user_id, _ = _get_authenticated_user()
+    if auth_ctx is None:
+        auth_ctx = _get_auth_context()
+    user_id = auth_ctx.get("user_id")
     if user_id:
         return user_id
     return DEFAULT_PROJECT
@@ -604,19 +655,31 @@ def _auto_provision_project(project: str, user_id: str) -> None:
         logger.debug("Auto-provision skipped (may already exist): %s", e)
 
 
-def _check_project_access(project: str) -> tuple[str | None, set[str], str | None]:
+def _check_project_access(project: str,
+                          auth_ctx: dict | None = None) -> tuple[str | None, set[str], str | None]:
     """Check project ACL for the authenticated user. Auto-provisions if needed.
 
     Returns (user_id, groups, error_message).
     error_message is None if access is allowed.
     """
-    user_id, groups = _get_authenticated_user()
+    if auth_ctx is None:
+        auth_ctx = _get_auth_context()
+    user_id = auth_ctx.get("user_id")
+    groups = auth_ctx.get("groups", set()) or set()
+    pat_projects = auth_ctx.get("pat_projects")
+    pat_all_projects = auth_ctx.get("pat_all_projects")
 
     # Auto-provision personal project on first access
     if user_id and project == user_id:
         _auto_provision_project(project, user_id)
 
-    if not is_project_allowed(project, user_id, groups):
+    if not is_project_allowed(
+        project,
+        user_id,
+        groups,
+        pat_projects=pat_projects,
+        pat_all_projects=pat_all_projects,
+    ):
         return user_id, groups, f"Forbidden: no access to project '{project}'"
     return user_id, groups, None
 
@@ -636,8 +699,12 @@ async def search_knowledge(
         top_k: Number of results to return (1-20, default 5)
         project: Project ID (default: your personal space)
     """
-    project = _resolve_project(project)
-    _uid, _grp, _err = _check_project_access(project)
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("search", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
     if _err:
         return {"error": _err}
     top_k = max(1, min(20, top_k))
@@ -669,8 +736,12 @@ async def traverse_graph(
         depth: How many hops to traverse (1-4, default 2)
         project: Project ID (default: your personal space)
     """
-    project = _resolve_project(project)
-    _uid, _grp, _err = _check_project_access(project)
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
     if _err:
         return {"error": _err}
     depth = max(1, min(4, depth))
@@ -700,8 +771,12 @@ async def list_beliefs(
         status: Filter — active, uncertain, superseded, contradicted
         project: Project ID (default: your personal space)
     """
-    project = _resolve_project(project)
-    _uid, _grp, _err = _check_project_access(project)
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
     if _err:
         return {"error": _err}
     if status not in ("active", "uncertain", "superseded", "contradicted"):
@@ -728,8 +803,12 @@ async def get_graph_stats(project: str = None) -> dict:
     Args:
         project: Project ID (default: your personal space)
     """
-    project = _resolve_project(project)
-    _uid, _grp, _err = _check_project_access(project)
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
     if _err:
         return {"error": _err}
     adapter = _get_adapter()
@@ -763,8 +842,12 @@ async def query_nodes(
         limit: Max results (1-200, default 50)
         project: Project ID (default: your personal space)
     """
-    project = _resolve_project(project)
-    _uid, _grp, _err = _check_project_access(project)
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
     if _err:
         return {"error": _err}
     if node_type and node_type not in NODE_TYPES:
@@ -813,8 +896,12 @@ async def add_knowledge(
             S4=strategic, S5=identity). Determines default TTL if valid_until not set.
         project: Project ID (default: your personal space)
     """
-    project = _resolve_project(project)
-    _uid, _grp, _err = _check_project_access(project)
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("write", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
     if _err:
         return {"error": _err}
     if node_type not in NODE_TYPES:
@@ -833,11 +920,6 @@ async def add_knowledge(
     try:
         written = await _run_sync(
             adapter.write_entities, [entity], "manual", "user", project
-        )
-        await _run_sync(
-            adapter.vector_upsert,
-            f"{project}:{name}", f"{name}: {summary}",
-            {"name": name, "node_type": node_type, "source": "manual"}, project,
         )
         audit_log("add_knowledge", "authed",
                   {"name": name, "node_type": node_type, "project": project},
@@ -869,8 +951,12 @@ async def add_relationship(
         reason: Why this relationship exists (optional)
         project: Project ID (default: your personal space)
     """
-    project = _resolve_project(project)
-    _uid, _grp, _err = _check_project_access(project)
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("write", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
     if _err:
         return {"error": _err}
     if relationship_type not in RELATIONSHIP_TYPES:
@@ -915,8 +1001,12 @@ async def update_belief(
         valid_until: ISO 8601 date when this belief expires (e.g. "2026-06-30"). None = no change.
         project: Project ID (default: your personal space)
     """
-    project = _resolve_project(project)
-    _uid, _grp, _err = _check_project_access(project)
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("write", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
     if _err:
         return {"error": _err}
     adapter = _get_adapter()
@@ -949,8 +1039,12 @@ async def get_usage(
         tier: Pricing tier — free (100), pro (1000), team (5000), enterprise (50000)
         project: Project ID (default: your personal space)
     """
-    project = _resolve_project(project)
-    _uid, _grp, _err = _check_project_access(project)
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
     if _err:
         return {"error": _err}
     tier = tier.lower()
@@ -1061,19 +1155,6 @@ VSM levels (optional, classify by organizational function):
     ent_count = adapter.write_entities(entities, "ingest", "extraction", project)
     rel_count = adapter.write_relationships(relationships, "ingest", "extraction", project)
 
-    for ent in entities:
-        name = ent.get("name", "")
-        summary = ent.get("summary", "")
-        if name:
-            vec_meta = {"name": name, "node_type": ent.get("node_type", "Concept"),
-                        "source": "extraction"}
-            if ent.get("vsm_level"):
-                vec_meta["vsm_level"] = ent["vsm_level"]
-            adapter.vector_upsert(
-                f"{project}:{name}", f"{name}: {summary}",
-                vec_meta, project,
-            )
-
     return {
         "entities_written": ent_count, "relationships_written": rel_count,
         "entities_extracted": len(entities), "relationships_extracted": len(relationships),
@@ -1098,8 +1179,12 @@ async def ingest_knowledge(
         return {"error": "Empty text"}
 
     # Resolve project now (in auth context) before dispatching to background thread
-    project = _resolve_project(project)
-    _uid, _grp, _err = _check_project_access(project)
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("ingest", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
     if _err:
         return {"error": _err}
 
@@ -1114,6 +1199,8 @@ async def ingest_knowledge(
         _jobs[job_id] = {
             "status": "queued", "created": time.time(),
             "text_len": len(text), "result": None, "error": None,
+            "owner_id": auth_ctx.get("user_id"),
+            "project": project,
         }
     _job_queue.put((job_id, text, project))
     return {"job_id": job_id, "status": "queued",
@@ -1127,10 +1214,22 @@ async def check_ingestion_status(job_id: str) -> dict:
     Args:
         job_id: The job ID returned by ingest_knowledge
     """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+
     with _jobs_lock:
         job = _jobs.get(job_id)
     if not job:
         return {"error": f"Unknown job_id: {job_id}"}
+    owner_id = job.get("owner_id")
+    user_id = auth_ctx.get("user_id")
+    if owner_id:
+        if user_id is None:
+            return {"error": "Forbidden: authentication required for this job"}
+        if owner_id != user_id:
+            return {"error": "Forbidden: no access to this ingestion job"}
     response = {
         "job_id": job_id, "status": job["status"],
         "text_len": job["text_len"],
@@ -1148,6 +1247,10 @@ async def check_ingestion_status(job_id: str) -> dict:
 @mcp.tool()
 async def health_check() -> dict:
     """Check if the knowledge graph backends are healthy."""
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
     adapter = _get_adapter()
     start = time.time()
     healthy = adapter.is_healthy()

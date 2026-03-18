@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import asyncio
 import os
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 
 class TestAuthDefaults(unittest.TestCase):
@@ -130,6 +132,104 @@ class TestGraphQueryHardening(unittest.TestCase):
                             hops=merkraum_api.MAX_GRAPH_HOPS,
                             top=merkraum_api.MAX_SEARCH_TOP,
                         )
+            finally:
+                merkraum_api.adapter = previous_adapter
+
+
+class TestMcpTenantHardening(unittest.TestCase):
+    @patch.dict(os.environ, {"AUTH_REQUIRED": "true"})
+    def test_mcp_check_project_access_honors_pat_project_restrictions(self):
+        import merkraum_mcp_server
+
+        token = SimpleNamespace(
+            claims={
+                "sub": "user-123",
+                "token_type": "pat",
+                "projects": ["user-123"],
+                "all_projects": False,
+            },
+            scopes=["read"],
+        )
+        with patch.object(merkraum_mcp_server, "get_access_token", return_value=token):
+            _uid, _groups, err = merkraum_mcp_server._check_project_access("other-project")
+            self.assertEqual(err, "Forbidden: no access to project 'other-project'")
+
+    def test_mcp_require_pat_scope_denies_missing_scope(self):
+        import merkraum_mcp_server
+
+        token = SimpleNamespace(
+            claims={"sub": "user-123", "token_type": "pat"},
+            scopes=["read"],
+        )
+        with patch.object(merkraum_mcp_server, "get_access_token", return_value=token):
+            auth_ctx = merkraum_mcp_server._get_auth_context()
+            self.assertEqual(
+                merkraum_mcp_server._require_pat_scope("write", auth_ctx),
+                "Token lacks required scope: write",
+            )
+            self.assertIsNone(merkraum_mcp_server._require_pat_scope("read", auth_ctx))
+
+    def test_check_ingestion_status_is_owner_bound(self):
+        import merkraum_mcp_server
+
+        original_jobs = None
+        with merkraum_mcp_server._jobs_lock:
+            original_jobs = dict(merkraum_mcp_server._jobs)
+            merkraum_mcp_server._jobs.clear()
+            merkraum_mcp_server._jobs["job-1"] = {
+                "status": "queued",
+                "created": 0,
+                "text_len": 12,
+                "result": None,
+                "error": None,
+                "owner_id": "owner-user",
+            }
+
+        token = SimpleNamespace(
+            claims={"sub": "other-user", "token_type": "pat"},
+            scopes=["read"],
+        )
+        try:
+            with patch.object(merkraum_mcp_server, "get_access_token", return_value=token):
+                result = asyncio.run(merkraum_mcp_server.check_ingestion_status("job-1"))
+                self.assertEqual(result.get("error"), "Forbidden: no access to this ingestion job")
+        finally:
+            with merkraum_mcp_server._jobs_lock:
+                merkraum_mcp_server._jobs.clear()
+                merkraum_mcp_server._jobs.update(original_jobs)
+
+
+class TestReindexApiHardening(unittest.TestCase):
+    def test_reindex_api_forwards_cleanup_flag(self):
+        with patch.dict(os.environ, {"AUTH_REQUIRED": "false"}, clear=True):
+            import merkraum_api
+
+            previous_adapter = merkraum_api.adapter
+            mock_adapter = MagicMock()
+            mock_adapter.reindex_project_vectors.return_value = {
+                "project_id": "proj-1",
+                "total_nodes": 0,
+                "upserted": 0,
+                "failed": 0,
+                "legacy_deleted": 0,
+                "limit": 5000,
+                "truncated": False,
+            }
+            try:
+                merkraum_api.adapter = mock_adapter
+                with merkraum_api.app.test_request_context(
+                    "/api/projects/proj-1/vectors/reindex",
+                    method="POST",
+                    json={"cleanup_legacy_ids": True},
+                ):
+                    response = merkraum_api.reindex_project_vectors("proj-1")
+                    status = response[1] if isinstance(response, tuple) else response.status_code
+                    self.assertEqual(status, 200)
+                    mock_adapter.reindex_project_vectors.assert_called_once_with(
+                        project_id="proj-1",
+                        limit=5000,
+                        cleanup_legacy_ids=True,
+                    )
             finally:
                 merkraum_api.adapter = previous_adapter
 
