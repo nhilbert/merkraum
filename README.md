@@ -2,6 +2,11 @@
 
 <!-- mcp-name: io.github.nhilbert/merkraum -->
 
+[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](LICENSE)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
+[![MCP Compatible](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
+[![EU Hosted](https://img.shields.io/badge/hosting-EU%20(Frankfurt)-blue.svg)](#)
+
 Auditable knowledge memory for AI agents. Know what your AI believes — and prove it.
 
 ## Why Merkraum
