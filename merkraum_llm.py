@@ -34,7 +34,7 @@ LLM_REGION = os.environ.get("MERKRAUM_LLM_REGION", "eu-central-1")
 
 # Default models per provider
 _DEFAULT_MODELS = {
-    "bedrock": "anthropic.claude-3-haiku-20240307-v1:0",
+    "bedrock": "eu.anthropic.claude-haiku-4-5-20251001-v1:0",
     "openai": "gpt-4o-mini",
 }
 
@@ -99,7 +99,11 @@ def _llm_call_bedrock(
 
     for block in content_blocks:
         if "toolUse" in block:
-            return json.dumps(block["toolUse"]["input"])
+            data = block["toolUse"]["input"]
+            # Bedrock may wrap tool output in a "parameter" key — unwrap it
+            if isinstance(data, dict) and len(data) == 1 and "parameter" in data:
+                data = data["parameter"]
+            return json.dumps(data)
     for block in content_blocks:
         if "text" in block:
             return block["text"]
@@ -211,6 +215,13 @@ def llm_extract(
         logger.error("Failed to parse LLM response as JSON: %s", e)
         logger.debug("Raw response: %s", raw[:500])
         return {"entities": [], "relationships": []}
+
+    # Unwrap single-key wrappers (Bedrock Tool Use may nest under arbitrary keys
+    # like "parameter", "response", "result", etc.)
+    while isinstance(result, dict) and "entities" not in result and len(result) == 1:
+        result = next(iter(result.values()))
+        if not isinstance(result, dict):
+            return {"entities": [], "relationships": []}
 
     return {
         "entities": result.get("entities", []),
