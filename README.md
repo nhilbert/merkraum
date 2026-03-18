@@ -61,6 +61,73 @@ URL: http://localhost:8090/mcp
 
 That's it. Start asking your agent to remember things.
 
+## OpenCode setup
+
+Use OpenCode as an MCP client for Merkraum (local or hosted).
+
+1. Install OpenCode:
+
+```bash
+# npm (recommended)
+npm install -g opencode-ai
+
+# or Go
+go install github.com/opencode-ai/opencode@latest
+```
+
+2. Create `opencode.json` in the directory where you start `opencode`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "merkraum": {
+      "type": "remote",
+      "url": "http://localhost:8090/mcp"
+    }
+  }
+}
+```
+
+For hosted Merkraum, use your remote URL and token:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "merkraum": {
+      "type": "remote",
+      "url": "https://mcp.merkraum.de/mcp",
+      "headers": {
+        "Authorization": "Bearer mk_pat_<your_token>"
+      }
+    }
+  }
+}
+```
+
+3. Verify connectivity:
+
+```bash
+opencode mcp list
+```
+
+If your MCP server is OAuth-enabled, you can also run:
+
+```bash
+opencode mcp auth merkraum
+```
+
+4. Start OpenCode and test:
+
+```bash
+opencode
+```
+
+Example prompts:
+- `List all available tools`
+- `Search for "Bundeskartellamt" in the knowledge graph`
+
 ## MCP Tools
 
 | Tool | Description |
