@@ -1,5 +1,5 @@
 # Merkraum MCP Server + REST API — Python dependencies
-# v1.1 — SUP-94
+# v1.2 — SUP-149
 
 fastmcp>=2.0.0
 neo4j>=5.0.0
@@ -10,3 +10,6 @@ flask>=3.0.0
 # Cognito JWT validation
 PyJWT>=2.8.0
 requests>=2.31.0
+
+# AWS Bedrock (EU-compliant LLM extraction via Converse API)
+boto3>=1.34.0

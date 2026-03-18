@@ -24,7 +24,7 @@ import urllib.request
 import urllib.error
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 logger = logging.getLogger(__name__)
@@ -71,6 +71,17 @@ RELATIONSHIP_TYPES = [
 
 SYMMETRIC_TYPES = {"CONTRADICTS", "COMPLEMENTS"}
 
+VSM_LEVELS = ["S1", "S2", "S3", "S4", "S5"]
+
+# Default TTLs by VSM level (days). None = no expiration.
+VSM_DEFAULT_TTL_DAYS = {
+    "S1": 30,    # Operational — fast-cycling task data
+    "S2": 90,    # Coordination — valid while processes exist
+    "S3": 180,   # Control — performance metrics, superseded not deleted
+    "S4": 365,   # Strategic — environmental models, must be refreshed
+    "S5": None,  # Identity — near-permanent, only explicit S5 revision
+}
+
 
 class BackendAdapter(ABC):
     """Abstract interface for Merkraum graph + vector backends."""
@@ -110,8 +121,9 @@ class BackendAdapter(ABC):
     @abstractmethod
     def query_nodes(self, node_type: Optional[str] = None,
                     project_id: str = "default",
-                    limit: int = 100) -> list:
-        """Query nodes, optionally filtered by type and project."""
+                    limit: int = 100,
+                    vsm_level: Optional[str] = None) -> list:
+        """Query nodes, optionally filtered by type, project, and VSM level."""
 
     @abstractmethod
     def traverse(self, entity_name: str, project_id: str = "default",
@@ -229,7 +241,10 @@ class BackendAdapter(ABC):
     def update_project(self, project_id: str,
                        name: Optional[str] = None,
                        description: Optional[str] = None,
-                       tier: Optional[str] = None) -> dict:
+                       tier: Optional[str] = None,
+                       dreaming_enabled: Optional[bool] = None,
+                       dreaming_schedule: Optional[str] = None,
+                       dreaming_config: Optional[dict] = None) -> dict:
         """Update project metadata. Returns updated project dict."""
 
     @abstractmethod
@@ -416,6 +431,18 @@ class Neo4jBaseAdapter(BackendAdapter):
                     if node_type not in NODE_TYPES:
                         continue
                     node_id = _string_to_uuid(f"{project_id}:{node_type}:{ent['name']}")
+                    valid_until = ent.get("valid_until") or None
+                    vsm_level = ent.get("vsm_level") or None
+                    if vsm_level and vsm_level not in VSM_LEVELS:
+                        vsm_level = None
+                    # Apply default TTL from VSM level if no explicit valid_until
+                    if not valid_until and vsm_level:
+                        ttl_days = VSM_DEFAULT_TTL_DAYS.get(vsm_level)
+                        if ttl_days is not None:
+                            valid_until = (
+                                datetime.now(timezone.utc) +
+                                timedelta(days=ttl_days)
+                            ).isoformat()
                     params = dict(
                         name=ent["name"],
                         summary=ent.get("summary", ""),
@@ -424,6 +451,8 @@ class Neo4jBaseAdapter(BackendAdapter):
                         source_type=source_type,
                         project_id=project_id,
                         node_id=node_id,
+                        valid_until=valid_until,
+                        vsm_level=vsm_level,
                     )
                     if node_type == "Belief":
                         params["confidence"] = ent.get("confidence", 0.7)
@@ -435,12 +464,18 @@ class Neo4jBaseAdapter(BackendAdapter):
                                 n.updated_at = $now, n.source_cycle = $source_cycle,
                                 n.source_type = $source_type, n.active = true,
                                 n.status = 'active', n.confidence = $confidence,
-                                n.project_id = $project_id, n.node_id = $node_id
+                                n.project_id = $project_id, n.node_id = $node_id,
+                                n.valid_until = $valid_until,
+                                n.vsm_level = $vsm_level
                             ON MATCH SET
                                 n.summary = $summary, n.updated_at = $now,
                                 n.node_id = coalesce(n.node_id, $node_id),
                                 n.confidence = CASE WHEN $confidence > n.confidence
-                                    THEN $confidence ELSE n.confidence END
+                                    THEN $confidence ELSE n.confidence END,
+                                n.valid_until = CASE WHEN $valid_until IS NOT NULL
+                                    THEN $valid_until ELSE n.valid_until END,
+                                n.vsm_level = CASE WHEN $vsm_level IS NOT NULL
+                                    THEN $vsm_level ELSE n.vsm_level END
                             """,
                             **params,
                         )
@@ -452,15 +487,29 @@ class Neo4jBaseAdapter(BackendAdapter):
                                 n.summary = $summary, n.created_at = $now,
                                 n.updated_at = $now, n.source_cycle = $source_cycle,
                                 n.source_type = $source_type,
-                                n.project_id = $project_id, n.node_id = $node_id
+                                n.project_id = $project_id, n.node_id = $node_id,
+                                n.valid_until = $valid_until,
+                                n.vsm_level = $vsm_level
                             ON MATCH SET
                                 n.summary = CASE WHEN size($summary) > size(coalesce(n.summary, ''))
                                     THEN $summary ELSE n.summary END,
                                 n.node_id = coalesce(n.node_id, $node_id),
-                                n.updated_at = $now
+                                n.updated_at = $now,
+                                n.valid_until = CASE WHEN $valid_until IS NOT NULL
+                                    THEN $valid_until ELSE n.valid_until END,
+                                n.vsm_level = CASE WHEN $vsm_level IS NOT NULL
+                                    THEN $vsm_level ELSE n.vsm_level END
                             """,
                             **params,
                         )
+                    vec_meta = {
+                        "name": ent["name"],
+                        "node_type": node_type,
+                        "source": source_type,
+                        "project_id": project_id,
+                    }
+                    if vsm_level:
+                        vec_meta["vsm_level"] = vsm_level
                     vector_ok = self.vector_upsert(
                         self._vector_id_for_node(
                             project_id,
@@ -472,12 +521,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                             ent["name"],
                             ent.get("summary", ""),
                         ),
-                        {
-                            "name": ent["name"],
-                            "node_type": node_type,
-                            "source": source_type,
-                            "project_id": project_id,
-                        },
+                        vec_meta,
                         project_id=project_id,
                     )
                     if not vector_ok:
@@ -502,6 +546,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                     rel_type = rel.get("type", "REFERENCES")
                     if rel_type not in RELATIONSHIP_TYPES:
                         continue
+                    valid_until = rel.get("valid_until") or None
                     params = dict(
                         source=rel["source"],
                         target=rel["target"],
@@ -512,6 +557,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                         now=now,
                         project_id=project_id,
                         valid_from=rel.get("valid_from", now),
+                        valid_until=valid_until,
                     )
                     cypher = f"""
                     MATCH (a {{name: $source, project_id: $project_id}})
@@ -522,7 +568,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                         r.source_cycle = $source_cycle, r.source_type = $source_type,
                         r.created_at = $now, r.active = true,
                         r.weight = $confidence, r.valid_from = $valid_from,
-                        r.valid_until = null, r.expired_at = null
+                        r.valid_until = $valid_until, r.expired_at = null
                     ON MATCH SET
                         r.confidence = CASE WHEN $confidence > r.confidence
                             THEN $confidence ELSE r.confidence END,
@@ -554,40 +600,98 @@ class Neo4jBaseAdapter(BackendAdapter):
                                    rel.get("source"), rel.get("target"), e)
         return written
 
-    def query_nodes(self, node_type=None, project_id="default", limit=100):
+    def query_nodes(self, node_type=None, project_id="default", limit=100,
+                    vsm_level=None):
         self._ensure_project_node_ids(project_id)
         results = []
         with self._driver.session() as session:
+            vsm_filter = ""
+            if vsm_level and vsm_level in VSM_LEVELS:
+                vsm_filter = " AND n.vsm_level = $vsm_level"
             if node_type and node_type in NODE_TYPES:
                 cypher = f"""
                 MATCH (n:{node_type} {{project_id: $pid}})
+                WHERE true{vsm_filter}
                 RETURN n.name AS name, n.summary AS summary,
                        labels(n)[0] AS type, n.created_at AS created,
-                       n.node_id AS node_id, n.confidence AS confidence
+                       n.node_id AS node_id, n.confidence AS confidence,
+                       n.valid_until AS valid_until, n.vsm_level AS vsm_level
                 ORDER BY n.updated_at DESC LIMIT $limit
                 """
             else:
-                cypher = """
-                MATCH (n {project_id: $pid})
-                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+                cypher = f"""
+                MATCH (n {{project_id: $pid}})
+                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types){vsm_filter}
                 RETURN n.name AS name, n.summary AS summary,
                        labels(n)[0] AS type, n.created_at AS created,
-                       n.node_id AS node_id, n.confidence AS confidence
+                       n.node_id AS node_id, n.confidence AS confidence,
+                       n.valid_until AS valid_until, n.vsm_level AS vsm_level
                 ORDER BY n.updated_at DESC LIMIT $limit
                 """
             params = {"pid": project_id, "limit": limit}
+            if vsm_level and vsm_level in VSM_LEVELS:
+                params["vsm_level"] = vsm_level
             if not (node_type and node_type in NODE_TYPES):
                 params["node_types"] = list(NODE_TYPES)
             records = session.run(cypher, **params)
             for rec in records:
-                results.append({
+                entry = {
                     "name": rec["name"],
                     "summary": rec["summary"],
                     "type": rec["type"],
                     "created": rec["created"],
                     "node_id": rec.get("node_id"),
                     "confidence": rec.get("confidence"),
-                })
+                }
+                if rec.get("valid_until"):
+                    entry["valid_until"] = rec["valid_until"]
+                if rec.get("vsm_level"):
+                    entry["vsm_level"] = rec["vsm_level"]
+                results.append(entry)
+        return results
+
+    def query_expiring(self, project_id="default", horizon_days=30, limit=100):
+        """Find nodes with valid_until set and expiring within horizon_days.
+
+        Also returns already-expired nodes (valid_until < now) that are still active.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        horizon = (datetime.now(timezone.utc) +
+                   timedelta(days=horizon_days)).isoformat()
+        results = []
+        with self._driver.session() as session:
+            cypher = """
+            MATCH (n {project_id: $pid})
+            WHERE n.valid_until IS NOT NULL
+              AND n.valid_until <= $horizon
+              AND any(lbl IN labels(n) WHERE lbl IN $node_types)
+            RETURN n.name AS name, n.summary AS summary,
+                   labels(n)[0] AS type, n.valid_until AS valid_until,
+                   n.created_at AS created, n.updated_at AS updated,
+                   n.node_id AS node_id, n.confidence AS confidence,
+                   n.vsm_level AS vsm_level,
+                   CASE WHEN n.valid_until < $now THEN true ELSE false END AS expired
+            ORDER BY n.valid_until ASC LIMIT $limit
+            """
+            records = session.run(
+                cypher, pid=project_id, now=now, horizon=horizon,
+                limit=limit, node_types=list(NODE_TYPES),
+            )
+            for rec in records:
+                entry = {
+                    "name": rec["name"],
+                    "summary": rec["summary"],
+                    "type": rec["type"],
+                    "valid_until": rec["valid_until"],
+                    "created": rec["created"],
+                    "updated": rec["updated"],
+                    "node_id": rec.get("node_id"),
+                    "confidence": rec.get("confidence"),
+                    "expired": rec["expired"],
+                }
+                if rec.get("vsm_level"):
+                    entry["vsm_level"] = rec["vsm_level"]
+                results.append(entry)
         return results
 
     def traverse(self, entity_name, project_id="default", max_depth=2):
@@ -606,11 +710,14 @@ class Neo4jBaseAdapter(BackendAdapter):
                 for node in path.nodes:
                     nid = node.element_id
                     if nid not in nodes:
-                        nodes[nid] = {
+                        n_entry = {
                             "name": node.get("name", ""),
                             "type": list(node.labels)[0] if node.labels else "Unknown",
                             "summary": node.get("summary", ""),
                         }
+                        if node.get("vsm_level"):
+                            n_entry["vsm_level"] = node["vsm_level"]
+                        nodes[nid] = n_entry
                 for rel in path.relationships:
                     edges.append({
                         "source": rel.start_node.get("name", ""),
@@ -623,38 +730,24 @@ class Neo4jBaseAdapter(BackendAdapter):
     def get_beliefs(self, project_id="default", status="active"):
         beliefs = []
         with self._driver.session() as session:
-            if status == "uncertain":
-                cypher = """
-                MATCH (b:Belief {project_id: $pid})
-                WHERE b.active = true AND b.confidence < 0.5
-                RETURN b.name AS name, b.summary AS summary,
-                       b.confidence AS confidence, b.source_cycle AS cycle
-                ORDER BY b.confidence ASC
-                """
-            elif status == "contradicted":
-                cypher = """
-                MATCH (b1:Belief {project_id: $pid})-[:CONTRADICTS]-(b2:Belief {project_id: $pid})
-                WHERE b1.active = true AND b2.active = true
-                RETURN DISTINCT b1.name AS name, b1.summary AS summary,
-                       b1.confidence AS confidence, b1.source_cycle AS cycle
-                """
-            elif status == "superseded":
-                cypher = """
-                MATCH (b:Belief {project_id: $pid})
-                WHERE b.status = 'superseded'
-                RETURN b.name AS name, b.summary AS summary,
-                       b.confidence AS confidence, b.source_cycle AS cycle
-                ORDER BY b.updated_at DESC LIMIT 20
-                """
-            else:
+            if status == "active":
                 cypher = """
                 MATCH (b:Belief {project_id: $pid})
                 WHERE b.active = true
+                  AND (b.status IS NULL OR b.status = 'active')
                 RETURN b.name AS name, b.summary AS summary,
                        b.confidence AS confidence, b.source_cycle AS cycle
                 ORDER BY b.confidence DESC
                 """
-            records = session.run(cypher, pid=project_id)
+            else:
+                cypher = """
+                MATCH (b:Belief {project_id: $pid})
+                WHERE b.status = $status
+                RETURN b.name AS name, b.summary AS summary,
+                       b.confidence AS confidence, b.source_cycle AS cycle
+                ORDER BY b.updated_at DESC
+                """
+            records = session.run(cypher, pid=project_id, status=status)
             for rec in records:
                 beliefs.append({
                     "name": rec["name"],
@@ -665,7 +758,8 @@ class Neo4jBaseAdapter(BackendAdapter):
         return beliefs
 
     def get_stats(self, project_id="default"):
-        stats = {"nodes": {}, "edges": {}, "total_nodes": 0, "total_edges": 0}
+        stats = {"nodes": {}, "edges": {}, "total_nodes": 0, "total_edges": 0,
+                 "vsm_levels": {}}
         with self._driver.session() as session:
             for nt in NODE_TYPES:
                 result = session.run(
@@ -686,6 +780,17 @@ class Neo4jBaseAdapter(BackendAdapter):
                 if count > 0:
                     stats["edges"][rt] = count
                     stats["total_edges"] += count
+            # VSM level distribution
+            result = session.run(
+                """MATCH (n {project_id: $pid})
+                WHERE n.vsm_level IS NOT NULL
+                  AND any(lbl IN labels(n) WHERE lbl IN $node_types)
+                RETURN n.vsm_level AS level, count(n) AS c
+                ORDER BY n.vsm_level""",
+                pid=project_id, node_types=list(NODE_TYPES),
+            )
+            for rec in result:
+                stats["vsm_levels"][rec["level"]] = rec["c"]
         return stats
 
     def delete_project_data(self, project_id):
@@ -753,9 +858,13 @@ class Neo4jBaseAdapter(BackendAdapter):
             return props
 
     def update_project(self, project_id, name=None, description=None,
-                       tier=None):
+                       tier=None, dreaming_enabled=None,
+                       dreaming_schedule=None, dreaming_config=None):
+        VALID_SCHEDULES = {"manual", "daily", "weekly"}
         if tier is not None and tier not in TIER_LIMITS:
             raise ValueError(f"Invalid tier: {tier}. Valid: {list(TIER_LIMITS.keys())}")
+        if dreaming_schedule is not None and dreaming_schedule not in VALID_SCHEDULES:
+            raise ValueError(f"Invalid dreaming_schedule: {dreaming_schedule}. Valid: {sorted(VALID_SCHEDULES)}")
         now = datetime.now(timezone.utc).isoformat()
         set_clauses = ["pm.updated_at = $now"]
         params: dict = {"pid": project_id, "now": now}
@@ -768,6 +877,16 @@ class Neo4jBaseAdapter(BackendAdapter):
         if tier is not None:
             set_clauses.append("pm.tier = $tier")
             params["tier"] = tier
+        if dreaming_enabled is not None:
+            set_clauses.append("pm.dreaming_enabled = $dreaming_enabled")
+            params["dreaming_enabled"] = bool(dreaming_enabled)
+        if dreaming_schedule is not None:
+            set_clauses.append("pm.dreaming_schedule = $dreaming_schedule")
+            params["dreaming_schedule"] = dreaming_schedule
+        if dreaming_config is not None:
+            import json as _json
+            set_clauses.append("pm.dreaming_config = $dreaming_config")
+            params["dreaming_config"] = _json.dumps(dreaming_config)
 
         with self._driver.session() as session:
             result = session.run(
@@ -778,7 +897,15 @@ class Neo4jBaseAdapter(BackendAdapter):
             ).single()
             if not result:
                 return {"updated": False, "error": f"Project '{project_id}' not found"}
-            return {"updated": True, **dict(result["pm"])}
+            props = dict(result["pm"])
+            # Parse dreaming_config back from JSON string
+            if "dreaming_config" in props and isinstance(props["dreaming_config"], str):
+                try:
+                    import json as _json
+                    props["dreaming_config"] = _json.loads(props["dreaming_config"])
+                except (ValueError, TypeError):
+                    pass
+            return {"updated": True, **props}
 
     def list_projects(self, owner=None):
         with self._driver.session() as session:
@@ -879,7 +1006,7 @@ class Neo4jBaseAdapter(BackendAdapter):
         return stats
 
     def update_belief(self, name, project_id="default", confidence=None,
-                      status=None, summary=None):
+                      status=None, summary=None, valid_until=None):
         valid_statuses = ("active", "superseded")
         if status is not None and status not in valid_statuses:
             return {"updated": False, "name": name,
@@ -904,6 +1031,9 @@ class Neo4jBaseAdapter(BackendAdapter):
         if summary is not None:
             set_clauses.append("b.summary = $summary")
             changes["summary"] = summary
+        if valid_until is not None:
+            set_clauses.append("b.valid_until = $valid_until")
+            changes["valid_until"] = valid_until
 
         if not changes:
             return {"updated": False, "name": name, "error": "No changes specified"}
@@ -917,6 +1047,7 @@ class Neo4jBaseAdapter(BackendAdapter):
             result = session.run(
                 cypher, name=name, pid=project_id, now=now,
                 confidence=confidence, status=status, summary=summary,
+                valid_until=valid_until,
             )
             record = result.single()
 

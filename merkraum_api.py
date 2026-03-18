@@ -23,10 +23,15 @@ import importlib
 import json
 import logging
 import os
+import queue
+import threading
+import time
 import urllib.request
 import urllib.error
 from functools import lru_cache
 from typing import cast
+
+from merkraum_llm import llm_extract, get_provider_info
 
 from merkraum_acl import is_auth_required, is_project_allowed, split_csv_env
 
@@ -202,6 +207,53 @@ def _get_all_edges(adp, project_id: str, limit: int = 1000) -> list:
                 }
             )
     return edges
+
+
+def _get_contradiction_pairs(adp, project_id: str) -> list:
+    """Query actual CONTRADICTS relationship pairs from Neo4j.
+
+    Returns a list of dicts, each with belief_a, belief_b, reason, and relationship metadata.
+    Uses directed match with DISTINCT to avoid duplicate pairs.
+    """
+    pairs = []
+    with adp._driver.session() as session:
+        records = session.run(
+            """
+            MATCH (a:Belief {project_id: $pid})-[r:CONTRADICTS]->(b:Belief {project_id: $pid})
+            WHERE a.active = true AND b.active = true
+            RETURN a.name AS a_name, a.summary AS a_summary,
+                   a.confidence AS a_confidence, a.source_cycle AS a_cycle,
+                   a.node_id AS a_node_id,
+                   b.name AS b_name, b.summary AS b_summary,
+                   b.confidence AS b_confidence, b.source_cycle AS b_cycle,
+                   b.node_id AS b_node_id,
+                   r.reason AS reason, r.confidence AS rel_confidence,
+                   type(r) AS rel_type
+            """,
+            pid=project_id,
+        )
+        for rec in records:
+            pairs.append({
+                "belief_a": {
+                    "name": rec["a_name"] or "",
+                    "summary": rec["a_summary"] or "",
+                    "confidence": rec["a_confidence"] or 0,
+                    "status": "contradicted",
+                    "source": rec["a_cycle"] or "",
+                    "node_id": rec["a_node_id"] or "",
+                },
+                "belief_b": {
+                    "name": rec["b_name"] or "",
+                    "summary": rec["b_summary"] or "",
+                    "confidence": rec["b_confidence"] or 0,
+                    "status": "contradicted",
+                    "source": rec["b_cycle"] or "",
+                    "node_id": rec["b_node_id"] or "",
+                },
+                "reason": rec["reason"] or "Conflicting evidence detected",
+                "rel_confidence": rec["rel_confidence"] or 0,
+            })
+    return pairs
 
 
 def _get_semantic_subgraph(adp, project_id: str, query: str, *, limit: int, hops: int, top: int) -> dict:
@@ -691,6 +743,35 @@ Use ONLY the following fixed vocabulary.
 6. If the text contains no extractable knowledge, return empty arrays.
 7. Do NOT invent relationships not stated or clearly implied in the text.
 
+## VSM LEVEL CLASSIFICATION:
+Classify each entity by its organizational function using the Viable System Model (S1-S5):
+- S1 (Operational): Task-specific facts, in-progress data, current values, scratch notes. Fast-cycling.
+- S2 (Coordination): Rules, procedures, process descriptions, scheduling, "how things connect." Valid while processes exist.
+- S3 (Control): Performance metrics, quality assessments, resource capacities, priorities. Updated at reviews.
+- S4 (Strategic): Environmental models, competitive intelligence, market trends, research findings. Slow-cycling.
+- S5 (Identity): Core values, policy rules, identity claims, normative commitments. Near-permanent.
+Set "vsm_level" to one of: S1, S2, S3, S4, S5. When uncertain, omit it (null).
+Heuristics: task data → S1, process docs → S2, metrics/assessments → S3, external research → S4, values/policy → S5.
+
+## TEMPORAL VALIDITY:
+For entities with a known expiration or temporal boundary, set "valid_until" (ISO 8601 date).
+- Events: set valid_until to the event date (knowledge becomes historical after).
+- Regulations with enforcement dates: set valid_until to when they take effect or are superseded.
+- Market data, statistics, competitive assessments: set valid_until ~90 days from the text date.
+- Beliefs about current state: set valid_until ~30 days if the domain changes rapidly.
+- Permanent concepts, people, organizations: omit valid_until (null = no expiration).
+- Only set valid_until when the text provides temporal cues. When uncertain, omit it.
+- If vsm_level is set but valid_until is omitted, a default TTL is applied based on the level (S1=30d, S2=90d, S3=180d, S4=365d, S5=none).
+
+## CONTRADICTION RULES (for CONTRADICTS relationships):
+8. Only use CONTRADICTS when two beliefs are about the SAME subject with SAME scope.
+9. Different scopes are NOT contradictions. Examples of different scopes:
+   - "German market grew 30%" vs "International market declined" — different geographic scopes
+   - "Revenue increased in Q1" vs "Revenue decreased in Q4" — different time periods
+   - "Product A sales up" vs "Product B sales down" — different subjects
+10. Before emitting CONTRADICTS, verify: same entity, same scope, same time frame, genuinely incompatible claims.
+11. Include the specific reason in the "reason" field explaining WHY the beliefs conflict.
+
 ## OUTPUT FORMAT:
 Return a JSON object with two arrays: "entities" and "relationships".
 
@@ -700,7 +781,9 @@ Return a JSON object with two arrays: "entities" and "relationships".
       "name": "canonical name",
       "node_type": "one of the node types above",
       "summary": "one-paragraph description, max 500 chars",
-      "confidence": 0.9
+      "confidence": 0.9,
+      "valid_until": "2026-06-30T00:00:00Z or null",
+      "vsm_level": "S1 or S2 or S3 or S4 or S5 or null"
     }}
   ],
   "relationships": [
@@ -735,40 +818,29 @@ def _load_env_value(key: str) -> str | None:
     return None
 
 
-def _llm_extract(text: str, api_key: str, model: str = "gpt-4o-mini") -> dict:
-    """Call OpenAI to extract entities and relationships from text."""
-    url = "https://api.openai.com/v1/chat/completions"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "model": model,
-        "response_format": {"type": "json_object"},
-        "temperature": 0.3,
-        "max_completion_tokens": 8000,
-        "messages": [
-            {"role": "system", "content": EXTRACTION_SYSTEM_PROMPT},
-            {"role": "user", "content": f"Extract entities and relationships from the following text:\n\n{text[:8000]}"},
-        ],
-    }
-    body = json.dumps(payload).encode()
-    req = urllib.request.Request(url, data=body, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        data = json.loads(resp.read())
-        content = data["choices"][0]["message"].get("content", "")
-        if not content:
-            return {"entities": [], "relationships": []}
-        result = json.loads(content)
-        # Validate structure
-        entities = result.get("entities", [])
-        relationships = result.get("relationships", [])
-        # Filter to valid types
-        valid_node_types = set(NODE_TYPES)
-        valid_rel_types = set(RELATIONSHIP_TYPES)
-        entities = [e for e in entities if e.get("node_type") in valid_node_types]
-        relationships = [r for r in relationships if r.get("type") in valid_rel_types]
-        return {"entities": entities, "relationships": relationships}
+def _llm_extract_text(text: str) -> dict:
+    """Extract entities and relationships from text using configured LLM provider.
+
+    Uses merkraum_llm module for provider-agnostic extraction (Bedrock or OpenAI).
+    """
+    user_prompt = f"Extract entities and relationships from the following text:\n\n{text[:8000]}"
+    api_key = _get_openai_key()
+
+    result = llm_extract(
+        system_prompt=EXTRACTION_SYSTEM_PROMPT,
+        user_prompt=user_prompt,
+        temperature=0.3,
+        api_key=api_key,
+    )
+
+    # Filter to valid types
+    entities = result.get("entities", [])
+    relationships = result.get("relationships", [])
+    valid_node_types = set(NODE_TYPES)
+    valid_rel_types = set(RELATIONSHIP_TYPES)
+    entities = [e for e in entities if e.get("node_type") in valid_node_types]
+    relationships = [r for r in relationships if r.get("type") in valid_rel_types]
+    return {"entities": entities, "relationships": relationships}
 
 
 # ---------------------------------------------------------------------------
@@ -788,6 +860,7 @@ def discover():
         "base_url": "https://agent.nhilbert.de/api/merkraum",
         "mcp_url": "https://agent.nhilbert.de/mcp/merkraum/",
         "skill_md": "https://agent.nhilbert.de/.well-known/skill.md",
+        "agent_spec": "https://agent.nhilbert.de/.well-known/agent-spec.json",
         "authentication": {
             "type": "oauth2",
             "provider": "aws_cognito",
@@ -799,6 +872,7 @@ def discover():
             "node_types": list(NODE_TYPES),
             "relationship_types": list(RELATIONSHIP_TYPES),
         },
+        "llm": get_provider_info(),
         "tiers": {k: {"node_limit": v} for k, v in TIER_LIMITS.items()},
         "endpoints": [
             {"path": "/api/search", "method": "GET", "auth": True, "description": "Semantic vector search"},
@@ -841,6 +915,17 @@ def well_known_skill():
     with open(skill_path) as f:
         content = f.read()
     return content, 200, {"Content-Type": "text/markdown; charset=utf-8"}
+
+
+@app.route("/.well-known/agent-spec.json", methods=["GET"])
+def well_known_agent_spec():
+    """Serve AGENT_SPEC.json — machine-readable integration specification."""
+    spec_path = os.path.join(os.path.dirname(__file__), "AGENT_SPEC.json")
+    if not os.path.exists(spec_path):
+        return _error("AGENT_SPEC.json not found", 404)
+    with open(spec_path) as f:
+        content = f.read()
+    return content, 200, {"Content-Type": "application/json; charset=utf-8"}
 
 
 # ---------------------------------------------------------------------------
@@ -1063,6 +1148,9 @@ def update_project(project_id):
         name: new display name (optional)
         description: new description (optional)
         tier: new tier (optional)
+        dreaming_enabled: bool (optional)
+        dreaming_schedule: "manual" | "daily" | "weekly" (optional)
+        dreaming_config: dict with replay_walks, replay_hops, consolidation_threshold (optional)
     """
     adp = adapter
     if adp is None:
@@ -1077,6 +1165,9 @@ def update_project(project_id):
             name=body.get("name"),
             description=body.get("description"),
             tier=body.get("tier"),
+            dreaming_enabled=body.get("dreaming_enabled"),
+            dreaming_schedule=body.get("dreaming_schedule"),
+            dreaming_config=body.get("dreaming_config"),
         )
         if not result.get("updated"):
             return _error(result.get("error", "Update failed"), 404)
@@ -1112,6 +1203,92 @@ def delete_project(project_id):
         return _error(str(exc), 400)
     except Exception as exc:
         logger.exception("delete_project failed for %s", project_id)
+        return _error(str(exc))
+
+
+@app.route("/api/projects/<path:project_id>/dreaming", methods=["GET"])
+@require_auth
+@require_scope("read")
+def get_dreaming_config(project_id):
+    """Get dreaming configuration for a project.
+
+    Returns: dreaming_enabled, dreaming_schedule, dreaming_config
+    """
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+    denied = _deny_if_project_forbidden(project_id)
+    if denied:
+        return denied
+    try:
+        project = adp.get_project(project_id)
+        if not project:
+            return _error(f"Project '{project_id}' not found", 404)
+        dreaming_config_raw = project.get("dreaming_config")
+        if isinstance(dreaming_config_raw, str):
+            try:
+                dreaming_config_raw = json.loads(dreaming_config_raw)
+            except (ValueError, TypeError):
+                dreaming_config_raw = {}
+        return jsonify({
+            "project_id": project_id,
+            "dreaming_enabled": project.get("dreaming_enabled", False),
+            "dreaming_schedule": project.get("dreaming_schedule", "manual"),
+            "dreaming_config": dreaming_config_raw or {
+                "replay_walks": 3,
+                "replay_hops": 5,
+                "consolidation_threshold": 0.75,
+            },
+        })
+    except Exception as exc:
+        logger.exception("get_dreaming_config failed for %s", project_id)
+        return _error(str(exc))
+
+
+@app.route("/api/projects/<path:project_id>/dreaming", methods=["PATCH"])
+@require_auth
+@require_scope("projects")
+def update_dreaming_config(project_id):
+    """Update dreaming configuration for a project.
+
+    Body (JSON):
+        dreaming_enabled: bool (optional)
+        dreaming_schedule: "manual" | "daily" | "weekly" (optional)
+        dreaming_config: dict with replay_walks, replay_hops, consolidation_threshold (optional)
+    """
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+    denied = _deny_if_project_forbidden(project_id)
+    if denied:
+        return denied
+    body = request.get_json(silent=True) or {}
+    try:
+        result = adp.update_project(
+            project_id=project_id,
+            dreaming_enabled=body.get("dreaming_enabled"),
+            dreaming_schedule=body.get("dreaming_schedule"),
+            dreaming_config=body.get("dreaming_config"),
+        )
+        if not result.get("updated"):
+            return _error(result.get("error", "Update failed"), 404)
+        # Return clean dreaming config
+        dreaming_config_val = result.get("dreaming_config")
+        if isinstance(dreaming_config_val, str):
+            try:
+                dreaming_config_val = json.loads(dreaming_config_val)
+            except (ValueError, TypeError):
+                dreaming_config_val = {}
+        return jsonify({
+            "project_id": project_id,
+            "dreaming_enabled": result.get("dreaming_enabled", False),
+            "dreaming_schedule": result.get("dreaming_schedule", "manual"),
+            "dreaming_config": dreaming_config_val or {},
+        })
+    except ValueError as exc:
+        return _error(str(exc), 400)
+    except Exception as exc:
+        logger.exception("update_dreaming_config failed for %s", project_id)
         return _error(str(exc))
 
 
@@ -1389,6 +1566,31 @@ def beliefs():
         return _error(str(exc))
 
 
+@app.route("/api/contradictions", methods=["GET"])
+@require_auth
+@require_scope("read")
+def contradictions():
+    """Contradiction pairs — returns actual CONTRADICTS relationship pairs.
+
+    Each pair contains both beliefs and the relationship reason.
+
+    Query params:
+        project: project id (default: "default")
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+    try:
+        pairs = _get_contradiction_pairs(adapter, project)
+        return jsonify(pairs)
+    except Exception as exc:
+        logger.exception("contradictions failed for project=%s", project)
+        return _error(str(exc))
+
+
 @app.route("/api/graph", methods=["GET"])
 @require_auth
 @require_scope("read")
@@ -1518,11 +1720,12 @@ def graph_expand():
 @require_auth
 @require_scope("read")
 def nodes():
-    """Query nodes, optionally filtered by type.
+    """Query nodes, optionally filtered by type and VSM level.
 
     Query params:
         project: project id (default: "default")
         type: node type label, e.g. Belief, Concept, Person (optional)
+        vsm_level: VSM system level filter, e.g. S1, S2, S3, S4, S5 (optional)
         limit: max results (default: 100)
     """
     if adapter is None:
@@ -1532,6 +1735,7 @@ def nodes():
     if denied:
         return denied
     node_type = request.args.get("type") or None
+    vsm_level = request.args.get("vsm_level") or None
     try:
         limit = int(request.args.get("limit", 100))
     except (TypeError, ValueError):
@@ -1540,11 +1744,51 @@ def nodes():
 
     try:
         results = adapter.query_nodes(
-            node_type=node_type, project_id=project, limit=limit
+            node_type=node_type, project_id=project, limit=limit,
+            vsm_level=vsm_level,
         )
         return jsonify(results)
     except Exception as exc:
         logger.exception("nodes failed for project=%s type=%s", project, node_type)
+        return _error(str(exc))
+
+
+@app.route("/api/nodes/expiring", methods=["GET"])
+@require_auth
+@require_scope("read")
+def nodes_expiring():
+    """Find nodes with valid_until set that are expiring soon or already expired.
+
+    Query params:
+        project: project id (default: "default")
+        horizon: days ahead to look (default: 30)
+        limit: max results (default: 100)
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+    try:
+        horizon = int(request.args.get("horizon", 30))
+    except (TypeError, ValueError):
+        horizon = 30
+    horizon = max(1, min(horizon, 365))
+    try:
+        limit = int(request.args.get("limit", 100))
+    except (TypeError, ValueError):
+        limit = 100
+    limit = max(1, min(limit, MAX_NODES_LIMIT))
+
+    try:
+        results = adapter.query_expiring(
+            project_id=project, horizon_days=horizon, limit=limit,
+        )
+        return jsonify({"expiring": results, "horizon_days": horizon,
+                        "total": len(results)})
+    except Exception as exc:
+        logger.exception("nodes_expiring failed for project=%s", project)
         return _error(str(exc))
 
 
@@ -1738,16 +1982,18 @@ def ingest_text():
         return denied
     source = body.get("source") or "text_ingestion"
 
-    api_key = _get_openai_key()
-    if not api_key:
+    # Check provider-specific prerequisites
+    provider_info = get_provider_info()
+    if provider_info["provider"] == "openai" and not _get_openai_key():
         return _error(
-            "OPENAI_API_KEY not configured. Set it in .env or environment.",
+            "OPENAI_API_KEY not configured. Set it in .env or environment, "
+            "or switch to Bedrock provider (MERKRAUM_LLM_PROVIDER=bedrock).",
             503,
         )
 
-    # Step 1: LLM extraction
+    # Step 1: LLM extraction (provider-agnostic via merkraum_llm)
     try:
-        extracted = _llm_extract(text, api_key)
+        extracted = _llm_extract_text(text)
     except urllib.error.HTTPError as exc:
         logger.exception("LLM extraction HTTP error")
         return _error(f"LLM extraction failed: HTTP {exc.code}", 502)
@@ -2121,6 +2367,250 @@ def revoke_token(token_prefix: str):
 
 
 # ---------------------------------------------------------------------------
+# Dreaming — async graph dreaming with SSE progress streaming
+# ---------------------------------------------------------------------------
+
+from merkraum_dreaming import dream as _dream_engine
+
+# In-memory dream job store (same pattern as MCP ingestion jobs)
+_dream_jobs: dict[str, dict] = {}
+_dream_jobs_lock = threading.Lock()
+_dream_queue: queue.Queue | None = None
+MAX_DREAM_JOBS = 20
+
+
+def _ensure_dream_worker():
+    """Lazy-create the dreaming background worker thread."""
+    global _dream_queue
+    if _dream_queue is not None:
+        return
+    _dream_queue = queue.Queue()
+
+    def _worker():
+        while True:
+            job_id = _dream_queue.get()
+            _run_dream_job(job_id)
+            _dream_queue.task_done()
+
+    t = threading.Thread(target=_worker, daemon=True, name="dreaming-worker")
+    t.start()
+
+
+def _run_dream_job(job_id: str):
+    """Execute a dream session, storing progress messages for SSE streaming."""
+    with _dream_jobs_lock:
+        job = _dream_jobs.get(job_id)
+        if not job:
+            return
+        job["status"] = "running"
+
+    adp = adapter
+    if not adp:
+        with _dream_jobs_lock:
+            job["status"] = "failed"
+            job["error"] = "Backend not available"
+        return
+
+    start = time.time()
+    try:
+        gen = _dream_engine(
+            adp,
+            project_id=job["project_id"],
+            phases=job.get("phases"),
+            replay_hops=job.get("replay_hops", 5),
+            replay_walks=job.get("replay_walks", 3),
+            consolidation_threshold=job.get("consolidation_threshold", 0.75),
+            consolidation_dry_run=job.get("consolidation_dry_run", False),
+            seed=job.get("seed"),
+        )
+        result = None
+        try:
+            while True:
+                progress = next(gen)
+                with _dream_jobs_lock:
+                    job.setdefault("messages", []).append(progress)
+        except StopIteration as e:
+            result = e.value
+
+        with _dream_jobs_lock:
+            job["status"] = "completed"
+            job["result"] = result or {}
+            job["duration_ms"] = int((time.time() - start) * 1000)
+    except Exception as e:
+        logger.error("Dream job %s failed: %s", job_id, e, exc_info=True)
+        with _dream_jobs_lock:
+            job["status"] = "failed"
+            job["error"] = str(e)
+            job["duration_ms"] = int((time.time() - start) * 1000)
+
+
+@app.route("/api/dream", methods=["POST"])
+@require_auth
+@require_scope("write")
+def dream_trigger():
+    """Trigger a dream session (async). Returns job_id for status polling / SSE.
+
+    Request body (all optional):
+        phases: ["replay", "consolidation", "reflection"]
+        replay_hops: int (default 5)
+        replay_walks: int (default 3)
+        consolidation_threshold: float (default 0.75)
+        consolidation_dry_run: bool (default false)
+        seed: str (optional starting entity for replay)
+    """
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    body = request.get_json(silent=True) or {}
+
+    # Limit concurrent dream jobs per project
+    with _dream_jobs_lock:
+        active = [j for j in _dream_jobs.values()
+                  if j["project_id"] == project and j["status"] in ("queued", "running")]
+        if active:
+            return _error("A dream session is already running for this project", 409)
+
+        # Evict old jobs
+        if len(_dream_jobs) >= MAX_DREAM_JOBS:
+            oldest = sorted(_dream_jobs.keys(),
+                            key=lambda k: _dream_jobs[k].get("created_at", "")
+                            )[:MAX_DREAM_JOBS // 2]
+            for k in oldest:
+                if _dream_jobs[k]["status"] not in ("queued", "running"):
+                    del _dream_jobs[k]
+
+        import uuid
+        job_id = str(uuid.uuid4())[:12]
+        _dream_jobs[job_id] = {
+            "job_id": job_id,
+            "project_id": project,
+            "status": "queued",
+            "created_at": time.time(),
+            "messages": [],
+            "phases": body.get("phases"),
+            "replay_hops": min(body.get("replay_hops", 5), 10),
+            "replay_walks": min(body.get("replay_walks", 3), 5),
+            "consolidation_threshold": body.get("consolidation_threshold", 0.75),
+            "consolidation_dry_run": body.get("consolidation_dry_run", False),
+            "seed": body.get("seed"),
+        }
+
+    _ensure_dream_worker()
+    _dream_queue.put(job_id)
+
+    return jsonify({"job_id": job_id, "status": "queued"}), 202
+
+
+@app.route("/api/dream/status", methods=["GET"])
+@require_auth
+@require_scope("read")
+def dream_status():
+    """Check dream session status. Query param: job_id (required).
+
+    Returns status, messages since last_index, and result if complete.
+    Query params:
+        job_id: str (required)
+        since: int (message index to start from, for incremental polling)
+    """
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return _error("job_id parameter required", 400)
+
+    with _dream_jobs_lock:
+        job = _dream_jobs.get(job_id)
+        if not job:
+            return _error("Dream job not found", 404)
+
+        project = job["project_id"]
+        denied = _deny_if_project_forbidden(project)
+        if denied:
+            return denied
+
+        since = int(request.args.get("since", 0))
+        messages = job.get("messages", [])[since:]
+
+        resp = {
+            "job_id": job_id,
+            "status": job["status"],
+            "messages": messages,
+            "message_count": len(job.get("messages", [])),
+        }
+        if job["status"] == "completed":
+            resp["result"] = job.get("result", {})
+            resp["duration_ms"] = job.get("duration_ms")
+        elif job["status"] == "failed":
+            resp["error"] = job.get("error")
+
+    return jsonify(resp)
+
+
+@app.route("/api/dream/stream", methods=["GET"])
+@require_auth
+@require_scope("read")
+def dream_stream():
+    """SSE (Server-Sent Events) stream of dream progress messages.
+
+    Query param: job_id (required).
+    Streams messages as they arrive, then sends a 'complete' event.
+    """
+    from flask import Response
+
+    job_id = request.args.get("job_id")
+    if not job_id:
+        return _error("job_id parameter required", 400)
+
+    with _dream_jobs_lock:
+        job = _dream_jobs.get(job_id)
+        if not job:
+            return _error("Dream job not found", 404)
+
+        project = job["project_id"]
+        denied = _deny_if_project_forbidden(project)
+        if denied:
+            return denied
+
+    def generate():
+        last_index = 0
+        while True:
+            with _dream_jobs_lock:
+                job = _dream_jobs.get(job_id)
+                if not job:
+                    yield f"data: {json.dumps({'event': 'error', 'detail': 'Job not found'})}\n\n"
+                    return
+
+                messages = job.get("messages", [])[last_index:]
+                status = job["status"]
+
+            for msg in messages:
+                yield f"data: {json.dumps(msg)}\n\n"
+                last_index += 1
+
+            if status == "completed":
+                with _dream_jobs_lock:
+                    result = job.get("result", {})
+                yield f"data: {json.dumps({'event': 'complete', 'result': result})}\n\n"
+                return
+            elif status == "failed":
+                with _dream_jobs_lock:
+                    error = job.get("error", "Unknown error")
+                yield f"data: {json.dumps({'event': 'error', 'detail': error})}\n\n"
+                return
+
+            time.sleep(0.5)
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Startup
 # ---------------------------------------------------------------------------
 
@@ -2188,6 +2678,8 @@ def _init_pat_auth():
         logger.info("PAT validator initialized (Neo4j-backed)")
     except Exception as exc:
         logger.error("Failed to initialize PAT validator: %s", exc)
+
+
 
 
 def main():

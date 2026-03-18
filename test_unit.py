@@ -368,11 +368,12 @@ class TestGetStats(unittest.TestCase):
         self.assertIn("edges", stats)
         self.assertIn("total_nodes", stats)
         self.assertIn("total_edges", stats)
+        self.assertIn("vsm_levels", stats)
 
     def test_stats_queries_all_types(self):
         self.adapter.get_stats(project_id="test")
-        # Should query each NODE_TYPE + each RELATIONSHIP_TYPE
-        expected_calls = len(NODE_TYPES) + len(RELATIONSHIP_TYPES)
+        # Should query each NODE_TYPE + each RELATIONSHIP_TYPE + 1 VSM level query
+        expected_calls = len(NODE_TYPES) + len(RELATIONSHIP_TYPES) + 1
         self.assertEqual(self.session.run.call_count, expected_calls)
 
 

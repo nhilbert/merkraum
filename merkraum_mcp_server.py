@@ -45,7 +45,9 @@ from fastmcp.server.dependencies import get_access_token
 
 from merkraum_backend import (
     create_adapter, BackendAdapter, NODE_TYPES, RELATIONSHIP_TYPES, TIER_LIMITS,
+    VSM_LEVELS,
 )
+from merkraum_llm import llm_extract, get_provider_info
 
 # --- Configuration ---
 
@@ -83,9 +85,9 @@ DEFAULT_PROJECT = os.environ.get("MERKRAUM_PROJECT", "default")
 HTTP_PORT = int(os.environ.get("MERKRAUM_MCP_PORT", "8090"))
 HTTP_HOST = os.environ.get("MERKRAUM_MCP_HOST", "127.0.0.1")
 
-# LLM for knowledge extraction (optional)
+# LLM for knowledge extraction — now configurable via merkraum_llm module
+# Legacy OPENAI_API_KEY still read for backward compatibility when provider=openai
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-EXTRACTION_MODEL = os.environ.get("MERKRAUM_EXTRACTION_MODEL", "gpt-4o-mini")
 
 # --- Logging ---
 
@@ -269,15 +271,83 @@ def audit_log(tool_name: str, sub: str, params: dict,
     logger.info("AUDIT %s", json.dumps(entry))
 
 
+# --- PAT Validation ---
+
+PAT_PREFIX = "mk_pat_"
+
+def _validate_pat(token: str) -> dict | None:
+    """Validate a Personal Access Token against Neo4j. Returns metadata or None."""
+    import hashlib
+    adapter = _get_adapter()
+    driver = getattr(adapter, "_driver", None)
+    if not driver:
+        logger.warning("PAT validation: no Neo4j driver available")
+        return None
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    with driver.session() as session:
+        result = session.run(
+            """
+            MATCH (t:PersonalAccessToken {token_hash: $hash})
+            WHERE t.revoked = false
+              AND (t.expires_at IS NULL OR datetime(t.expires_at) > datetime())
+            SET t.last_used_at = toString(datetime())
+            RETURN t.token_prefix AS token_prefix,
+                   t.name AS name,
+                   t.owner_id AS owner_id,
+                   t.scopes AS scopes,
+                   t.projects AS projects,
+                   t.all_projects AS all_projects,
+                   t.expires_at AS expires_at
+            """,
+            hash=token_hash,
+        ).single()
+        if not result:
+            return None
+        return dict(result)
+
+
 # --- Token Verifier ---
 
 class CognitoTokenVerifier(TokenVerifier):
-    """Validates Cognito JWT access tokens."""
+    """Validates Cognito JWT access tokens and Personal Access Tokens (mk_pat_)."""
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Called by FastMCP for every authenticated request."""
         if not token:
             return None
+
+        # PAT tokens: validate against Neo4j
+        if token.startswith(PAT_PREFIX):
+            try:
+                pat_meta = await asyncio.get_event_loop().run_in_executor(
+                    None, _validate_pat, token
+                )
+                if not pat_meta:
+                    logger.warning("PAT validation failed: token not found or expired")
+                    return None
+                scopes = pat_meta.get("scopes") or []
+                if isinstance(scopes, str):
+                    scopes = scopes.split(",")
+                logger.info("PAT authenticated: owner=%s name=%s",
+                            pat_meta.get("owner_id", "?"), pat_meta.get("name", "?"))
+                return AccessToken(
+                    token=token,
+                    client_id=f"pat:{pat_meta.get('owner_id', 'unknown')}",
+                    scopes=scopes,
+                    expires_at=None,
+                    claims={
+                        "sub": pat_meta.get("owner_id", "unknown"),
+                        "token_type": "pat",
+                        "pat_name": pat_meta.get("name", ""),
+                        "projects": pat_meta.get("projects") or [],
+                        "all_projects": pat_meta.get("all_projects", False),
+                    },
+                )
+            except Exception as e:
+                logger.warning("PAT validation error: %s", e)
+                return None
+
+        # Cognito JWT tokens
         try:
             claims = validate_jwt(token)
             return AccessToken(
@@ -679,14 +749,17 @@ async def get_graph_stats(project: str = None) -> dict:
 @mcp.tool()
 async def query_nodes(
     node_type: str = None,
+    vsm_level: str = None,
     limit: int = 50,
     project: str = None,
 ) -> dict:
-    """Query entities in the knowledge graph, optionally filtered by type.
+    """Query entities in the knowledge graph, optionally filtered by type and VSM level.
 
     Args:
         node_type: Filter by type (Person, Organization, Project, Concept,
             Regulation, Event, Belief, Artifact, Interview, Quote). None = all.
+        vsm_level: Filter by VSM system level (S1=operational, S2=coordination,
+            S3=control, S4=strategic, S5=identity). None = all.
         limit: Max results (1-200, default 50)
         project: Project ID (default: your personal space)
     """
@@ -696,15 +769,20 @@ async def query_nodes(
         return {"error": _err}
     if node_type and node_type not in NODE_TYPES:
         return {"error": f"Unknown node_type: {node_type}. Valid: {NODE_TYPES}"}
+    if vsm_level and vsm_level not in VSM_LEVELS:
+        return {"error": f"Unknown vsm_level: {vsm_level}. Valid: {VSM_LEVELS}"}
     limit = max(1, min(200, limit))
     adapter = _get_adapter()
     start = time.time()
     try:
-        nodes = await _run_sync(adapter.query_nodes, node_type, project, limit)
+        nodes = await _run_sync(adapter.query_nodes, node_type, project, limit,
+                                vsm_level)
         audit_log("query_nodes", "authed",
-                  {"node_type": node_type, "limit": limit, "project": project},
+                  {"node_type": node_type, "vsm_level": vsm_level,
+                   "limit": limit, "project": project},
                   int((time.time() - start) * 1000), "ok")
         return {"nodes": nodes, "count": len(nodes), "node_type_filter": node_type,
+                "vsm_level_filter": vsm_level,
                 "duration_ms": int((time.time() - start) * 1000)}
     except Exception as e:
         audit_log("query_nodes", "authed",
@@ -718,6 +796,8 @@ async def add_knowledge(
     summary: str,
     node_type: str = "Concept",
     confidence: float = 0.7,
+    valid_until: str = None,
+    vsm_level: str = None,
     project: str = None,
 ) -> dict:
     """Add a single entity to the knowledge graph.
@@ -728,6 +808,9 @@ async def add_knowledge(
         node_type: One of Person, Organization, Project, Concept, Regulation,
             Event, Belief, Artifact, Interview, Quote
         confidence: For Beliefs only (0.0-1.0, default 0.7)
+        valid_until: ISO 8601 date when this knowledge expires (optional, null = no expiration)
+        vsm_level: VSM system level (S1=operational, S2=coordination, S3=control,
+            S4=strategic, S5=identity). Determines default TTL if valid_until not set.
         project: Project ID (default: your personal space)
     """
     project = _resolve_project(project)
@@ -736,10 +819,16 @@ async def add_knowledge(
         return {"error": _err}
     if node_type not in NODE_TYPES:
         return {"error": f"Unknown node_type: {node_type}. Valid: {NODE_TYPES}"}
+    if vsm_level and vsm_level not in VSM_LEVELS:
+        return {"error": f"Unknown vsm_level: {vsm_level}. Valid: {VSM_LEVELS}"}
     adapter = _get_adapter()
     entity = {"name": name, "summary": summary, "node_type": node_type}
     if node_type == "Belief":
         entity["confidence"] = max(0.0, min(1.0, confidence))
+    if valid_until:
+        entity["valid_until"] = valid_until
+    if vsm_level:
+        entity["vsm_level"] = vsm_level
     start = time.time()
     try:
         written = await _run_sync(
@@ -813,15 +902,17 @@ async def update_belief(
     confidence: float = None,
     status: str = None,
     summary: str = None,
+    valid_until: str = None,
     project: str = None,
 ) -> dict:
-    """Update an existing belief's confidence, status, or summary.
+    """Update an existing belief's confidence, status, summary, or temporal validity.
 
     Args:
         name: Belief name (must already exist)
         confidence: New confidence score (0.0-1.0). None = no change.
-        status: New status — active or superseded. None = no change.
+        status: New status — active, uncertain, contradicted, or superseded. None = no change.
         summary: New summary text. None = no change.
+        valid_until: ISO 8601 date when this belief expires (e.g. "2026-06-30"). None = no change.
         project: Project ID (default: your personal space)
     """
     project = _resolve_project(project)
@@ -834,6 +925,7 @@ async def update_belief(
         result = await _run_sync(
             adapter.update_belief, name, project,
             confidence=confidence, status=status, summary=summary,
+            valid_until=valid_until,
         )
         result["duration_ms"] = int((time.time() - start) * 1000)
         audit_log("update_belief", "authed",
@@ -921,15 +1013,22 @@ def _run_ingestion_job(job_id: str, text: str, project: str):
 
 
 def _extract_and_write(text: str, project: str = None) -> dict:
-    """Extract entities/relationships from text via LLM, write to graph."""
-    api_key = OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        return {"error": "OPENAI_API_KEY not set"}
+    """Extract entities/relationships from text via LLM, write to graph.
 
-    prompt = f"""Extract structured knowledge from this text. Return JSON:
+    Uses merkraum_llm module for provider-agnostic extraction (Bedrock or OpenAI).
+    """
+    provider_info = get_provider_info()
+    if provider_info["provider"] == "openai":
+        api_key = OPENAI_API_KEY or os.environ.get("OPENAI_API_KEY", "")
+        if not api_key:
+            return {"error": "OPENAI_API_KEY not set (or switch to MERKRAUM_LLM_PROVIDER=bedrock)"}
+    else:
+        api_key = None
+
+    system_prompt = f"""Extract structured knowledge from this text. Return JSON:
 {{
   "entities": [
-    {{"name": "...", "node_type": "...", "summary": "..."}}
+    {{"name": "...", "node_type": "...", "summary": "...", "vsm_level": "S1|S2|S3|S4|S5|null"}}
   ],
   "relationships": [
     {{"source": "...", "target": "...", "type": "...", "reason": "..."}}
@@ -938,30 +1037,21 @@ def _extract_and_write(text: str, project: str = None) -> dict:
 
 Valid node_types: {json.dumps(NODE_TYPES)}
 Valid relationship types: {json.dumps(RELATIONSHIP_TYPES)}
+VSM levels (optional, classify by organizational function):
+- S1 (Operational): task data, current values, in-progress notes
+- S2 (Coordination): rules, procedures, process descriptions
+- S3 (Control): metrics, quality assessments, priorities
+- S4 (Strategic): environmental models, competitive intel, research
+- S5 (Identity): core values, policies, identity claims"""
 
-Text:
-{text[:8000]}"""
+    user_prompt = f"Extract structured knowledge from this text:\n\n{text[:8000]}"
 
-    req_body = json.dumps({
-        "model": EXTRACTION_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-        "temperature": 0.1,
-        "response_format": {"type": "json_object"},
-    }).encode()
-
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=req_body,
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
+    extracted = llm_extract(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.1,
+        api_key=api_key,
     )
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        data = json.loads(resp.read())
-
-    content = data["choices"][0]["message"]["content"]
-    extracted = json.loads(content)
 
     adapter = _get_adapter()
     entities = extracted.get("entities", [])
@@ -975,10 +1065,13 @@ Text:
         name = ent.get("name", "")
         summary = ent.get("summary", "")
         if name:
+            vec_meta = {"name": name, "node_type": ent.get("node_type", "Concept"),
+                        "source": "extraction"}
+            if ent.get("vsm_level"):
+                vec_meta["vsm_level"] = ent["vsm_level"]
             adapter.vector_upsert(
                 f"{project}:{name}", f"{name}: {summary}",
-                {"name": name, "node_type": ent.get("node_type", "Concept"),
-                 "source": "extraction"}, project,
+                vec_meta, project,
             )
 
     return {
