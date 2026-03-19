@@ -452,7 +452,8 @@ class Neo4jBaseAdapter(BackendAdapter):
                 )
 
     def write_entities(self, entities, source_cycle, source_type="extraction",
-                       project_id="default", node_limit=None):
+                       project_id="default", node_limit=None,
+                       actor="ingestion"):
         if node_limit is not None and entities:
             usage = self.get_usage(project_id)
             if usage["nodes"] + len(entities) > node_limit:
@@ -461,7 +462,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                     limit=node_limit,
                     attempted=len(entities),
                 )
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         written = 0
         with self._driver.session() as session:
             for ent in entities:
@@ -493,54 +494,96 @@ class Neo4jBaseAdapter(BackendAdapter):
                         valid_until=valid_until,
                         vsm_level=vsm_level,
                     )
-                    if node_type == "Belief":
-                        params["confidence"] = ent.get("confidence", 0.7)
-                        session.run(
-                            """
-                            MERGE (n:Belief {name: $name, project_id: $project_id})
-                            ON CREATE SET
-                                n.summary = $summary, n.created_at = $now,
-                                n.updated_at = $now, n.source_cycle = $source_cycle,
-                                n.source_type = $source_type, n.active = true,
-                                n.status = 'active', n.confidence = $confidence,
-                                n.project_id = $project_id, n.node_id = $node_id,
-                                n.valid_until = $valid_until,
-                                n.vsm_level = $vsm_level
-                            ON MATCH SET
-                                n.summary = $summary, n.updated_at = $now,
-                                n.node_id = coalesce(n.node_id, $node_id),
-                                n.confidence = CASE WHEN $confidence > n.confidence
-                                    THEN $confidence ELSE n.confidence END,
-                                n.valid_until = CASE WHEN $valid_until IS NOT NULL
-                                    THEN $valid_until ELSE n.valid_until END,
-                                n.vsm_level = CASE WHEN $vsm_level IS NOT NULL
-                                    THEN $vsm_level ELSE n.vsm_level END
-                            """,
-                            **params,
-                        )
-                    else:
-                        session.run(
+
+                    tx = session.begin_transaction()
+                    try:
+                        # Capture before-state (None if entity is new)
+                        before_rec = tx.run(
                             f"""
-                            MERGE (n:{node_type} {{name: $name, project_id: $project_id}})
-                            ON CREATE SET
-                                n.summary = $summary, n.created_at = $now,
-                                n.updated_at = $now, n.source_cycle = $source_cycle,
-                                n.source_type = $source_type,
-                                n.project_id = $project_id, n.node_id = $node_id,
-                                n.valid_until = $valid_until,
-                                n.vsm_level = $vsm_level
-                            ON MATCH SET
-                                n.summary = CASE WHEN size($summary) > size(coalesce(n.summary, ''))
-                                    THEN $summary ELSE n.summary END,
-                                n.node_id = coalesce(n.node_id, $node_id),
-                                n.updated_at = $now,
-                                n.valid_until = CASE WHEN $valid_until IS NOT NULL
-                                    THEN $valid_until ELSE n.valid_until END,
-                                n.vsm_level = CASE WHEN $vsm_level IS NOT NULL
-                                    THEN $vsm_level ELSE n.vsm_level END
+                            MATCH (n:{node_type} {{name: $name, project_id: $project_id}})
+                            RETURN properties(n) AS props
                             """,
-                            **params,
-                        )
+                            name=ent["name"],
+                            project_id=project_id,
+                        ).single()
+                        before_state = dict(before_rec["props"]) if before_rec else None
+                        action = "update_entity" if before_state else "create_entity"
+
+                        if node_type == "Belief":
+                            params["confidence"] = ent.get("confidence", 0.7)
+                            tx.run(
+                                """
+                                MERGE (n:Belief {name: $name, project_id: $project_id})
+                                ON CREATE SET
+                                    n.summary = $summary, n.created_at = $now,
+                                    n.updated_at = $now, n.source_cycle = $source_cycle,
+                                    n.source_type = $source_type, n.active = true,
+                                    n.status = 'active', n.confidence = $confidence,
+                                    n.project_id = $project_id, n.node_id = $node_id,
+                                    n.valid_until = $valid_until,
+                                    n.vsm_level = $vsm_level
+                                ON MATCH SET
+                                    n.summary = $summary, n.updated_at = $now,
+                                    n.node_id = coalesce(n.node_id, $node_id),
+                                    n.confidence = CASE WHEN $confidence > n.confidence
+                                        THEN $confidence ELSE n.confidence END,
+                                    n.valid_until = CASE WHEN $valid_until IS NOT NULL
+                                        THEN $valid_until ELSE n.valid_until END,
+                                    n.vsm_level = CASE WHEN $vsm_level IS NOT NULL
+                                        THEN $vsm_level ELSE n.vsm_level END
+                                """,
+                                **params,
+                            )
+                        else:
+                            tx.run(
+                                f"""
+                                MERGE (n:{node_type} {{name: $name, project_id: $project_id}})
+                                ON CREATE SET
+                                    n.summary = $summary, n.created_at = $now,
+                                    n.updated_at = $now, n.source_cycle = $source_cycle,
+                                    n.source_type = $source_type,
+                                    n.project_id = $project_id, n.node_id = $node_id,
+                                    n.valid_until = $valid_until,
+                                    n.vsm_level = $vsm_level
+                                ON MATCH SET
+                                    n.summary = CASE WHEN size($summary) > size(coalesce(n.summary, ''))
+                                        THEN $summary ELSE n.summary END,
+                                    n.node_id = coalesce(n.node_id, $node_id),
+                                    n.updated_at = $now,
+                                    n.valid_until = CASE WHEN $valid_until IS NOT NULL
+                                        THEN $valid_until ELSE n.valid_until END,
+                                    n.vsm_level = CASE WHEN $vsm_level IS NOT NULL
+                                        THEN $vsm_level ELSE n.vsm_level END
+                                """,
+                                **params,
+                            )
+
+                        # Log the operation
+                        op_id = self._operation_id()
+                        payload = {
+                            "name": ent["name"],
+                            "node_type": node_type,
+                            "source_cycle": source_cycle,
+                            "source_type": source_type,
+                        }
+                        after_payload = {
+                            "name": ent["name"],
+                            "node_type": node_type,
+                            "summary": ent.get("summary", ""),
+                        }
+                        self._log_history(tx, op_id, ent["name"], project_id,
+                                          action,
+                                          before_state if before_state else payload,
+                                          actor)
+                        self._log_operation(tx, op_id, "entity_upsert", actor,
+                                            project_id, payload=payload,
+                                            before_state=before_state,
+                                            after_state=after_payload)
+                        tx.commit()
+                    except Exception as inner_exc:
+                        tx.rollback()
+                        raise inner_exc
+
                     vec_meta = {
                         "name": ent["name"],
                         "node_type": node_type,
@@ -577,8 +620,8 @@ class Neo4jBaseAdapter(BackendAdapter):
 
     def write_relationships(self, relationships, source_cycle,
                             source_type="extraction",
-                            project_id="default"):
-        now = datetime.now().isoformat()
+                            project_id="default", actor="ingestion"):
+        now = datetime.now(timezone.utc).isoformat()
         written = 0
         with self._driver.session() as session:
             for rel in relationships:
@@ -599,42 +642,89 @@ class Neo4jBaseAdapter(BackendAdapter):
                         valid_from=rel.get("valid_from", now),
                         valid_until=valid_until,
                     )
-                    cypher = f"""
-                    MATCH (a {{name: $source, project_id: $project_id}})
-                    MATCH (b {{name: $target, project_id: $project_id}})
-                    MERGE (a)-[r:{rel_type}]->(b)
-                    ON CREATE SET
-                        r.confidence = $confidence, r.reason = $reason,
-                        r.source_cycle = $source_cycle, r.source_type = $source_type,
-                        r.created_at = $now, r.active = true,
-                        r.weight = $confidence, r.valid_from = $valid_from,
-                        r.valid_until = $valid_until, r.expired_at = null
-                    ON MATCH SET
-                        r.confidence = CASE WHEN $confidence > r.confidence
-                            THEN $confidence ELSE r.confidence END,
-                        r.updated_at = $now,
-                        r.weight = CASE WHEN $confidence > r.weight
-                            THEN $confidence ELSE r.weight END
-                    """
-                    result = session.run(cypher, **params)
-                    summary = result.consume()
-                    if summary.counters.relationships_created > 0:
-                        written += 1
-                        if rel_type in SYMMETRIC_TYPES:
-                            inverse = f"""
-                            MATCH (a {{name: $target, project_id: $project_id}})
-                            MATCH (b {{name: $source, project_id: $project_id}})
-                            MERGE (a)-[r:{rel_type}]->(b)
-                            ON CREATE SET
-                                r.confidence = $confidence, r.reason = $reason,
-                                r.source_cycle = $source_cycle,
-                                r.source_type = $source_type,
-                                r.created_at = $now, r.active = true,
-                                r.weight = $confidence, r.valid_from = $valid_from
-                            """
-                            session.run(inverse, **params)
-                    elif summary.counters.properties_set > 0:
-                        written += 1
+
+                    tx = session.begin_transaction()
+                    try:
+                        # Capture before-state of relationship if it exists
+                        before_rec = tx.run(
+                            f"""
+                            MATCH (a {{name: $source, project_id: $project_id}})
+                                  -[r:{rel_type}]->
+                                  (b {{name: $target, project_id: $project_id}})
+                            RETURN properties(r) AS props
+                            """,
+                            source=rel["source"],
+                            target=rel["target"],
+                            project_id=project_id,
+                        ).single()
+                        before_state = dict(before_rec["props"]) if before_rec else None
+
+                        cypher = f"""
+                        MATCH (a {{name: $source, project_id: $project_id}})
+                        MATCH (b {{name: $target, project_id: $project_id}})
+                        MERGE (a)-[r:{rel_type}]->(b)
+                        ON CREATE SET
+                            r.confidence = $confidence, r.reason = $reason,
+                            r.source_cycle = $source_cycle, r.source_type = $source_type,
+                            r.created_at = $now, r.active = true,
+                            r.weight = $confidence, r.valid_from = $valid_from,
+                            r.valid_until = $valid_until, r.expired_at = null
+                        ON MATCH SET
+                            r.confidence = CASE WHEN $confidence > r.confidence
+                                THEN $confidence ELSE r.confidence END,
+                            r.updated_at = $now,
+                            r.weight = CASE WHEN $confidence > r.weight
+                                THEN $confidence ELSE r.weight END
+                        """
+                        result = tx.run(cypher, **params)
+                        summary = result.consume()
+
+                        # Log the operation
+                        op_id = self._operation_id()
+                        rel_name = f"{rel['source']}->{rel['target']}:{rel_type}"
+                        payload = {
+                            "source": rel["source"],
+                            "target": rel["target"],
+                            "type": rel_type,
+                            "confidence": rel.get("confidence", 0.7),
+                            "reason": rel.get("reason", ""),
+                        }
+                        action = "update_relationship" if before_state else "create_relationship"
+
+                        if summary.counters.relationships_created > 0:
+                            written += 1
+                            self._log_history(tx, op_id, rel_name, project_id,
+                                              action, payload, actor)
+                            self._log_operation(tx, op_id, "relationship_upsert",
+                                                actor, project_id, payload=payload,
+                                                before_state=before_state,
+                                                after_state=payload)
+                            if rel_type in SYMMETRIC_TYPES:
+                                inverse = f"""
+                                MATCH (a {{name: $target, project_id: $project_id}})
+                                MATCH (b {{name: $source, project_id: $project_id}})
+                                MERGE (a)-[r:{rel_type}]->(b)
+                                ON CREATE SET
+                                    r.confidence = $confidence, r.reason = $reason,
+                                    r.source_cycle = $source_cycle,
+                                    r.source_type = $source_type,
+                                    r.created_at = $now, r.active = true,
+                                    r.weight = $confidence, r.valid_from = $valid_from
+                                """
+                                tx.run(inverse, **params)
+                        elif summary.counters.properties_set > 0:
+                            written += 1
+                            self._log_history(tx, op_id, rel_name, project_id,
+                                              action, before_state or payload, actor)
+                            self._log_operation(tx, op_id, "relationship_upsert",
+                                                actor, project_id, payload=payload,
+                                                before_state=before_state,
+                                                after_state=payload)
+
+                        tx.commit()
+                    except Exception as inner_exc:
+                        tx.rollback()
+                        raise inner_exc
                 except Exception as e:
                     logger.warning("Relationship write failed %s->%s: %s",
                                    rel.get("source"), rel.get("target"), e)
@@ -1054,7 +1144,8 @@ class Neo4jBaseAdapter(BackendAdapter):
         return stats
 
     def update_belief(self, name, project_id="default", confidence=None,
-                      status=None, summary=None, valid_until=None):
+                      status=None, summary=None, valid_until=None,
+                      actor="api"):
         valid_statuses = ("active", "superseded")
         if status is not None and status not in valid_statuses:
             return {"updated": False, "name": name,
@@ -1062,7 +1153,7 @@ class Neo4jBaseAdapter(BackendAdapter):
         if confidence is not None:
             confidence = max(0.0, min(1.0, float(confidence)))
 
-        now = datetime.now().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         changes = {}
         set_clauses = ["b.updated_at = $now"]
 
@@ -1086,24 +1177,57 @@ class Neo4jBaseAdapter(BackendAdapter):
         if not changes:
             return {"updated": False, "name": name, "error": "No changes specified"}
 
-        cypher = f"""
-        MATCH (b:Belief {{name: $name, project_id: $pid}})
-        SET {', '.join(set_clauses)}
-        RETURN b.name AS name
-        """
+        op_id = self._operation_id()
         with self._driver.session() as session:
-            result = session.run(
-                cypher, name=name, pid=project_id, now=now,
-                confidence=confidence, status=status, summary=summary,
-                valid_until=valid_until,
-            )
-            record = result.single()
+            tx = session.begin_transaction()
+            try:
+                # Capture before-state
+                before_rec = tx.run(
+                    """
+                    MATCH (b:Belief {name: $name, project_id: $pid})
+                    RETURN b.confidence AS confidence, b.status AS status,
+                           b.summary AS summary, b.valid_until AS valid_until,
+                           b.active AS active, b.updated_at AS updated_at
+                    """,
+                    name=name, pid=project_id,
+                ).single()
 
-        if record is None:
-            return {"updated": False, "name": name,
-                    "error": f"Belief '{name}' not found in project '{project_id}'"}
+                if before_rec is None:
+                    tx.rollback()
+                    return {"updated": False, "name": name,
+                            "error": f"Belief '{name}' not found in project '{project_id}'"}
 
-        return {"updated": True, "name": name, "changes": changes}
+                before_state = dict(before_rec)
+
+                # Apply changes
+                cypher = f"""
+                MATCH (b:Belief {{name: $name, project_id: $pid}})
+                SET {', '.join(set_clauses)}
+                RETURN b.confidence AS confidence, b.status AS status,
+                       b.summary AS summary, b.valid_until AS valid_until,
+                       b.active AS active, b.updated_at AS updated_at
+                """
+                after_rec = tx.run(
+                    cypher, name=name, pid=project_id, now=now,
+                    confidence=confidence, status=status, summary=summary,
+                    valid_until=valid_until,
+                ).single()
+
+                after_state = dict(after_rec) if after_rec else None
+
+                # Log operation and history
+                self._log_history(tx, op_id, name, project_id,
+                                  "update_belief", before_state, actor)
+                self._log_operation(tx, op_id, "update_belief", actor,
+                                    project_id, payload=changes,
+                                    before_state=before_state,
+                                    after_state=after_state)
+                tx.commit()
+                return {"updated": True, "name": name, "changes": changes,
+                        "operation_id": op_id}
+            except Exception as exc:
+                tx.rollback()
+                return {"updated": False, "name": name, "error": str(exc)}
 
     def add_relationship(self, source, target, rel_type, project_id="default",
                          reason="", confidence=0.7,

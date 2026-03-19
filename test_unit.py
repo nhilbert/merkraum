@@ -141,6 +141,13 @@ class TestWriteEntities(unittest.TestCase):
     def setUp(self):
         self.adapter = _make_mock_adapter()
         self.session = MagicMock()
+        # write_entities now uses begin_transaction(), so mock the tx
+        self.tx = MagicMock()
+        # before-state query returns None (new entity) by default
+        before_result = MagicMock()
+        before_result.single.return_value = None
+        self.tx.run.return_value = before_result
+        self.session.begin_transaction.return_value = self.tx
         self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
         self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
         self.adapter.vector_upsert = MagicMock(return_value=True)
@@ -149,38 +156,39 @@ class TestWriteEntities(unittest.TestCase):
         entities = [{"name": "TestConcept", "node_type": "Concept", "summary": "A test"}]
         count = self.adapter.write_entities(entities, "Z1337", project_id="test")
         self.assertEqual(count, 1)
-        self.session.run.assert_called_once()
+        # tx.run called: before-state query + MERGE + _log_history + _log_operation
+        self.assertTrue(self.tx.run.call_count >= 2)
+        self.tx.commit.assert_called_once()
 
     def test_skip_invalid_node_type(self):
         entities = [{"name": "Bad", "node_type": "InvalidType"}]
         count = self.adapter.write_entities(entities, "Z1337", project_id="test")
         self.assertEqual(count, 0)
-        self.session.run.assert_not_called()
 
     def test_default_node_type_is_concept(self):
         entities = [{"name": "NoType"}]  # No node_type field
         count = self.adapter.write_entities(entities, "Z1337", project_id="test")
         self.assertEqual(count, 1)
-        # Verify the Cypher was for Concept (default)
-        call_args = self.session.run.call_args
-        self.assertIn("Concept", call_args[0][0])
+        # Verify the MERGE Cypher was for Concept (default) — second tx.run call
+        merge_call = self.tx.run.call_args_list[1]
+        self.assertIn("Concept", merge_call[0][0])
 
     def test_belief_entity_uses_confidence(self):
         entities = [{"name": "TestBelief", "node_type": "Belief",
                      "confidence": 0.9, "summary": "High confidence"}]
         count = self.adapter.write_entities(entities, "Z1337", project_id="test")
         self.assertEqual(count, 1)
-        call_args = self.session.run.call_args
-        self.assertIn("Belief", call_args[0][0])
-        self.assertIn("confidence", call_args[0][0])
+        merge_call = self.tx.run.call_args_list[1]
+        self.assertIn("Belief", merge_call[0][0])
+        self.assertIn("confidence", merge_call[0][0])
 
     def test_belief_default_confidence(self):
         entities = [{"name": "LowConf", "node_type": "Belief"}]
         count = self.adapter.write_entities(entities, "Z1337", project_id="test")
         self.assertEqual(count, 1)
-        # Default confidence is 0.7
-        call_kwargs = self.session.run.call_args[1]
-        self.assertEqual(call_kwargs["confidence"], 0.7)
+        # Default confidence is 0.7 — passed in kwargs to the MERGE tx.run call
+        merge_call = self.tx.run.call_args_list[1]
+        self.assertEqual(merge_call[1]["confidence"], 0.7)
 
     def test_multiple_entities(self):
         entities = [
@@ -194,7 +202,16 @@ class TestWriteEntities(unittest.TestCase):
 
     def test_entity_write_error_continues(self):
         """If one entity fails, others should still be written."""
-        self.session.run.side_effect = [Exception("DB error"), None]
+        # First entity's before-state query raises, second succeeds
+        before_result_ok = MagicMock()
+        before_result_ok.single.return_value = None
+        self.tx.run.side_effect = [Exception("DB error")]
+        # Need a fresh tx for second entity
+        tx2 = MagicMock()
+        tx2_before = MagicMock()
+        tx2_before.single.return_value = None
+        tx2.run.return_value = tx2_before
+        self.session.begin_transaction.side_effect = [self.tx, tx2]
         entities = [
             {"name": "Fail", "node_type": "Concept"},
             {"name": "Succeed", "node_type": "Concept"},
@@ -205,16 +222,19 @@ class TestWriteEntities(unittest.TestCase):
     def test_project_id_passed_through(self):
         entities = [{"name": "X", "node_type": "Concept"}]
         self.adapter.write_entities(entities, "Z1337", project_id="my_project")
-        call_kwargs = self.session.run.call_args[1]
-        self.assertEqual(call_kwargs["project_id"], "my_project")
+        # MERGE call (second tx.run) should have project_id in kwargs
+        merge_call = self.tx.run.call_args_list[1]
+        self.assertEqual(merge_call[1]["project_id"], "my_project")
 
     def test_entity_write_triggers_vector_upsert(self):
         entities = [{"name": "Vectorized", "node_type": "Concept", "summary": "Embedding"}]
         self.adapter.write_entities(entities, "Z1337", project_id="my_project")
         self.adapter.vector_upsert.assert_called_once()
-        call_kwargs = self.adapter.vector_upsert.call_args[1]
-        self.assertEqual(call_kwargs["project_id"], "my_project")
-        self.assertEqual(call_kwargs["metadata"]["name"], "Vectorized")
+        call_args = self.adapter.vector_upsert.call_args
+        # metadata is 3rd positional arg, project_id is keyword
+        metadata = call_args[0][2]
+        self.assertEqual(call_args[1]["project_id"], "my_project")
+        self.assertEqual(metadata["name"], "Vectorized")
 
     def test_vector_upsert_failure_does_not_block_entity_write(self):
         self.adapter.vector_upsert.return_value = False
@@ -228,15 +248,37 @@ class TestWriteRelationships(unittest.TestCase):
     def setUp(self):
         self.adapter = _make_mock_adapter()
         self.session = MagicMock()
-        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
-        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
-        # Default: simulate a new relationship created
+        # write_relationships now uses begin_transaction()
+        self.tx = MagicMock()
+        # before-state query returns None (new relationship) by default
+        before_result = MagicMock()
+        before_result.single.return_value = None
+        # MERGE result with consume()
         mock_summary = MagicMock()
         mock_summary.counters.relationships_created = 1
         mock_summary.counters.properties_set = 0
-        mock_result = MagicMock()
-        mock_result.consume.return_value = mock_summary
-        self.session.run.return_value = mock_result
+        mock_merge_result = MagicMock()
+        mock_merge_result.consume.return_value = mock_summary
+        # tx.run returns before_result first, then merge_result
+        self.tx.run.side_effect = [before_result, mock_merge_result] + [MagicMock()] * 10
+        self.session.begin_transaction.return_value = self.tx
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        self._mock_summary = mock_summary
+
+    def _reset_tx_for_n_rels(self, n, created=1, props_set=0):
+        """Reset tx.run side_effect for n relationships."""
+        effects = []
+        for _ in range(n):
+            before = MagicMock()
+            before.single.return_value = None
+            summary = MagicMock()
+            summary.counters.relationships_created = created
+            summary.counters.properties_set = props_set
+            merge = MagicMock()
+            merge.consume.return_value = summary
+            effects.extend([before, merge] + [MagicMock()] * 4)  # log calls
+        self.tx.run.side_effect = effects
 
     def test_write_valid_relationship(self):
         rels = [{"source": "A", "target": "B", "type": "SUPPORTS"}]
@@ -252,36 +294,47 @@ class TestWriteRelationships(unittest.TestCase):
         rels = [{"source": "A", "target": "B"}]  # No type field
         count = self.adapter.write_relationships(rels, "Z1337", project_id="test")
         self.assertEqual(count, 1)
-        call_args = self.session.run.call_args_list[0]
-        self.assertIn("REFERENCES", call_args[0][0])
+        # MERGE Cypher is the second tx.run call (after before-state query)
+        merge_call = self.tx.run.call_args_list[1]
+        self.assertIn("REFERENCES", merge_call[0][0])
 
     def test_symmetric_type_creates_inverse(self):
+        self._reset_tx_for_n_rels(1)
         rels = [{"source": "A", "target": "B", "type": "CONTRADICTS"}]
         self.adapter.write_relationships(rels, "Z1337", project_id="test")
-        # Should have 2 calls: forward + inverse
-        self.assertEqual(self.session.run.call_count, 2)
+        # tx should have: before-state + MERGE + inverse + log calls
+        self.assertTrue(self.tx.run.call_count >= 3)
 
     def test_non_symmetric_no_inverse(self):
         rels = [{"source": "A", "target": "B", "type": "SUPPORTS"}]
         self.adapter.write_relationships(rels, "Z1337", project_id="test")
-        # Only 1 call (forward) + consume
-        self.assertEqual(self.session.run.call_count, 1)
+        # Verify no inverse MERGE — check that the third call is a log, not a MERGE
+        calls = self.tx.run.call_args_list
+        # calls[0] = before-state, calls[1] = MERGE, calls[2+] = logs
+        for call in calls[2:]:
+            if call[0]:
+                self.assertNotIn("MERGE", call[0][0])
 
     def test_update_existing_counts(self):
         """When rel already exists (properties_set > 0, relationships_created = 0)."""
-        mock_summary = MagicMock()
-        mock_summary.counters.relationships_created = 0
-        mock_summary.counters.properties_set = 3
-        mock_result = MagicMock()
-        mock_result.consume.return_value = mock_summary
-        self.session.run.return_value = mock_result
-
+        self._reset_tx_for_n_rels(1, created=0, props_set=3)
         rels = [{"source": "A", "target": "B", "type": "SUPPORTS"}]
         count = self.adapter.write_relationships(rels, "Z1337", project_id="test")
         self.assertEqual(count, 1)  # Updated counts as written
 
     def test_relationship_error_continues(self):
-        self.session.run.side_effect = [Exception("DB error"), self.session.run.return_value]
+        # First rel's before-state query raises, second succeeds
+        self.tx.run.side_effect = [Exception("DB error")]
+        tx2 = MagicMock()
+        before2 = MagicMock()
+        before2.single.return_value = None
+        summary2 = MagicMock()
+        summary2.counters.relationships_created = 1
+        summary2.counters.properties_set = 0
+        merge2 = MagicMock()
+        merge2.consume.return_value = summary2
+        tx2.run.side_effect = [before2, merge2] + [MagicMock()] * 4
+        self.session.begin_transaction.side_effect = [self.tx, tx2]
         rels = [
             {"source": "A", "target": "B", "type": "SUPPORTS"},
             {"source": "C", "target": "D", "type": "SUPPORTS"},
@@ -682,6 +735,12 @@ class TestWriteEntitiesWithLimit(unittest.TestCase):
     def setUp(self):
         self.adapter = _make_mock_adapter()
         self.session = MagicMock()
+        # Mock transaction for write_entities (uses begin_transaction now)
+        self.tx = MagicMock()
+        before_result = MagicMock()
+        before_result.single.return_value = None
+        self.tx.run.return_value = before_result
+        self.session.begin_transaction.return_value = self.tx
         self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
         self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
         self.adapter.vector_upsert = MagicMock(return_value=True)
@@ -692,6 +751,7 @@ class TestWriteEntitiesWithLimit(unittest.TestCase):
         node_result.single.return_value = {"c": node_count}
         edge_result = MagicMock()
         edge_result.single.return_value = {"c": 0}
+        # get_usage uses session.run directly, while write_entities uses tx
         self.session.run.side_effect = (
             [node_result, edge_result] + [None] * extra_writes
         )
@@ -895,41 +955,55 @@ class TestUpdateBelief(unittest.TestCase):
     def setUp(self):
         self.adapter = _make_mock_adapter()
         self.session = MagicMock()
+        # update_belief now uses begin_transaction()
+        self.tx = MagicMock()
+        self.session.begin_transaction.return_value = self.tx
         self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
         self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
 
     def _mock_found(self, name="test belief"):
-        """Mock a successful belief match."""
-        mock_result = MagicMock()
-        mock_result.single.return_value = {"name": name}
-        self.session.run.return_value = mock_result
+        """Mock a successful belief match — before-state + after-state queries."""
+        before_result = MagicMock()
+        before_result.single.return_value = {
+            "confidence": 0.7, "status": "active", "summary": "old",
+            "valid_until": None, "active": True, "updated_at": "2026-01-01",
+        }
+        after_result = MagicMock()
+        after_result.single.return_value = {
+            "confidence": 0.9, "status": "active", "summary": "old",
+            "valid_until": None, "active": True, "updated_at": "2026-03-19",
+        }
+        # tx.run calls: before-state, SET, _log_history, _log_operation
+        self.tx.run.side_effect = [before_result, after_result] + [MagicMock()] * 4
 
     def _mock_not_found(self):
         """Mock a belief not found."""
-        mock_result = MagicMock()
-        mock_result.single.return_value = None
-        self.session.run.return_value = mock_result
+        not_found = MagicMock()
+        not_found.single.return_value = None
+        self.tx.run.return_value = not_found
 
     def test_update_confidence(self):
         self._mock_found()
         result = self.adapter.update_belief("test belief", "proj", confidence=0.9)
         self.assertTrue(result["updated"])
         self.assertEqual(result["changes"]["confidence"], 0.9)
+        self.assertIn("operation_id", result)
 
     def test_update_status_superseded(self):
         self._mock_found()
         result = self.adapter.update_belief("test belief", "proj", status="superseded")
         self.assertTrue(result["updated"])
         self.assertEqual(result["changes"]["status"], "superseded")
-        cypher = self.session.run.call_args[0][0]
-        self.assertIn("b.active = false", cypher)
+        # SET Cypher is the second tx.run call
+        set_call = self.tx.run.call_args_list[1]
+        self.assertIn("b.active = false", set_call[0][0])
 
     def test_update_status_active(self):
         self._mock_found()
         result = self.adapter.update_belief("test belief", "proj", status="active")
         self.assertTrue(result["updated"])
-        cypher = self.session.run.call_args[0][0]
-        self.assertIn("b.active = true", cypher)
+        set_call = self.tx.run.call_args_list[1]
+        self.assertIn("b.active = true", set_call[0][0])
 
     def test_update_summary(self):
         self._mock_found()

@@ -1015,7 +1015,7 @@ async def update_belief(
         result = await _run_sync(
             adapter.update_belief, name, project,
             confidence=confidence, status=status, summary=summary,
-            valid_until=valid_until,
+            valid_until=valid_until, actor=_uid or "mcp",
         )
         result["duration_ms"] = int((time.time() - start) * 1000)
         audit_log("update_belief", "authed",
