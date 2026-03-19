@@ -2,7 +2,7 @@
 
 <!-- mcp-name: io.github.nhilbert/merkraum -->
 
-[![License: BUSL-1.1](https://img.shields.io/badge/License-BUSL--1.1-blue.svg)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
 [![MCP Compatible](https://img.shields.io/badge/MCP-compatible-green.svg)](https://modelcontextprotocol.io)
 [![EU Hosted](https://img.shields.io/badge/hosting-EU%20(Frankfurt)-blue.svg)](#)
@@ -230,7 +230,7 @@ python merkraum_mcp_server.py
 
 ## License
 
-Business Source License 1.1 (BSL 1.1). Free for personal and non-commercial use. See LICENSE for details.
+MIT License. Free for personal and commercial use. Attribution required. See [LICENSE](LICENSE) for details.
 
 ---
 
