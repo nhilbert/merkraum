@@ -1604,6 +1604,60 @@ def contradictions():
         return _error(str(exc))
 
 
+@app.route("/api/history", methods=["GET"])
+@require_auth
+@require_scope("read")
+def history():
+    """Audit history — chronological trail of all mutations.
+
+    Requires: Authorization: Bearer <token> (when AUTH_REQUIRED=true)
+
+    Query params:
+        project: project id (default: from auth context)
+        entity: filter by entity name (optional)
+        operation_type: filter by type e.g. 'update_belief', 'entity_upsert' (optional)
+        since: ISO 8601 timestamp — entries after this time (optional)
+        until: ISO 8601 timestamp — entries before this time (optional)
+        limit: max entries (default 50, max 200)
+        offset: pagination offset (default 0)
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    entity = request.args.get("entity")
+    operation_type = request.args.get("operation_type")
+    since = request.args.get("since")
+    until = request.args.get("until")
+
+    try:
+        limit = min(int(request.args.get("limit", 50)), 200)
+    except (ValueError, TypeError):
+        limit = 50
+    try:
+        offset = max(int(request.args.get("offset", 0)), 0)
+    except (ValueError, TypeError):
+        offset = 0
+
+    try:
+        result = adapter.get_history(
+            project_id=project,
+            entity_name=entity,
+            operation_type=operation_type,
+            since=since,
+            until=until,
+            limit=limit,
+            offset=offset,
+        )
+        return jsonify(result)
+    except Exception as exc:
+        logger.exception("history failed for project=%s", project)
+        return _error(str(exc))
+
+
 @app.route("/api/graph", methods=["GET"])
 @require_auth
 @require_scope("read")

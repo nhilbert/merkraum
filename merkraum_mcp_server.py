@@ -1245,6 +1245,64 @@ async def check_ingestion_status(job_id: str) -> dict:
 
 
 @mcp.tool()
+async def get_history(
+    entity_name: str = None,
+    operation_type: str = None,
+    since: str = None,
+    until: str = None,
+    limit: int = 20,
+    project: str = None,
+) -> dict:
+    """Retrieve the audit trail of mutations to the knowledge graph.
+
+    Returns chronological history of all changes (entity creates/updates,
+    belief updates, relationship changes, node merges/deletes) with
+    before/after snapshots.
+
+    Args:
+        entity_name: Filter to a specific entity (optional)
+        operation_type: Filter by type: 'update_belief', 'entity_upsert',
+            'relationship_upsert', 'add_relationship', 'delete_relationship',
+            'delete_node', 'update_node', 'merge_nodes' (optional)
+        since: ISO 8601 timestamp — only entries after this time (optional)
+        until: ISO 8601 timestamp — only entries before this time (optional)
+        limit: Max entries to return (default 20, max 200)
+        project: Project ID (default: your personal space)
+    """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    adapter = _get_adapter()
+    start = time.time()
+    try:
+        result = await _run_sync(
+            adapter.get_history,
+            project_id=project,
+            entity_name=entity_name,
+            operation_type=operation_type,
+            since=since,
+            until=until,
+            limit=min(limit, 200),
+        )
+        result["duration_ms"] = int((time.time() - start) * 1000)
+        audit_log("get_history", "authed",
+                  {"entity": entity_name or "", "type": operation_type or "",
+                   "project": project},
+                  int((time.time() - start) * 1000), "ok")
+        return result
+    except Exception as e:
+        audit_log("get_history", "authed",
+                  {"entity": entity_name or "", "project": project},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
 async def health_check() -> dict:
     """Check if the knowledge graph backends are healthy."""
     auth_ctx = _get_auth_context()

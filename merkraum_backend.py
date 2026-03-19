@@ -255,6 +255,31 @@ class BackendAdapter(ABC):
         Returns list of project metadata dicts.
         """
 
+    # --- Audit History ---
+
+    @abstractmethod
+    def get_history(self, project_id: str = "default",
+                    entity_name: Optional[str] = None,
+                    operation_type: Optional[str] = None,
+                    since: Optional[str] = None,
+                    until: Optional[str] = None,
+                    limit: int = 50,
+                    offset: int = 0) -> dict:
+        """Retrieve audit history from OperationLog and HistoryLog.
+
+        Args:
+            project_id: Scope to this project.
+            entity_name: Filter to a specific entity (matches HistoryLog.entity_name).
+            operation_type: Filter by operation type (e.g. 'update_belief', 'entity_upsert').
+            since: ISO 8601 timestamp — only entries after this time.
+            until: ISO 8601 timestamp — only entries before this time.
+            limit: Max entries to return (capped at 200).
+            offset: Pagination offset.
+
+        Returns:
+            {"entries": [...], "total": int, "limit": int, "offset": int}
+        """
+
     # --- Vector Operations ---
 
     @abstractmethod
@@ -1773,6 +1798,138 @@ class Neo4jBaseAdapter(BackendAdapter):
                         project_id=project_id,
                     )
                 return {"ok": False, "error": str(exc)}
+
+
+    # --- Audit History Implementation ---
+
+    def get_history(self, project_id="default",
+                    entity_name=None, operation_type=None,
+                    since=None, until=None,
+                    limit=50, offset=0):
+        """Retrieve audit trail from OperationLog + HistoryLog nodes."""
+        limit = min(max(1, limit), 200)
+        offset = max(0, offset)
+
+        with self._driver.session() as session:
+            # Build dynamic WHERE clauses
+            where_clauses = ["op.project_id = $project_id"]
+            params: dict = {"project_id": project_id, "limit": limit, "offset": offset}
+
+            if operation_type:
+                where_clauses.append("op.type = $operation_type")
+                params["operation_type"] = operation_type
+
+            if since:
+                where_clauses.append("op.created_at >= $since")
+                params["since"] = since
+
+            if until:
+                where_clauses.append("op.created_at <= $until")
+                params["until"] = until
+
+            where_str = " AND ".join(where_clauses)
+
+            if entity_name:
+                # Join with HistoryLog to filter by entity
+                count_query = f"""
+                    MATCH (op:OperationLog)
+                    WHERE {where_str}
+                    WITH op
+                    MATCH (h:HistoryLog {{operation_id: op.id, project_id: $project_id}})
+                    WHERE h.entity_name = $entity_name
+                    RETURN count(DISTINCT op) AS total
+                """
+                params["entity_name"] = entity_name
+
+                data_query = f"""
+                    MATCH (op:OperationLog)
+                    WHERE {where_str}
+                    WITH op
+                    MATCH (h:HistoryLog {{operation_id: op.id, project_id: $project_id}})
+                    WHERE h.entity_name = $entity_name
+                    WITH DISTINCT op, collect(h {{
+                        .entity_name, .action, .actor, .snapshot_json, .created_at
+                    }}) AS history_entries
+                    ORDER BY op.created_at DESC
+                    SKIP $offset LIMIT $limit
+                    RETURN op {{
+                        .id, .type, .actor, .project_id, .payload_json,
+                        .before_json, .after_json, .status, .created_at
+                    }} AS operation, history_entries
+                """
+            else:
+                # No entity filter — just OperationLog with optional HistoryLog
+                count_query = f"""
+                    MATCH (op:OperationLog)
+                    WHERE {where_str}
+                    RETURN count(op) AS total
+                """
+
+                data_query = f"""
+                    MATCH (op:OperationLog)
+                    WHERE {where_str}
+                    WITH op ORDER BY op.created_at DESC
+                    SKIP $offset LIMIT $limit
+                    OPTIONAL MATCH (h:HistoryLog {{operation_id: op.id, project_id: $project_id}})
+                    WITH op, collect(
+                        CASE WHEN h IS NOT NULL THEN h {{
+                            .entity_name, .action, .actor, .snapshot_json, .created_at
+                        }} ELSE null END
+                    ) AS raw_history
+                    WITH op, [x IN raw_history WHERE x IS NOT NULL] AS history_entries
+                    RETURN op {{
+                        .id, .type, .actor, .project_id, .payload_json,
+                        .before_json, .after_json, .status, .created_at
+                    }} AS operation, history_entries
+                """
+
+            # Execute count
+            count_result = session.run(count_query, **params)
+            total = count_result.single()["total"]
+
+            # Execute data query
+            records = session.run(data_query, **params)
+            entries = []
+            for rec in records:
+                op = dict(rec["operation"])
+                # Parse JSON fields for readability
+                for json_field in ("payload_json", "before_json", "after_json"):
+                    val = op.get(json_field)
+                    if val:
+                        try:
+                            op[json_field.replace("_json", "")] = json.loads(val)
+                        except (json.JSONDecodeError, TypeError):
+                            op[json_field.replace("_json", "")] = val
+                    else:
+                        op[json_field.replace("_json", "")] = None
+                    del op[json_field]
+
+                # Parse history entry snapshots
+                history = []
+                for h in rec["history_entries"]:
+                    h_dict = dict(h)
+                    snap = h_dict.get("snapshot_json")
+                    if snap:
+                        try:
+                            h_dict["snapshot"] = json.loads(snap)
+                        except (json.JSONDecodeError, TypeError):
+                            h_dict["snapshot"] = snap
+                    else:
+                        h_dict["snapshot"] = None
+                    h_dict.pop("snapshot_json", None)
+                    history.append(h_dict)
+
+                entries.append({
+                    "operation": op,
+                    "history": history,
+                })
+
+            return {
+                "entries": entries,
+                "total": total,
+                "limit": limit,
+                "offset": offset,
+            }
 
 
 class Neo4jQdrantAdapter(Neo4jBaseAdapter):
