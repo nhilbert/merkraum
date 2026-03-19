@@ -228,6 +228,14 @@ python merkraum_mcp_server.py
 - [EpistBench](docs/benchmark.md) — epistemological memory benchmark (baseline results)
 - [Security Review (2026-03)](docs/security-review-2026-03.md) — detailed application security assessment and remediation roadmap
 
+## Disclaimer
+
+This software is provided **"as is"**, without warranty of any kind, express or implied, including but not limited to the warranties of merchantability, fitness for a particular purpose, and noninfringement.
+
+**Merkraum is not a production-grade service.** It is an experimental knowledge memory layer for AI agents. Use it at your own risk. The authors and contributors are not liable for any claim, damages, or other liability arising from the use of this software. See the [LICENSE](LICENSE) file for the full legal terms.
+
+If you use Merkraum in a regulated environment (healthcare, finance, legal), you are solely responsible for ensuring compliance with applicable laws and standards. Merkraum does not provide legal, compliance, or security guarantees.
+
 ## License
 
 MIT License. Free for personal and commercial use. Attribution required. See [LICENSE](LICENSE) for details.
