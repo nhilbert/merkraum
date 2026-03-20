@@ -854,6 +854,222 @@ class Neo4jBaseAdapter(BackendAdapter):
                 results.append(entry)
         return results
 
+    def expire_nodes(self, project_id="default", dry_run=False, actor="system"):
+        """Enforce managed forgetting: mark expired nodes as inactive.
+
+        Finds all nodes where valid_until < now and expired_at is not set.
+        Sets expired_at timestamp and active=false (for Beliefs).
+        Non-destructive — nodes remain in graph with full audit trail.
+
+        Args:
+            project_id: Scope to a specific project.
+            dry_run: If True, return what would be expired without changing anything.
+            actor: Who triggered the expiration (for audit trail).
+
+        Returns:
+            dict with 'expired' list and 'total' count.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        expired_nodes = []
+        op_id = self._operation_id()
+
+        with self._driver.session() as session:
+            # Find all nodes past valid_until that haven't been expired yet
+            find_cypher = """
+            MATCH (n {project_id: $pid})
+            WHERE n.valid_until IS NOT NULL
+              AND n.valid_until < $now
+              AND n.expired_at IS NULL
+              AND any(lbl IN labels(n) WHERE lbl IN $node_types)
+            RETURN n.name AS name, n.summary AS summary,
+                   labels(n)[0] AS type, n.valid_until AS valid_until,
+                   n.node_id AS node_id, n.vsm_level AS vsm_level,
+                   n.confidence AS confidence, n.status AS status,
+                   n.active AS active
+            ORDER BY n.valid_until ASC
+            LIMIT 500
+            """
+            records = list(session.run(
+                find_cypher, pid=project_id, now=now,
+                node_types=list(NODE_TYPES),
+            ))
+
+            if dry_run:
+                for rec in records:
+                    expired_nodes.append({
+                        "name": rec["name"],
+                        "type": rec["type"],
+                        "valid_until": rec["valid_until"],
+                        "vsm_level": rec.get("vsm_level"),
+                        "summary": rec["summary"],
+                    })
+                return {"expired": expired_nodes, "total": len(expired_nodes),
+                        "dry_run": True}
+
+            # Expire each node in a transaction with audit trail
+            for rec in records:
+                name = rec["name"]
+                node_type = rec["type"]
+                tx = session.begin_transaction()
+                try:
+                    before_state = {
+                        "name": name, "type": node_type,
+                        "valid_until": rec["valid_until"],
+                        "active": rec.get("active"),
+                        "status": rec.get("status"),
+                    }
+
+                    # Set expired_at; for Beliefs also set active=false, status=expired
+                    if node_type == "Belief":
+                        tx.run(
+                            """
+                            MATCH (n:Belief {name: $name, project_id: $pid})
+                            SET n.expired_at = $now,
+                                n.active = false,
+                                n.status = 'expired',
+                                n.updated_at = $now
+                            """,
+                            name=name, pid=project_id, now=now,
+                        )
+                    else:
+                        tx.run(
+                            f"""
+                            MATCH (n:{node_type} {{name: $name, project_id: $pid}})
+                            SET n.expired_at = $now,
+                                n.updated_at = $now
+                            """,
+                            name=name, pid=project_id, now=now,
+                        )
+
+                    after_state = {
+                        "name": name, "type": node_type,
+                        "expired_at": now,
+                        "active": False if node_type == "Belief" else rec.get("active"),
+                        "status": "expired" if node_type == "Belief" else rec.get("status"),
+                    }
+
+                    self._log_history(tx, op_id, name, project_id,
+                                      "expire_node", before_state, actor)
+                    self._log_operation(tx, op_id, "expire_node", actor,
+                                        project_id,
+                                        payload={"name": name, "type": node_type,
+                                                 "valid_until": rec["valid_until"]},
+                                        before_state=before_state,
+                                        after_state=after_state)
+                    tx.commit()
+                    expired_nodes.append({
+                        "name": name, "type": node_type,
+                        "valid_until": rec["valid_until"],
+                        "vsm_level": rec.get("vsm_level"),
+                    })
+                except Exception:
+                    tx.rollback()
+                    # Continue with other nodes — don't fail entire batch
+
+        return {"expired": expired_nodes, "total": len(expired_nodes),
+                "dry_run": False, "operation_id": op_id}
+
+    def renew_node(self, name, project_id="default", extend_days=None,
+                   new_valid_until=None, node_type=None, actor="api"):
+        """Extend or reset the valid_until of a node (managed renewal).
+
+        Either extend_days (add N days from now) or new_valid_until (explicit
+        ISO date) must be provided. Also clears expired_at if the node was
+        previously expired.
+
+        Args:
+            name: Node name.
+            project_id: Project scope.
+            extend_days: Number of days to extend from now.
+            new_valid_until: Explicit new ISO datetime for valid_until.
+            node_type: Optional node label to narrow match.
+            actor: Who triggered the renewal.
+
+        Returns:
+            dict with renewal result.
+        """
+        if extend_days is None and new_valid_until is None:
+            return {"renewed": False, "name": name,
+                    "error": "Provide extend_days or new_valid_until"}
+        if extend_days is not None:
+            extend_days = max(1, min(3650, int(extend_days)))
+            computed_until = (
+                datetime.now(timezone.utc) + timedelta(days=extend_days)
+            ).isoformat()
+        else:
+            computed_until = new_valid_until
+
+        now = datetime.now(timezone.utc).isoformat()
+        op_id = self._operation_id()
+        label_clause = f":{node_type}" if node_type and node_type in NODE_TYPES else ""
+
+        with self._driver.session() as session:
+            tx = session.begin_transaction()
+            try:
+                before_rec = tx.run(
+                    f"""
+                    MATCH (n{label_clause} {{name: $name, project_id: $pid}})
+                    RETURN n.valid_until AS valid_until, n.expired_at AS expired_at,
+                           n.active AS active, n.status AS status,
+                           labels(n)[0] AS type
+                    """,
+                    name=name, pid=project_id,
+                ).single()
+
+                if before_rec is None:
+                    tx.rollback()
+                    return {"renewed": False, "name": name,
+                            "error": f"Node '{name}' not found"}
+
+                before_state = dict(before_rec)
+                actual_type = before_rec["type"]
+                was_expired = before_rec["expired_at"] is not None
+
+                # Update valid_until, clear expired_at, reactivate if Belief
+                set_parts = [
+                    "n.valid_until = $new_until",
+                    "n.expired_at = null",
+                    "n.updated_at = $now",
+                ]
+                if actual_type == "Belief" and was_expired:
+                    set_parts.append("n.active = true")
+                    set_parts.append("n.status = 'active'")
+
+                tx.run(
+                    f"""
+                    MATCH (n{label_clause} {{name: $name, project_id: $pid}})
+                    SET {', '.join(set_parts)}
+                    """,
+                    name=name, pid=project_id, new_until=computed_until, now=now,
+                )
+
+                after_state = {
+                    "valid_until": computed_until,
+                    "expired_at": None,
+                    "active": True if (actual_type == "Belief" and was_expired)
+                    else before_rec.get("active"),
+                    "status": "active" if (actual_type == "Belief" and was_expired)
+                    else before_rec.get("status"),
+                }
+
+                self._log_history(tx, op_id, name, project_id,
+                                  "renew_node", before_state, actor)
+                self._log_operation(tx, op_id, "renew_node", actor,
+                                    project_id,
+                                    payload={"name": name,
+                                             "extend_days": extend_days,
+                                             "new_valid_until": computed_until},
+                                    before_state=before_state,
+                                    after_state=after_state)
+                tx.commit()
+                return {"renewed": True, "name": name,
+                        "new_valid_until": computed_until,
+                        "was_expired": was_expired,
+                        "operation_id": op_id}
+            except Exception as exc:
+                tx.rollback()
+                return {"renewed": False, "name": name, "error": str(exc)}
+
     def traverse(self, entity_name, project_id="default", max_depth=2):
         nodes = {}
         edges = []

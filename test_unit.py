@@ -1605,5 +1605,171 @@ class TestRequireScope(unittest.TestCase):
             self.assertEqual(result, "ok")
 
 
+class TestExpireNodes(unittest.TestCase):
+    """Test expire_nodes managed forgetting method."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.tx = MagicMock()
+        self.session.begin_transaction.return_value = self.tx
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_dry_run_returns_expired_list(self):
+        """dry_run=True should return expired nodes without modifying anything."""
+        expired_rec = MagicMock()
+        expired_rec.__getitem__ = lambda s, k: {
+            "name": "Old fact", "summary": "stale info", "type": "Concept",
+            "valid_until": "2025-01-01T00:00:00+00:00", "node_id": "id-1",
+            "vsm_level": "S1", "confidence": None, "status": None, "active": None,
+        }[k]
+        expired_rec.get = lambda k, d=None: {
+            "name": "Old fact", "summary": "stale info", "type": "Concept",
+            "valid_until": "2025-01-01T00:00:00+00:00", "node_id": "id-1",
+            "vsm_level": "S1", "confidence": None, "status": None, "active": None,
+        }.get(k, d)
+        self.session.run.return_value = [expired_rec]
+
+        result = self.adapter.expire_nodes(project_id="proj", dry_run=True)
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["expired"][0]["name"], "Old fact")
+        # No transaction should have been created for dry_run
+        self.session.begin_transaction.assert_not_called()
+
+    def test_expire_marks_belief_inactive(self):
+        """Expiring a Belief should set active=false and status='expired'."""
+        expired_rec = MagicMock()
+        data = {
+            "name": "Stale belief", "summary": "old", "type": "Belief",
+            "valid_until": "2025-01-01T00:00:00+00:00", "node_id": "id-2",
+            "vsm_level": "S3", "confidence": 0.6, "status": "active", "active": True,
+        }
+        expired_rec.__getitem__ = lambda s, k: data[k]
+        expired_rec.get = lambda k, d=None: data.get(k, d)
+        self.session.run.return_value = [expired_rec]
+        self.tx.run.return_value = MagicMock()
+
+        result = self.adapter.expire_nodes(project_id="proj", dry_run=False)
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["expired"][0]["name"], "Stale belief")
+        self.tx.commit.assert_called_once()
+
+    def test_empty_when_nothing_expired(self):
+        """No expired nodes should return empty list."""
+        self.session.run.return_value = []
+        result = self.adapter.expire_nodes(project_id="proj", dry_run=False)
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["expired"], [])
+
+    def test_expire_non_belief_sets_expired_at_only(self):
+        """Non-Belief nodes get expired_at but no status/active change."""
+        expired_rec = MagicMock()
+        data = {
+            "name": "Old event", "summary": "happened", "type": "Event",
+            "valid_until": "2025-06-01T00:00:00+00:00", "node_id": "id-3",
+            "vsm_level": None, "confidence": None, "status": None, "active": None,
+        }
+        expired_rec.__getitem__ = lambda s, k: data[k]
+        expired_rec.get = lambda k, d=None: data.get(k, d)
+        self.session.run.return_value = [expired_rec]
+        self.tx.run.return_value = MagicMock()
+
+        result = self.adapter.expire_nodes(project_id="proj", dry_run=False)
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["expired"][0]["type"], "Event")
+        self.tx.commit.assert_called_once()
+
+
+class TestRenewNode(unittest.TestCase):
+    """Test renew_node managed renewal method."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.tx = MagicMock()
+        self.session.begin_transaction.return_value = self.tx
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_renew_with_extend_days(self):
+        """Renewing with extend_days should succeed."""
+        before = MagicMock()
+        before.__getitem__ = lambda s, k: {
+            "valid_until": "2025-01-01", "expired_at": None,
+            "active": True, "status": "active", "type": "Concept",
+        }[k]
+        before.get = lambda k, d=None: {
+            "valid_until": "2025-01-01", "expired_at": None,
+            "active": True, "status": "active", "type": "Concept",
+        }.get(k, d)
+        self.tx.run.side_effect = [
+            MagicMock(single=MagicMock(return_value=before)),
+            MagicMock(),  # UPDATE
+            MagicMock(),  # _log_history
+            MagicMock(),  # _log_operation
+        ]
+        result = self.adapter.renew_node("Test node", project_id="proj", extend_days=90)
+        self.assertTrue(result["renewed"])
+        self.assertIn("new_valid_until", result)
+        self.assertFalse(result["was_expired"])
+        self.tx.commit.assert_called_once()
+
+    def test_renew_expired_belief_reactivates(self):
+        """Renewing an expired Belief should set active=true, status='active'."""
+        before = MagicMock()
+        data = {
+            "valid_until": "2025-01-01", "expired_at": "2025-01-02",
+            "active": False, "status": "expired", "type": "Belief",
+        }
+        before.__getitem__ = lambda s, k: data[k]
+        before.get = lambda k, d=None: data.get(k, d)
+        self.tx.run.side_effect = [
+            MagicMock(single=MagicMock(return_value=before)),
+            MagicMock(),  # UPDATE
+            MagicMock(),  # _log_history
+            MagicMock(),  # _log_operation
+        ]
+        result = self.adapter.renew_node("Old belief", project_id="proj", extend_days=180)
+        self.assertTrue(result["renewed"])
+        self.assertTrue(result["was_expired"])
+        self.tx.commit.assert_called_once()
+
+    def test_renew_not_found(self):
+        """Renewing a nonexistent node should return error."""
+        self.tx.run.return_value = MagicMock(single=MagicMock(return_value=None))
+        result = self.adapter.renew_node("ghost", project_id="proj", extend_days=30)
+        self.assertFalse(result["renewed"])
+        self.assertIn("not found", result["error"])
+
+    def test_renew_requires_days_or_until(self):
+        """Must provide extend_days or new_valid_until."""
+        result = self.adapter.renew_node("test", project_id="proj")
+        self.assertFalse(result["renewed"])
+        self.assertIn("Provide", result["error"])
+
+    def test_renew_with_explicit_valid_until(self):
+        """Renewing with new_valid_until should use the provided value."""
+        before = MagicMock()
+        data = {
+            "valid_until": "2025-01-01", "expired_at": None,
+            "active": True, "status": "active", "type": "Event",
+        }
+        before.__getitem__ = lambda s, k: data[k]
+        before.get = lambda k, d=None: data.get(k, d)
+        self.tx.run.side_effect = [
+            MagicMock(single=MagicMock(return_value=before)),
+            MagicMock(), MagicMock(), MagicMock(),
+        ]
+        result = self.adapter.renew_node(
+            "Test event", project_id="proj",
+            new_valid_until="2027-12-31T00:00:00+00:00",
+        )
+        self.assertTrue(result["renewed"])
+        self.assertEqual(result["new_valid_until"], "2027-12-31T00:00:00+00:00")
+
+
 if __name__ == "__main__":
     unittest.main()

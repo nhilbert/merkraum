@@ -1985,6 +1985,95 @@ def nodes_expiring():
         return _error(str(exc))
 
 
+@app.route("/api/nodes/expire", methods=["POST"])
+@require_auth
+@require_scope("write")
+def nodes_expire():
+    """Enforce managed forgetting: expire nodes past their valid_until date.
+
+    JSON body (all optional):
+        project: project id (default: from JWT)
+        dry_run: if true, return what would be expired without changing (default: false)
+
+    Returns list of expired (or would-be-expired) nodes.
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    body = request.get_json(silent=True) or {}
+    project = body.get("project") or _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+    dry_run = body.get("dry_run", False)
+    actor = getattr(request, "username", None) or getattr(request, "user_id", "api")
+
+    try:
+        result = adapter.expire_nodes(
+            project_id=project, dry_run=dry_run, actor=actor,
+        )
+        return jsonify(result)
+    except Exception as exc:
+        logger.exception("nodes_expire failed for project=%s", project)
+        return _error(str(exc))
+
+
+@app.route("/api/nodes/renew", methods=["POST"])
+@require_auth
+@require_scope("write")
+def nodes_renew():
+    """Renew a node's validity — extend or reset valid_until.
+
+    JSON body:
+        name (required): node name
+        project: project id (default: from JWT)
+        extend_days: number of days to extend from now
+        new_valid_until: explicit ISO datetime for valid_until
+        node_type: optional node type to narrow match
+
+    Exactly one of extend_days or new_valid_until must be provided.
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    body = request.get_json(silent=True) or {}
+    name = body.get("name")
+    if not name or not isinstance(name, str) or not name.strip():
+        return _error("'name' is required", 400)
+    name = name.strip()
+
+    project = body.get("project") or _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    extend_days = body.get("extend_days")
+    new_valid_until = body.get("new_valid_until")
+    if extend_days is None and new_valid_until is None:
+        return _error("Provide 'extend_days' or 'new_valid_until'", 400)
+
+    if extend_days is not None:
+        try:
+            extend_days = int(extend_days)
+            if extend_days < 1 or extend_days > 3650:
+                return _error("'extend_days' must be between 1 and 3650", 400)
+        except (TypeError, ValueError):
+            return _error("'extend_days' must be an integer", 400)
+
+    node_type = body.get("node_type")
+    actor = getattr(request, "username", None) or getattr(request, "user_id", "api")
+
+    try:
+        result = adapter.renew_node(
+            name=name, project_id=project, extend_days=extend_days,
+            new_valid_until=new_valid_until, node_type=node_type, actor=actor,
+        )
+        if result.get("error"):
+            return _error(result["error"], 404 if "not found" in result["error"] else 400)
+        return jsonify(result)
+    except Exception as exc:
+        logger.exception("nodes_renew failed for project=%s name=%s", project, name)
+        return _error(str(exc))
+
+
 @app.route("/api/traverse/<path:entity>", methods=["GET"])
 @require_auth
 @require_scope("read")

@@ -1088,6 +1088,90 @@ async def consolidate_beliefs(
 
 
 @mcp.tool()
+async def expire_nodes(
+    dry_run: bool = True,
+    project: str = None,
+) -> dict:
+    """Enforce managed forgetting: expire nodes past their valid_until date.
+
+    Finds all nodes whose valid_until timestamp has passed and marks them
+    as expired (sets expired_at, deactivates Beliefs). Non-destructive —
+    nodes remain in the graph with full audit trail.
+
+    Use dry_run=True (default) to preview what would be expired.
+    Set dry_run=False to actually expire the nodes.
+
+    Args:
+        dry_run: If True, only show what would be expired without changing anything.
+        project: Project ID (uses authenticated user's default if omitted).
+    """
+    start = time.time()
+    auth = await _require_auth()
+    if isinstance(auth, dict) and "error" in auth:
+        return auth
+    project = project or auth.get("project_id", "default")
+    try:
+        result = adapter.expire_nodes(
+            project_id=project, dry_run=dry_run,
+            actor=auth.get("sub", "mcp"),
+        )
+        audit_log("expire_nodes", "authed",
+                  {"project": project, "dry_run": dry_run},
+                  int((time.time() - start) * 1000),
+                  "ok" if result.get("total", 0) >= 0 else "error")
+        return result
+    except Exception as e:
+        audit_log("expire_nodes", "authed",
+                  {"project": project, "dry_run": dry_run},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def renew_node(
+    name: str,
+    extend_days: int = None,
+    new_valid_until: str = None,
+    node_type: str = None,
+    project: str = None,
+) -> dict:
+    """Renew a node's validity — extend or reset its valid_until date.
+
+    Use this when a node is expiring but is still relevant. Either provide
+    extend_days (adds N days from now) or new_valid_until (explicit ISO date).
+    Also clears expired_at and reactivates the node if it was previously expired.
+
+    Args:
+        name: The node name to renew.
+        extend_days: Number of days to extend from now (1-3650).
+        new_valid_until: Explicit ISO datetime for the new valid_until.
+        node_type: Optional node type to narrow the match (e.g. 'Concept', 'Belief').
+        project: Project ID (uses authenticated user's default if omitted).
+    """
+    start = time.time()
+    auth = await _require_auth()
+    if isinstance(auth, dict) and "error" in auth:
+        return auth
+    project = project or auth.get("project_id", "default")
+    try:
+        result = adapter.renew_node(
+            name=name, project_id=project, extend_days=extend_days,
+            new_valid_until=new_valid_until, node_type=node_type,
+            actor=auth.get("sub", "mcp"),
+        )
+        audit_log("renew_node", "authed",
+                  {"name": name, "project": project, "extend_days": extend_days},
+                  int((time.time() - start) * 1000),
+                  "ok" if result.get("renewed") else "error")
+        return result
+    except Exception as e:
+        audit_log("renew_node", "authed",
+                  {"name": name, "project": project},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
 async def get_usage(
     tier: str = "free",
     project: str = None,
