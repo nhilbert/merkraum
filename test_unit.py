@@ -143,10 +143,22 @@ class TestWriteEntities(unittest.TestCase):
         self.session = MagicMock()
         # write_entities now uses begin_transaction(), so mock the tx
         self.tx = MagicMock()
-        # before-state query returns None (new entity) by default
+        # before-state query returns None (new entity) by default;
+        # after-state properties(n) query returns a dict
         before_result = MagicMock()
         before_result.single.return_value = None
-        self.tx.run.return_value = before_result
+        after_result = MagicMock()
+        after_result.single.return_value = {"props": {"name": "mock", "node_type": "Concept"}}
+        # tx.run returns before_result by default, but after-state query
+        # (3rd call) needs after_result. Use side_effect for ordered calls:
+        # call 1: before-state, call 2: MERGE, call 3: after-state props,
+        # call 4+: log_history/log_operation
+        log_result = MagicMock()
+        log_result.single.return_value = None
+        self.tx.run.return_value = after_result  # default fallback
+        self.tx.run.side_effect = None  # clear any side_effect
+        # Simple approach: return after_result for all calls (it has .single())
+        self.tx.run.return_value = after_result
         self.session.begin_transaction.return_value = self.tx
         self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
         self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
@@ -203,14 +215,12 @@ class TestWriteEntities(unittest.TestCase):
     def test_entity_write_error_continues(self):
         """If one entity fails, others should still be written."""
         # First entity's before-state query raises, second succeeds
-        before_result_ok = MagicMock()
-        before_result_ok.single.return_value = None
         self.tx.run.side_effect = [Exception("DB error")]
         # Need a fresh tx for second entity
         tx2 = MagicMock()
-        tx2_before = MagicMock()
-        tx2_before.single.return_value = None
-        tx2.run.return_value = tx2_before
+        tx2_after = MagicMock()
+        tx2_after.single.return_value = {"props": {"name": "Succeed"}}
+        tx2.run.return_value = tx2_after
         self.session.begin_transaction.side_effect = [self.tx, tx2]
         entities = [
             {"name": "Fail", "node_type": "Concept"},
@@ -2417,6 +2427,218 @@ class TestDreamingMaintenance(unittest.TestCase):
         messages, result = self._run_generator(
             maintain(adapter, "proj", dry_run=False))
         self.assertTrue(result["decay"]["applied"] is True)
+
+
+class TestReconstructAt(unittest.TestCase):
+    """Test Neo4jBaseAdapter.reconstruct_at — point-in-time reconstruction."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_reconstruct_found(self):
+        """Should return state from the most recent operation before timestamp."""
+        import json
+        after_state = {"name": "TestEntity", "summary": "Updated", "confidence": 0.9}
+        op_result = MagicMock()
+        op_result.single.return_value = {
+            "op_id": "abc123",
+            "op_type": "update_belief",
+            "actor": "system",
+            "before_json": None,
+            "after_json": json.dumps(after_state),
+            "created_at": "2026-03-20T10:00:00+00:00",
+            "action": "update_belief",
+        }
+        count_result = MagicMock()
+        count_result.single.return_value = {"total": 5}
+        self.session.run.side_effect = [op_result, count_result]
+
+        result = self.adapter.reconstruct_at(
+            "TestEntity", "2026-03-20T12:00:00+00:00", project_id="test")
+        self.assertTrue(result["found"])
+        self.assertEqual(result["state"]["name"], "TestEntity")
+        self.assertEqual(result["state"]["confidence"], 0.9)
+        self.assertEqual(result["operation"]["type"], "update_belief")
+        self.assertEqual(result["total_ops"], 5)
+
+    def test_reconstruct_not_found(self):
+        """Should return found=False when no operations exist before timestamp."""
+        op_result = MagicMock()
+        op_result.single.return_value = None
+        self.session.run.return_value = op_result
+
+        result = self.adapter.reconstruct_at(
+            "NoSuchEntity", "2026-01-01T00:00:00+00:00", project_id="test")
+        self.assertFalse(result["found"])
+        self.assertIsNone(result["state"])
+        self.assertEqual(result["total_ops"], 0)
+
+    def test_reconstruct_deleted_entity(self):
+        """Should return before_state with _deleted flag for delete operations."""
+        import json
+        before_state = {"node": {"name": "Deleted", "summary": "Was here"}}
+        op_result = MagicMock()
+        op_result.single.return_value = {
+            "op_id": "del123",
+            "op_type": "delete_node",
+            "actor": "admin",
+            "before_json": json.dumps(before_state),
+            "after_json": None,
+            "created_at": "2026-03-20T10:00:00+00:00",
+            "action": "delete_node",
+        }
+        count_result = MagicMock()
+        count_result.single.return_value = {"total": 3}
+        self.session.run.side_effect = [op_result, count_result]
+
+        result = self.adapter.reconstruct_at(
+            "Deleted", "2026-03-20T12:00:00+00:00", project_id="test")
+        self.assertTrue(result["found"])
+        self.assertTrue(result["state"]["_deleted"])
+        self.assertEqual(result["operation"]["type"], "delete_node")
+
+    def test_reconstruct_entity_name_in_result(self):
+        """Result should include the requested entity name and timestamp."""
+        op_result = MagicMock()
+        op_result.single.return_value = None
+        self.session.run.return_value = op_result
+
+        result = self.adapter.reconstruct_at(
+            "MyEntity", "2026-06-01T00:00:00+00:00", project_id="test")
+        self.assertEqual(result["entity"], "MyEntity")
+        self.assertEqual(result["timestamp"], "2026-06-01T00:00:00+00:00")
+
+
+class TestWriteEntitiesFullAfterState(unittest.TestCase):
+    """Test that write_entities captures full after_state from DB (SUP-166)."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.tx = MagicMock()
+        # Simulate: before=None, MERGE, after-state properties query
+        after_props = {
+            "name": "TestConcept", "summary": "A test",
+            "created_at": "2026-03-20T10:00:00+00:00",
+            "updated_at": "2026-03-20T10:00:00+00:00",
+            "node_id": "abc", "project_id": "test",
+        }
+        before_mock = MagicMock()
+        before_mock.single.return_value = None  # new entity
+        merge_mock = MagicMock()
+        after_mock = MagicMock()
+        after_mock.single.return_value = {"props": after_props}
+        log_mock = MagicMock()
+        # Calls: 1=before, 2=MERGE, 3=after-props, 4=log_history, 5=log_operation
+        self.tx.run.side_effect = [before_mock, merge_mock, after_mock, log_mock, log_mock]
+        self.session.begin_transaction.return_value = self.tx
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        self.adapter.vector_upsert = MagicMock(return_value=True)
+
+    def test_after_state_includes_timestamps(self):
+        """after_state should include created_at, updated_at from DB."""
+        entities = [{"name": "TestConcept", "node_type": "Concept", "summary": "A test"}]
+        self.adapter.write_entities(entities, "Z1801", project_id="test")
+        # _log_operation is the 5th tx.run call — check after_state arg
+        log_op_call = self.tx.run.call_args_list[4]
+        cypher = log_op_call[0][0]
+        self.assertIn("OperationLog", cypher)  # This is the log_operation CREATE
+
+    def test_after_state_has_node_type(self):
+        """after_state should include node_type."""
+        entities = [{"name": "TestConcept", "node_type": "Concept", "summary": "A test"}]
+        self.adapter.write_entities(entities, "Z1801", project_id="test")
+        # The after-props query is the 3rd call
+        after_call = self.tx.run.call_args_list[2]
+        self.assertIn("properties(n)", after_call[0][0])
+
+
+class TestExpireNodesUniqueOpId(unittest.TestCase):
+    """Test that expire_nodes uses unique op_id per node (SUP-166 bug fix)."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_unique_op_ids_per_expired_node(self):
+        """Each expired node should get its own op_id."""
+        # Simulate 2 expired nodes
+        expired_records = [
+            {"name": "A", "summary": "s", "type": "Concept", "valid_until": "2026-01-01",
+             "node_id": "a1", "vsm_level": None, "confidence": None,
+             "status": None, "active": True},
+            {"name": "B", "summary": "s", "type": "Belief", "valid_until": "2026-01-02",
+             "node_id": "b1", "vsm_level": None, "confidence": 0.5,
+             "status": "active", "active": True},
+        ]
+        find_result = MagicMock()
+        find_result.__iter__ = MagicMock(return_value=iter(expired_records))
+        self.session.run.return_value = find_result
+
+        tx1 = MagicMock()
+        tx2 = MagicMock()
+        self.session.begin_transaction.side_effect = [tx1, tx2]
+
+        # Track op_ids used in _log_operation calls
+        op_ids = []
+        original_log = self.adapter._log_operation
+
+        def capture_log(tx, op_id, *args, **kwargs):
+            op_ids.append(op_id)
+
+        self.adapter._log_operation = capture_log
+        self.adapter._log_history = MagicMock()
+
+        self.adapter.expire_nodes(project_id="test", dry_run=False)
+        # Should have 2 different op_ids
+        self.assertEqual(len(op_ids), 2)
+        self.assertNotEqual(op_ids[0], op_ids[1])
+
+
+class TestConfidenceDecayUniqueOpId(unittest.TestCase):
+    """Test that confidence_decay uses unique op_id per belief (SUP-166 bug fix)."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_unique_op_ids_per_decayed_belief(self):
+        """Each decayed belief should get its own op_id."""
+        from datetime import datetime, timezone, timedelta
+        old_time = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
+        records = [
+            {"name": "B1", "confidence": 0.8, "knowledge_type": "state",
+             "updated_at": old_time, "source_cycle": "Z1", "vsm_level": None},
+            {"name": "B2", "confidence": 0.7, "knowledge_type": "belief",
+             "updated_at": old_time, "source_cycle": "Z2", "vsm_level": None},
+        ]
+        find_result = MagicMock()
+        find_result.__iter__ = MagicMock(return_value=iter(records))
+        self.session.run.return_value = find_result
+
+        tx1 = MagicMock()
+        tx2 = MagicMock()
+        self.session.begin_transaction.side_effect = [tx1, tx2]
+
+        op_ids = []
+        original_log = self.adapter._log_operation
+
+        def capture_log(tx, op_id, *args, **kwargs):
+            op_ids.append(op_id)
+
+        self.adapter._log_operation = capture_log
+
+        self.adapter.apply_confidence_decay(project_id="test", dry_run=False)
+        self.assertEqual(len(op_ids), 2)
+        self.assertNotEqual(op_ids[0], op_ids[1])
 
 
 if __name__ == "__main__":

@@ -650,6 +650,19 @@ class Neo4jBaseAdapter(BackendAdapter):
                                 **params,
                             )
 
+                        # Capture full after_state from DB for point-in-time
+                        # reconstruction (SUP-166)
+                        after_rec = tx.run(
+                            f"""
+                            MATCH (n:{node_type} {{name: $name, project_id: $project_id}})
+                            RETURN properties(n) AS props
+                            """,
+                            name=ent["name"],
+                            project_id=project_id,
+                        ).single()
+                        after_payload = dict(after_rec["props"]) if after_rec else {}
+                        after_payload["node_type"] = node_type
+
                         # Log the operation
                         op_id = self._operation_id()
                         payload = {
@@ -658,16 +671,6 @@ class Neo4jBaseAdapter(BackendAdapter):
                             "source_cycle": source_cycle,
                             "source_type": source_type,
                         }
-                        after_payload = {
-                            "name": ent["name"],
-                            "node_type": node_type,
-                            "summary": ent.get("summary", ""),
-                            "valid_until": valid_until,
-                            "vsm_level": vsm_level,
-                            "knowledge_type": knowledge_type,
-                        }
-                        if node_type == "Belief":
-                            after_payload["confidence"] = ent.get("confidence", 0.7)
                         self._log_history(tx, op_id, ent["name"], project_id,
                                           action,
                                           before_state if before_state else payload,
@@ -949,7 +952,6 @@ class Neo4jBaseAdapter(BackendAdapter):
         """
         now = datetime.now(timezone.utc).isoformat()
         expired_nodes = []
-        op_id = self._operation_id()
 
         with self._driver.session() as session:
             # Find all nodes past valid_until that haven't been expired yet
@@ -988,6 +990,7 @@ class Neo4jBaseAdapter(BackendAdapter):
             for rec in records:
                 name = rec["name"]
                 node_type = rec["type"]
+                op_id = self._operation_id()  # unique per node
                 tx = session.begin_transaction()
                 try:
                     before_state = {
@@ -1045,7 +1048,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                     # Continue with other nodes — don't fail entire batch
 
         return {"expired": expired_nodes, "total": len(expired_nodes),
-                "dry_run": False, "operation_id": op_id}
+                "dry_run": False}
 
     def renew_node(self, name, project_id="default", extend_days=None,
                    new_valid_until=None, node_type=None, actor="api"):
@@ -1789,7 +1792,6 @@ class Neo4jBaseAdapter(BackendAdapter):
         now_iso = now.isoformat()
         decayed = []
         unchanged = 0
-        op_id = self._operation_id()
 
         with self._driver.session() as session:
             # Get all active beliefs with their current state
@@ -1874,8 +1876,9 @@ class Neo4jBaseAdapter(BackendAdapter):
                             "confidence": new_confidence,
                             "knowledge_type": kt,
                         }
+                        decay_op_id = self._operation_id()  # unique per belief
                         self._log_operation(
-                            tx, op_id, "confidence_decay", actor,
+                            tx, decay_op_id, "confidence_decay", actor,
                             project_id,
                             payload={"name": rec["name"],
                                      "old": current, "new": new_confidence,
@@ -1894,7 +1897,7 @@ class Neo4jBaseAdapter(BackendAdapter):
             "total": len(decayed),
             "unchanged": unchanged,
             "dry_run": dry_run,
-            "operation_id": op_id if not dry_run else None,
+            "operation_ids": len(decayed),
         }
 
     def get_certainty_review_queue(self, project_id="default", limit=50):
@@ -2868,6 +2871,112 @@ class Neo4jBaseAdapter(BackendAdapter):
                 "total": total,
                 "limit": limit,
                 "offset": offset,
+            }
+
+    def reconstruct_at(self, entity_name, timestamp, project_id="default"):
+        """Reconstruct the state of an entity at a specific point in time.
+
+        Walks the audit trail to find the most recent operation affecting
+        this entity at or before the given timestamp. Returns the after_state
+        from that operation as the best available reconstruction.
+
+        For entities created after the timestamp, returns found=False.
+        For deleted entities, returns the before_state from the delete operation.
+
+        Args:
+            entity_name: Name of the entity to reconstruct.
+            timestamp: ISO 8601 timestamp — reconstruct state at this moment.
+            project_id: Scope to a specific project.
+
+        Returns:
+            dict with entity, timestamp, state, operation, found, total_ops.
+        """
+        with self._driver.session() as session:
+            # Find the most recent operation for this entity at or before
+            # the requested timestamp
+            result = session.run(
+                """
+                MATCH (h:HistoryLog {entity_name: $entity_name,
+                                     project_id: $pid})
+                MATCH (op:OperationLog {id: h.operation_id,
+                                        project_id: $pid})
+                WHERE op.created_at <= $timestamp
+                RETURN op.id AS op_id, op.type AS op_type,
+                       op.actor AS actor,
+                       op.before_json AS before_json,
+                       op.after_json AS after_json,
+                       op.created_at AS created_at,
+                       h.action AS action
+                ORDER BY op.created_at DESC
+                LIMIT 1
+                """,
+                entity_name=entity_name,
+                pid=project_id,
+                timestamp=timestamp,
+            ).single()
+
+            if not result:
+                return {
+                    "entity": entity_name,
+                    "timestamp": timestamp,
+                    "state": None,
+                    "operation": None,
+                    "found": False,
+                    "total_ops": 0,
+                }
+
+            # Parse after_state — this is the entity state after the operation
+            after_json = result.get("after_json")
+            state = None
+            if after_json:
+                try:
+                    state = json.loads(after_json)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+            # For delete operations, after_state is None — use before_state
+            op_type = result["op_type"]
+            action = result.get("action")
+            if state is None or op_type == "delete_node":
+                before_json = result.get("before_json")
+                if before_json:
+                    try:
+                        before = json.loads(before_json)
+                        if op_type == "delete_node":
+                            state = before
+                            # Mark that entity was deleted at this point
+                            if isinstance(state, dict):
+                                state["_deleted"] = True
+                        elif state is None:
+                            state = before
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+
+            # Count total operations for this entity (for context)
+            count_result = session.run(
+                """
+                MATCH (h:HistoryLog {entity_name: $entity_name,
+                                     project_id: $pid})
+                RETURN count(h) AS total
+                """,
+                entity_name=entity_name,
+                pid=project_id,
+            ).single()
+            total_ops = count_result["total"] if count_result else 0
+
+            return {
+                "entity": entity_name,
+                "timestamp": timestamp,
+                "state": state,
+                "operation": {
+                    "id": result["op_id"],
+                    "type": op_type,
+                    "actor": result["actor"],
+                    "action": action,
+                    "created_at": result["created_at"],
+                },
+                "found": True,
+                "total_ops": total_ops,
             }
 
 

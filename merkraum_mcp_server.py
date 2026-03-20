@@ -1581,6 +1581,57 @@ async def get_history(
 
 
 @mcp.tool()
+async def reconstruct_entity(
+    entity_name: str = None,
+    timestamp: str = None,
+    project: str = None,
+) -> dict:
+    """Reconstruct the state of an entity at a specific point in time.
+
+    Uses the audit trail to find the most recent operation affecting the
+    entity at or before the given timestamp, returning its state as it
+    was at that moment.
+
+    Args:
+        entity_name: Name of the entity to reconstruct (required)
+        timestamp: ISO 8601 timestamp — reconstruct state at this moment (required)
+        project: Project ID (default: your personal space)
+    """
+    if not entity_name:
+        return {"error": "entity_name is required"}
+    if not timestamp:
+        return {"error": "timestamp is required"}
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    adapter = _get_adapter()
+    start = time.time()
+    try:
+        result = await _run_sync(
+            adapter.reconstruct_at,
+            entity_name=entity_name,
+            timestamp=timestamp,
+            project_id=project,
+        )
+        result["duration_ms"] = int((time.time() - start) * 1000)
+        audit_log("reconstruct_entity", "authed",
+                  {"entity": entity_name, "timestamp": timestamp,
+                   "project": project},
+                  int((time.time() - start) * 1000), "ok")
+        return result
+    except Exception as e:
+        audit_log("reconstruct_entity", "authed",
+                  {"entity": entity_name, "project": project},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
 async def health_check() -> dict:
     """Check if the knowledge graph backends are healthy."""
     auth_ctx = _get_auth_context()

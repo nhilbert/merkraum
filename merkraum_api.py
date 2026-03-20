@@ -1808,6 +1808,49 @@ def history():
         return _error(str(exc))
 
 
+@app.route("/api/history/reconstruct", methods=["GET"])
+@require_auth
+@require_scope("read")
+def history_reconstruct():
+    """Reconstruct the state of an entity at a specific point in time.
+
+    Uses the audit trail to find the most recent operation affecting the
+    entity at or before the given timestamp, returning its after_state
+    as the reconstructed state.
+
+    Query params:
+        entity: entity name (required)
+        timestamp: ISO 8601 timestamp (required)
+        project: project id (default: from auth context)
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    entity = request.args.get("entity")
+    timestamp = request.args.get("timestamp")
+
+    if not entity:
+        return _error("'entity' parameter is required", 400)
+    if not timestamp:
+        return _error("'timestamp' parameter is required", 400)
+
+    try:
+        result = adapter.reconstruct_at(
+            entity_name=entity,
+            timestamp=timestamp,
+            project_id=project,
+        )
+        return jsonify(result)
+    except Exception as exc:
+        logger.exception("reconstruct failed for entity=%s project=%s",
+                         entity, project)
+        return _error(str(exc))
+
+
 @app.route("/api/graph", methods=["GET"])
 @require_auth
 @require_scope("read")
