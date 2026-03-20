@@ -45,7 +45,7 @@ from fastmcp.server.dependencies import get_access_token
 
 from merkraum_backend import (
     create_adapter, BackendAdapter, NODE_TYPES, RELATIONSHIP_TYPES, TIER_LIMITS,
-    VSM_LEVELS,
+    VSM_LEVELS, KNOWLEDGE_TYPES,
 )
 from merkraum_llm import llm_extract, get_provider_info
 
@@ -763,12 +763,16 @@ async def traverse_graph(
 @mcp.tool()
 async def list_beliefs(
     status: str = "active",
+    knowledge_type: str = None,
     project: str = None,
 ) -> dict:
     """List beliefs in the knowledge graph.
 
     Args:
         status: Filter — active, uncertain, superseded, contradicted
+        knowledge_type: Filter by knowledge type (fact=permanent truths,
+            state=temporary current facts, rule=policies/procedures,
+            belief=subjective assessments, memory=episodic events). None = all.
         project: Project ID (default: your personal space)
     """
     auth_ctx = _get_auth_context()
@@ -781,14 +785,19 @@ async def list_beliefs(
         return {"error": _err}
     if status not in ("active", "uncertain", "superseded", "contradicted"):
         status = "active"
+    if knowledge_type and knowledge_type not in KNOWLEDGE_TYPES:
+        return {"error": f"Unknown knowledge_type: {knowledge_type}. Valid: {KNOWLEDGE_TYPES}"}
     adapter = _get_adapter()
     start = time.time()
     try:
-        beliefs = await _run_sync(adapter.get_beliefs, project, status)
+        beliefs = await _run_sync(adapter.get_beliefs, project, status,
+                                  knowledge_type)
         audit_log("list_beliefs", "authed",
-                  {"status": status, "project": project},
+                  {"status": status, "knowledge_type": knowledge_type,
+                   "project": project},
                   int((time.time() - start) * 1000), "ok")
         return {"beliefs": beliefs, "count": len(beliefs), "status_filter": status,
+                "knowledge_type_filter": knowledge_type,
                 "duration_ms": int((time.time() - start) * 1000)}
     except Exception as e:
         audit_log("list_beliefs", "authed",
@@ -829,16 +838,20 @@ async def get_graph_stats(project: str = None) -> dict:
 async def query_nodes(
     node_type: str = None,
     vsm_level: str = None,
+    knowledge_type: str = None,
     limit: int = 50,
     project: str = None,
 ) -> dict:
-    """Query entities in the knowledge graph, optionally filtered by type and VSM level.
+    """Query entities in the knowledge graph, optionally filtered by type, VSM level, and knowledge type.
 
     Args:
         node_type: Filter by type (Person, Organization, Project, Concept,
             Regulation, Event, Belief, Artifact, Interview, Quote). None = all.
         vsm_level: Filter by VSM system level (S1=operational, S2=coordination,
             S3=control, S4=strategic, S5=identity). None = all.
+        knowledge_type: Filter by knowledge type (fact=permanent truths,
+            state=temporary current facts, rule=policies/procedures,
+            belief=subjective assessments, memory=episodic events). None = all.
         limit: Max results (1-200, default 50)
         project: Project ID (default: your personal space)
     """
@@ -854,18 +867,22 @@ async def query_nodes(
         return {"error": f"Unknown node_type: {node_type}. Valid: {NODE_TYPES}"}
     if vsm_level and vsm_level not in VSM_LEVELS:
         return {"error": f"Unknown vsm_level: {vsm_level}. Valid: {VSM_LEVELS}"}
+    if knowledge_type and knowledge_type not in KNOWLEDGE_TYPES:
+        return {"error": f"Unknown knowledge_type: {knowledge_type}. Valid: {KNOWLEDGE_TYPES}"}
     limit = max(1, min(200, limit))
     adapter = _get_adapter()
     start = time.time()
     try:
         nodes = await _run_sync(adapter.query_nodes, node_type, project, limit,
-                                vsm_level)
+                                vsm_level, False, knowledge_type)
         audit_log("query_nodes", "authed",
                   {"node_type": node_type, "vsm_level": vsm_level,
+                   "knowledge_type": knowledge_type,
                    "limit": limit, "project": project},
                   int((time.time() - start) * 1000), "ok")
         return {"nodes": nodes, "count": len(nodes), "node_type_filter": node_type,
                 "vsm_level_filter": vsm_level,
+                "knowledge_type_filter": knowledge_type,
                 "duration_ms": int((time.time() - start) * 1000)}
     except Exception as e:
         audit_log("query_nodes", "authed",
@@ -881,6 +898,7 @@ async def add_knowledge(
     confidence: float = 0.7,
     valid_until: str = None,
     vsm_level: str = None,
+    knowledge_type: str = None,
     project: str = None,
 ) -> dict:
     """Add a single entity to the knowledge graph.
@@ -894,6 +912,9 @@ async def add_knowledge(
         valid_until: ISO 8601 date when this knowledge expires (optional, null = no expiration)
         vsm_level: VSM system level (S1=operational, S2=coordination, S3=control,
             S4=strategic, S5=identity). Determines default TTL if valid_until not set.
+        knowledge_type: Epistemological classification (fact=permanent truths,
+            state=temporary current facts, rule=policies/procedures,
+            belief=subjective assessments, memory=episodic events). Optional.
         project: Project ID (default: your personal space)
     """
     auth_ctx = _get_auth_context()
@@ -908,6 +929,8 @@ async def add_knowledge(
         return {"error": f"Unknown node_type: {node_type}. Valid: {NODE_TYPES}"}
     if vsm_level and vsm_level not in VSM_LEVELS:
         return {"error": f"Unknown vsm_level: {vsm_level}. Valid: {VSM_LEVELS}"}
+    if knowledge_type and knowledge_type not in KNOWLEDGE_TYPES:
+        return {"error": f"Unknown knowledge_type: {knowledge_type}. Valid: {KNOWLEDGE_TYPES}"}
     adapter = _get_adapter()
     entity = {"name": name, "summary": summary, "node_type": node_type}
     if node_type == "Belief":
@@ -916,15 +939,19 @@ async def add_knowledge(
         entity["valid_until"] = valid_until
     if vsm_level:
         entity["vsm_level"] = vsm_level
+    if knowledge_type:
+        entity["knowledge_type"] = knowledge_type
     start = time.time()
     try:
         written = await _run_sync(
             adapter.write_entities, [entity], "manual", "user", project
         )
         audit_log("add_knowledge", "authed",
-                  {"name": name, "node_type": node_type, "project": project},
+                  {"name": name, "node_type": node_type,
+                   "knowledge_type": knowledge_type, "project": project},
                   int((time.time() - start) * 1000), "ok")
         return {"created": written > 0, "name": name, "node_type": node_type,
+                "knowledge_type": knowledge_type,
                 "duration_ms": int((time.time() - start) * 1000)}
     except Exception as e:
         audit_log("add_knowledge", "authed",

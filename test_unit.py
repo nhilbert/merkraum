@@ -392,6 +392,118 @@ class TestQueryNodes(unittest.TestCase):
         self.assertIn("n.expired_at IS NULL", call_args)
 
 
+class TestKnowledgeType(unittest.TestCase):
+    """SUP-162: Knowledge Type Taxonomy tests."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_query_nodes_filters_by_knowledge_type(self):
+        self.session.run.return_value = []
+        self.adapter.query_nodes(project_id="test", knowledge_type="fact")
+        call_args = self.session.run.call_args[0][0]
+        self.assertIn("n.knowledge_type", call_args)
+
+    def test_query_nodes_invalid_knowledge_type_ignored(self):
+        self.session.run.return_value = []
+        self.adapter.query_nodes(project_id="test", knowledge_type="invalid")
+        call_args = self.session.run.call_args[0][0]
+        # The filter clause should NOT be present for invalid types
+        self.assertNotIn("n.knowledge_type = $knowledge_type", call_args)
+
+    def test_query_nodes_returns_knowledge_type(self):
+        self.session.run.return_value = [
+            {"name": "A", "summary": "desc", "type": "Concept", "created": "2026-01-01",
+             "node_id": "123", "confidence": None, "valid_until": None,
+             "vsm_level": None, "knowledge_type": "fact"},
+        ]
+        results = self.adapter.query_nodes(project_id="test")
+        self.assertEqual(results[0]["knowledge_type"], "fact")
+
+    def test_query_nodes_omits_null_knowledge_type(self):
+        self.session.run.return_value = [
+            {"name": "B", "summary": "desc", "type": "Concept", "created": "2026-01-01",
+             "node_id": "456", "confidence": None, "valid_until": None,
+             "vsm_level": None, "knowledge_type": None},
+        ]
+        results = self.adapter.query_nodes(project_id="test")
+        self.assertNotIn("knowledge_type", results[0])
+
+    def test_write_entities_persists_knowledge_type(self):
+        tx = MagicMock()
+        tx.run.return_value.single.return_value = None  # no before-state
+        self.session.begin_transaction.return_value = tx
+        self.adapter._upsert_vector = MagicMock()
+        entities = [{"name": "Test", "node_type": "Concept", "summary": "test",
+                      "knowledge_type": "state"}]
+        self.adapter.write_entities(entities, "Z1", project_id="test")
+        # Check that knowledge_type param was passed to Cypher
+        merge_call = tx.run.call_args_list[1]  # [0]=before-state query, [1]=MERGE
+        self.assertEqual(merge_call[1]["knowledge_type"], "state")
+
+    def test_write_entities_invalid_knowledge_type_set_null(self):
+        tx = MagicMock()
+        tx.run.return_value.single.return_value = None
+        self.session.begin_transaction.return_value = tx
+        self.adapter._upsert_vector = MagicMock()
+        entities = [{"name": "Test", "node_type": "Concept", "summary": "test",
+                      "knowledge_type": "bogus"}]
+        self.adapter.write_entities(entities, "Z1", project_id="test")
+        merge_call = tx.run.call_args_list[1]
+        self.assertIsNone(merge_call[1]["knowledge_type"])
+
+    def test_get_beliefs_filters_by_knowledge_type(self):
+        self.session.run.return_value = []
+        self.adapter.get_beliefs(project_id="test", knowledge_type="belief")
+        call_args = self.session.run.call_args[0][0]
+        self.assertIn("b.knowledge_type", call_args)
+
+    def test_get_beliefs_returns_knowledge_type(self):
+        self.session.run.return_value = [
+            {"name": "B1", "summary": "test", "confidence": 0.7, "cycle": "Z1",
+             "valid_until": None, "vsm_level": None, "node_id": "789",
+             "updated_at": "2026-01-01", "status": "active",
+             "knowledge_type": "belief"},
+        ]
+        results = self.adapter.get_beliefs(project_id="test")
+        self.assertEqual(results[0]["knowledge_type"], "belief")
+
+    def test_get_stats_includes_knowledge_types(self):
+        # Mock session.run to handle multiple calls (nodes, edges, vsm_levels, knowledge_types)
+        call_count = [0]
+        node_type_count = len(__import__("merkraum_backend").NODE_TYPES)
+        rel_type_count = len(__import__("merkraum_backend").RELATIONSHIP_TYPES)
+
+        def mock_run(cypher, **kwargs):
+            call_count[0] += 1
+            idx = call_count[0]
+            if idx <= node_type_count:
+                # Node type counts
+                result = MagicMock()
+                result.single.return_value = {"c": 0}
+                return result
+            elif idx <= node_type_count + rel_type_count:
+                # Relationship type counts
+                result = MagicMock()
+                result.single.return_value = {"c": 0}
+                return result
+            elif idx == node_type_count + rel_type_count + 1:
+                # VSM levels
+                return []
+            else:
+                # Knowledge types
+                return [{"kt": "fact", "c": 5}, {"kt": "belief", "c": 3}]
+
+        self.session.run.side_effect = mock_run
+        stats = self.adapter.get_stats(project_id="test")
+        self.assertIn("knowledge_types", stats)
+        self.assertEqual(stats["knowledge_types"]["fact"], 5)
+        self.assertEqual(stats["knowledge_types"]["belief"], 3)
+
+
 class TestTraverseExpiryFilter(unittest.TestCase):
 
     def setUp(self):
@@ -493,11 +605,12 @@ class TestGetStats(unittest.TestCase):
         self.assertIn("total_nodes", stats)
         self.assertIn("total_edges", stats)
         self.assertIn("vsm_levels", stats)
+        self.assertIn("knowledge_types", stats)
 
     def test_stats_queries_all_types(self):
         self.adapter.get_stats(project_id="test")
-        # Should query each NODE_TYPE + each RELATIONSHIP_TYPE + 1 VSM level query
-        expected_calls = len(NODE_TYPES) + len(RELATIONSHIP_TYPES) + 1
+        # Should query each NODE_TYPE + each RELATIONSHIP_TYPE + 1 VSM level + 1 knowledge_type query
+        expected_calls = len(NODE_TYPES) + len(RELATIONSHIP_TYPES) + 2
         self.assertEqual(self.session.run.call_count, expected_calls)
 
 

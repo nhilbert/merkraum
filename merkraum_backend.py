@@ -73,6 +73,15 @@ SYMMETRIC_TYPES = {"CONTRADICTS", "COMPLEMENTS"}
 
 VSM_LEVELS = ["S1", "S2", "S3", "S4", "S5"]
 
+# Knowledge type taxonomy (SUP-162, Norman Z1579 directive).
+# Classifies the epistemological nature of knowledge, orthogonal to node_type.
+# - fact: Permanent world facts (e.g., "Berlin is the capital of Germany"). High confidence, no expiry.
+# - state: Temporary current-state facts (e.g., "Merkraum has 0 users"). Changes frequently, should expire.
+# - rule: Rules, policies, procedures (e.g., "S3 review every 10 cycles"). Changes rarely.
+# - belief: Subjective assessments with uncertainty (e.g., "competitive window is 3-8 months").
+# - memory: Episodic memories of events (e.g., "Norman sent voice message on Mar 16").
+KNOWLEDGE_TYPES = ["fact", "state", "rule", "belief", "memory"]
+
 # Default TTLs by VSM level (days). None = no expiration.
 VSM_DEFAULT_TTL_DAYS = {
     "S1": 30,    # Operational — fast-cycling task data
@@ -535,6 +544,9 @@ class Neo4jBaseAdapter(BackendAdapter):
                     vsm_level = ent.get("vsm_level") or None
                     if vsm_level and vsm_level not in VSM_LEVELS:
                         vsm_level = None
+                    knowledge_type = ent.get("knowledge_type") or None
+                    if knowledge_type and knowledge_type not in KNOWLEDGE_TYPES:
+                        knowledge_type = None
                     # Apply default TTL from VSM level if no explicit valid_until
                     if not valid_until and vsm_level:
                         ttl_days = VSM_DEFAULT_TTL_DAYS.get(vsm_level)
@@ -553,6 +565,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                         node_id=node_id,
                         valid_until=valid_until,
                         vsm_level=vsm_level,
+                        knowledge_type=knowledge_type,
                     )
 
                     tx = session.begin_transaction()
@@ -581,7 +594,8 @@ class Neo4jBaseAdapter(BackendAdapter):
                                     n.status = 'active', n.confidence = $confidence,
                                     n.project_id = $project_id, n.node_id = $node_id,
                                     n.valid_until = $valid_until,
-                                    n.vsm_level = $vsm_level
+                                    n.vsm_level = $vsm_level,
+                                    n.knowledge_type = $knowledge_type
                                 ON MATCH SET
                                     n.summary = $summary, n.updated_at = $now,
                                     n.node_id = coalesce(n.node_id, $node_id),
@@ -590,7 +604,9 @@ class Neo4jBaseAdapter(BackendAdapter):
                                     n.valid_until = CASE WHEN $valid_until IS NOT NULL
                                         THEN $valid_until ELSE n.valid_until END,
                                     n.vsm_level = CASE WHEN $vsm_level IS NOT NULL
-                                        THEN $vsm_level ELSE n.vsm_level END
+                                        THEN $vsm_level ELSE n.vsm_level END,
+                                    n.knowledge_type = CASE WHEN $knowledge_type IS NOT NULL
+                                        THEN $knowledge_type ELSE n.knowledge_type END
                                 """,
                                 **params,
                             )
@@ -604,7 +620,8 @@ class Neo4jBaseAdapter(BackendAdapter):
                                     n.source_type = $source_type,
                                     n.project_id = $project_id, n.node_id = $node_id,
                                     n.valid_until = $valid_until,
-                                    n.vsm_level = $vsm_level
+                                    n.vsm_level = $vsm_level,
+                                    n.knowledge_type = $knowledge_type
                                 ON MATCH SET
                                     n.summary = CASE WHEN size($summary) > size(coalesce(n.summary, ''))
                                         THEN $summary ELSE n.summary END,
@@ -613,7 +630,9 @@ class Neo4jBaseAdapter(BackendAdapter):
                                     n.valid_until = CASE WHEN $valid_until IS NOT NULL
                                         THEN $valid_until ELSE n.valid_until END,
                                     n.vsm_level = CASE WHEN $vsm_level IS NOT NULL
-                                        THEN $vsm_level ELSE n.vsm_level END
+                                        THEN $vsm_level ELSE n.vsm_level END,
+                                    n.knowledge_type = CASE WHEN $knowledge_type IS NOT NULL
+                                        THEN $knowledge_type ELSE n.knowledge_type END
                                 """,
                                 **params,
                             )
@@ -632,6 +651,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                             "summary": ent.get("summary", ""),
                             "valid_until": valid_until,
                             "vsm_level": vsm_level,
+                            "knowledge_type": knowledge_type,
                         }
                         if node_type == "Belief":
                             after_payload["confidence"] = ent.get("confidence", 0.7)
@@ -796,7 +816,7 @@ class Neo4jBaseAdapter(BackendAdapter):
         return written
 
     def query_nodes(self, node_type=None, project_id="default", limit=100,
-                    vsm_level=None, include_expired=False):
+                    vsm_level=None, include_expired=False, knowledge_type=None):
         self._ensure_project_node_ids(project_id)
         results = []
         with self._driver.session() as session:
@@ -804,29 +824,36 @@ class Neo4jBaseAdapter(BackendAdapter):
             if vsm_level and vsm_level in VSM_LEVELS:
                 vsm_filter = " AND n.vsm_level = $vsm_level"
             expired_filter = "" if include_expired else " AND n.expired_at IS NULL"
+            kt_filter = ""
+            if knowledge_type and knowledge_type in KNOWLEDGE_TYPES:
+                kt_filter = " AND n.knowledge_type = $knowledge_type"
             if node_type and node_type in NODE_TYPES:
                 cypher = f"""
                 MATCH (n:{node_type} {{project_id: $pid}})
-                WHERE true{vsm_filter}{expired_filter}
+                WHERE true{vsm_filter}{expired_filter}{kt_filter}
                 RETURN n.name AS name, n.summary AS summary,
                        labels(n)[0] AS type, n.created_at AS created,
                        n.node_id AS node_id, n.confidence AS confidence,
-                       n.valid_until AS valid_until, n.vsm_level AS vsm_level
+                       n.valid_until AS valid_until, n.vsm_level AS vsm_level,
+                       n.knowledge_type AS knowledge_type
                 ORDER BY n.updated_at DESC LIMIT $limit
                 """
             else:
                 cypher = f"""
                 MATCH (n {{project_id: $pid}})
-                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types){vsm_filter}{expired_filter}
+                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types){vsm_filter}{expired_filter}{kt_filter}
                 RETURN n.name AS name, n.summary AS summary,
                        labels(n)[0] AS type, n.created_at AS created,
                        n.node_id AS node_id, n.confidence AS confidence,
-                       n.valid_until AS valid_until, n.vsm_level AS vsm_level
+                       n.valid_until AS valid_until, n.vsm_level AS vsm_level,
+                       n.knowledge_type AS knowledge_type
                 ORDER BY n.updated_at DESC LIMIT $limit
                 """
             params = {"pid": project_id, "limit": limit}
             if vsm_level and vsm_level in VSM_LEVELS:
                 params["vsm_level"] = vsm_level
+            if knowledge_type and knowledge_type in KNOWLEDGE_TYPES:
+                params["knowledge_type"] = knowledge_type
             if not (node_type and node_type in NODE_TYPES):
                 params["node_types"] = list(NODE_TYPES)
             records = session.run(cypher, **params)
@@ -843,6 +870,8 @@ class Neo4jBaseAdapter(BackendAdapter):
                     entry["valid_until"] = rec["valid_until"]
                 if rec.get("vsm_level"):
                     entry["vsm_level"] = rec["vsm_level"]
+                if rec.get("knowledge_type"):
+                    entry["knowledge_type"] = rec["knowledge_type"]
                 results.append(entry)
         return results
 
@@ -1142,35 +1171,42 @@ class Neo4jBaseAdapter(BackendAdapter):
                     })
         return {"nodes": list(nodes.values()), "edges": edges}
 
-    def get_beliefs(self, project_id="default", status="active"):
+    def get_beliefs(self, project_id="default", status="active",
+                    knowledge_type=None):
         beliefs = []
         with self._driver.session() as session:
+            kt_filter = ""
+            if knowledge_type and knowledge_type in KNOWLEDGE_TYPES:
+                kt_filter = " AND b.knowledge_type = $knowledge_type"
             if status == "active":
-                cypher = """
-                MATCH (b:Belief {project_id: $pid})
+                cypher = f"""
+                MATCH (b:Belief {{project_id: $pid}})
                 WHERE b.active = true
-                  AND (b.status IS NULL OR b.status = 'active')
+                  AND (b.status IS NULL OR b.status = 'active'){kt_filter}
                 RETURN b.name AS name, b.summary AS summary,
                        b.confidence AS confidence, b.source_cycle AS cycle,
                        b.valid_until AS valid_until, b.vsm_level AS vsm_level,
                        b.node_id AS node_id, b.updated_at AS updated_at,
-                       b.status AS status
+                       b.status AS status, b.knowledge_type AS knowledge_type
                 ORDER BY b.confidence DESC
                 """
             else:
-                cypher = """
-                MATCH (b:Belief {project_id: $pid})
-                WHERE b.status = $status
+                cypher = f"""
+                MATCH (b:Belief {{project_id: $pid}})
+                WHERE b.status = $status{kt_filter}
                 RETURN b.name AS name, b.summary AS summary,
                        b.confidence AS confidence, b.source_cycle AS cycle,
                        b.valid_until AS valid_until, b.vsm_level AS vsm_level,
                        b.node_id AS node_id, b.updated_at AS updated_at,
-                       b.status AS status
+                       b.status AS status, b.knowledge_type AS knowledge_type
                 ORDER BY b.updated_at DESC
                 """
-            records = session.run(cypher, pid=project_id, status=status)
+            params = {"pid": project_id, "status": status}
+            if knowledge_type and knowledge_type in KNOWLEDGE_TYPES:
+                params["knowledge_type"] = knowledge_type
+            records = session.run(cypher, **params)
             for rec in records:
-                beliefs.append({
+                entry = {
                     "name": rec["name"],
                     "summary": rec["summary"],
                     "confidence": rec["confidence"],
@@ -1180,12 +1216,15 @@ class Neo4jBaseAdapter(BackendAdapter):
                     "node_id": rec["node_id"],
                     "updated_at": rec["updated_at"],
                     "status": rec["status"] or "active",
-                })
+                }
+                if rec.get("knowledge_type"):
+                    entry["knowledge_type"] = rec["knowledge_type"]
+                beliefs.append(entry)
         return beliefs
 
     def get_stats(self, project_id="default"):
         stats = {"nodes": {}, "edges": {}, "total_nodes": 0, "total_edges": 0,
-                 "vsm_levels": {}}
+                 "vsm_levels": {}, "knowledge_types": {}}
         with self._driver.session() as session:
             for nt in NODE_TYPES:
                 result = session.run(
@@ -1217,6 +1256,17 @@ class Neo4jBaseAdapter(BackendAdapter):
             )
             for rec in result:
                 stats["vsm_levels"][rec["level"]] = rec["c"]
+            # Knowledge type distribution
+            result = session.run(
+                """MATCH (n {project_id: $pid})
+                WHERE n.knowledge_type IS NOT NULL
+                  AND any(lbl IN labels(n) WHERE lbl IN $node_types)
+                RETURN n.knowledge_type AS kt, count(n) AS c
+                ORDER BY n.knowledge_type""",
+                pid=project_id, node_types=list(NODE_TYPES),
+            )
+            for rec in result:
+                stats["knowledge_types"][rec["kt"]] = rec["c"]
         return stats
 
     def delete_project_data(self, project_id):

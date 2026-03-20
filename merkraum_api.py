@@ -38,8 +38,8 @@ from merkraum_acl import is_auth_required, is_project_allowed, split_csv_env
 from flask import Flask, jsonify, request, current_app
 
 from merkraum_backend import (
-    create_adapter, NODE_TYPES, RELATIONSHIP_TYPES, Neo4jBaseAdapter,
-    NodeLimitExceeded, TIER_LIMITS,
+    create_adapter, NODE_TYPES, RELATIONSHIP_TYPES, KNOWLEDGE_TYPES,
+    Neo4jBaseAdapter, NodeLimitExceeded, TIER_LIMITS,
 )
 from jwt_auth import get_cognito_validator, require_auth, require_scope, PATValidator
 
@@ -697,6 +697,8 @@ def _map_belief(b: dict) -> dict:
         result["node_id"] = b["node_id"]
     if b.get("updated_at") is not None:
         result["updated_at"] = b["updated_at"]
+    if b.get("knowledge_type") is not None:
+        result["knowledge_type"] = b["knowledge_type"]
     return result
 
 
@@ -780,6 +782,16 @@ For entities with a known expiration or temporal boundary, set "valid_until" (IS
 - Only set valid_until when the text provides temporal cues. When uncertain, omit it.
 - If vsm_level is set but valid_until is omitted, a default TTL is applied based on the level (S1=30d, S2=90d, S3=180d, S4=365d, S5=none).
 
+## KNOWLEDGE TYPE CLASSIFICATION:
+Classify each entity by the epistemological nature of its knowledge using "knowledge_type":
+- fact: Permanent world facts that are objectively true and rarely change. E.g., "Berlin is the capital of Germany", "Stafford Beer created the VSM". High confidence, typically no expiry.
+- state: Temporary current-state facts that describe how things are NOW but will change. E.g., "Merkraum has 0 users", "Budget is at 70%". Should have valid_until set.
+- rule: Rules, policies, procedures, or operational constraints. E.g., "S3 review every 10 cycles", "GDPR applies to EU data". Changes rarely.
+- belief: Subjective assessments, opinions, or uncertain propositions. E.g., "Competitive window is 3-8 months", "Agent memory market will consolidate". Always has confidence < 1.0.
+- memory: Episodic memories of specific events or actions. E.g., "Norman sent directive on Mar 16", "Security incident occurred at Z1294". Temporal, tied to a moment.
+Set "knowledge_type" to one of: fact, state, rule, belief, memory. When uncertain, omit it (null).
+Heuristics: established truths → fact, current metrics/status → state, documented procedures → rule, assessments/predictions → belief, past events/actions → memory.
+
 ## CONTRADICTION RULES (for CONTRADICTS relationships):
 8. Only use CONTRADICTS when two beliefs are about the SAME subject with SAME scope.
 9. Different scopes are NOT contradictions. Examples of different scopes:
@@ -800,7 +812,8 @@ Return a JSON object with two arrays: "entities" and "relationships".
       "summary": "one-paragraph description, max 500 chars",
       "confidence": 0.9,
       "valid_until": "2026-06-30T00:00:00Z or null",
-      "vsm_level": "S1 or S2 or S3 or S4 or S5 or null"
+      "vsm_level": "S1 or S2 or S3 or S4 or S5 or null",
+      "knowledge_type": "fact or state or rule or belief or memory or null"
     }}
   ],
   "relationships": [
@@ -1567,13 +1580,14 @@ def usage():
 @require_auth
 @require_scope("read")
 def beliefs():
-    """Beliefs list filtered by status.
+    """Beliefs list filtered by status and/or knowledge type.
 
     Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
 
     Query params:
         project: project id (default: "default")
         status: active | uncertain | contradicted | superseded (default: "active")
+        knowledge_type: fact | state | rule | belief | memory (optional)
     """
     if adapter is None:
         return _error("Adapter not initialized", 503)
@@ -1582,6 +1596,7 @@ def beliefs():
     if denied:
         return denied
     status = request.args.get("status", "active") or "active"
+    knowledge_type = request.args.get("knowledge_type") or None
     valid_statuses = {"active", "uncertain", "contradicted", "superseded", "consolidated"}
     if status not in valid_statuses:
         return _error(
@@ -1589,7 +1604,8 @@ def beliefs():
             400,
         )
     try:
-        raw = adapter.get_beliefs(project_id=project, status=status)
+        raw = adapter.get_beliefs(project_id=project, status=status,
+                                  knowledge_type=knowledge_type)
         return jsonify([_map_belief(b) for b in raw])
     except Exception as exc:
         logger.exception("beliefs failed for project=%s status=%s", project, status)
@@ -1920,12 +1936,13 @@ def graph_expand():
 @require_auth
 @require_scope("read")
 def nodes():
-    """Query nodes, optionally filtered by type and VSM level.
+    """Query nodes, optionally filtered by type, VSM level, and knowledge type.
 
     Query params:
         project: project id (default: "default")
         type: node type label, e.g. Belief, Concept, Person (optional)
         vsm_level: VSM system level filter, e.g. S1, S2, S3, S4, S5 (optional)
+        knowledge_type: knowledge type filter, e.g. fact, state, rule, belief, memory (optional)
         limit: max results (default: 100)
     """
     if adapter is None:
@@ -1936,6 +1953,7 @@ def nodes():
         return denied
     node_type = request.args.get("type") or None
     vsm_level = request.args.get("vsm_level") or None
+    knowledge_type = request.args.get("knowledge_type") or None
     try:
         limit = int(request.args.get("limit", 100))
     except (TypeError, ValueError):
@@ -1945,7 +1963,7 @@ def nodes():
     try:
         results = adapter.query_nodes(
             node_type=node_type, project_id=project, limit=limit,
-            vsm_level=vsm_level,
+            vsm_level=vsm_level, knowledge_type=knowledge_type,
         )
         return jsonify(results)
     except Exception as exc:
