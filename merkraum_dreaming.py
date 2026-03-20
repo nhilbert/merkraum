@@ -37,6 +37,38 @@ logger = logging.getLogger("merkraum-dreaming")
 
 
 # ---------------------------------------------------------------------------
+# Model configuration — SUP-159: Dream Analysis Model Upgrade
+# ---------------------------------------------------------------------------
+# Replay: lightweight analysis of graph walks → Haiku (cost-efficient, many calls)
+# Consolidation: quality abstraction of episodic beliefs → Sonnet (accuracy matters)
+# Reflection: no LLM (pure structural analysis)
+
+_DEFAULT_REPLAY_MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+_DEFAULT_CONSOLIDATION_MODEL = "eu.anthropic.claude-sonnet-4-6"
+
+
+def _get_replay_model() -> str | None:
+    """Return the model for replay phase (env override or default)."""
+    return os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL") or _DEFAULT_REPLAY_MODEL
+
+
+def _get_consolidation_model() -> str | None:
+    """Return the model for consolidation phase (env override or default)."""
+    return os.environ.get("MERKRAUM_DREAMING_CONSOLIDATION_MODEL") or _DEFAULT_CONSOLIDATION_MODEL
+
+
+def get_dreaming_config() -> dict:
+    """Return current dreaming model configuration for diagnostics."""
+    return {
+        "replay_model": _get_replay_model(),
+        "consolidation_model": _get_consolidation_model(),
+        "reflection_model": None,  # No LLM used
+        "replay_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL") else "default",
+        "consolidation_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_CONSOLIDATION_MODEL") else "default",
+    }
+
+
+# ---------------------------------------------------------------------------
 # Progress message types — structured for frontend consumption
 # ---------------------------------------------------------------------------
 
@@ -228,7 +260,7 @@ def replay(
             f"Walk path: {walk_text}\n\nSubgraph:\n{subgraph_text}",
             temperature=0.4,
             json_schema=_replay_schema,
-            model=os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL"),
+            model=_get_replay_model(),
         )
 
         walk_result = {
@@ -399,7 +431,7 @@ def consolidate(
             f"Consolidate these related beliefs:\n{beliefs_text}",
             temperature=0.3,
             json_schema=_consolidation_schema,
-            model=os.environ.get("MERKRAUM_DREAMING_CONSOLIDATION_MODEL"),
+            model=_get_consolidation_model(),
         )
 
         if not result or "abstract_belief" not in result:

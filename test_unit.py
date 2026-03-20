@@ -2190,5 +2190,82 @@ class TestConfidenceDecayRates(unittest.TestCase):
                                f"State decay rate should exceed {kt}")
 
 
+# --- Dreaming model configuration tests (SUP-159) ---
+
+class TestDreamingModelConfig(unittest.TestCase):
+    """Test dreaming engine model selection — SUP-159."""
+
+    def test_default_replay_model_is_haiku(self):
+        """Replay phase should default to Haiku (cost-efficient)."""
+        from merkraum_dreaming import _DEFAULT_REPLAY_MODEL, _get_replay_model
+        self.assertIn("haiku", _DEFAULT_REPLAY_MODEL.lower())
+        # Without env override, should return default
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MERKRAUM_DREAMING_REPLAY_MODEL", None)
+            self.assertEqual(_get_replay_model(), _DEFAULT_REPLAY_MODEL)
+
+    def test_default_consolidation_model_is_sonnet(self):
+        """Consolidation phase should default to Sonnet (quality matters)."""
+        from merkraum_dreaming import _DEFAULT_CONSOLIDATION_MODEL, _get_consolidation_model
+        self.assertIn("sonnet", _DEFAULT_CONSOLIDATION_MODEL.lower())
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MERKRAUM_DREAMING_CONSOLIDATION_MODEL", None)
+            self.assertEqual(_get_consolidation_model(), _DEFAULT_CONSOLIDATION_MODEL)
+
+    def test_env_override_replay_model(self):
+        """Env var should override replay model."""
+        from merkraum_dreaming import _get_replay_model
+        with patch.dict(os.environ, {"MERKRAUM_DREAMING_REPLAY_MODEL": "custom-model"}):
+            self.assertEqual(_get_replay_model(), "custom-model")
+
+    def test_env_override_consolidation_model(self):
+        """Env var should override consolidation model."""
+        from merkraum_dreaming import _get_consolidation_model
+        with patch.dict(os.environ, {"MERKRAUM_DREAMING_CONSOLIDATION_MODEL": "custom-model"}):
+            self.assertEqual(_get_consolidation_model(), "custom-model")
+
+    def test_get_dreaming_config_structure(self):
+        """get_dreaming_config should return all expected keys."""
+        from merkraum_dreaming import get_dreaming_config
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MERKRAUM_DREAMING_REPLAY_MODEL", None)
+            os.environ.pop("MERKRAUM_DREAMING_CONSOLIDATION_MODEL", None)
+            config = get_dreaming_config()
+        self.assertIn("replay_model", config)
+        self.assertIn("consolidation_model", config)
+        self.assertIn("reflection_model", config)
+        self.assertIn("replay_model_source", config)
+        self.assertIn("consolidation_model_source", config)
+        self.assertIsNone(config["reflection_model"])
+
+    def test_get_dreaming_config_source_default(self):
+        """Source should be 'default' when no env override."""
+        from merkraum_dreaming import get_dreaming_config
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MERKRAUM_DREAMING_REPLAY_MODEL", None)
+            os.environ.pop("MERKRAUM_DREAMING_CONSOLIDATION_MODEL", None)
+            config = get_dreaming_config()
+        self.assertEqual(config["replay_model_source"], "default")
+        self.assertEqual(config["consolidation_model_source"], "default")
+
+    def test_get_dreaming_config_source_env(self):
+        """Source should be 'env' when env var is set."""
+        from merkraum_dreaming import get_dreaming_config
+        with patch.dict(os.environ, {
+            "MERKRAUM_DREAMING_REPLAY_MODEL": "x",
+            "MERKRAUM_DREAMING_CONSOLIDATION_MODEL": "y",
+        }):
+            config = get_dreaming_config()
+        self.assertEqual(config["replay_model_source"], "env")
+        self.assertEqual(config["consolidation_model_source"], "env")
+
+    def test_consolidation_model_different_from_replay(self):
+        """Default consolidation model should be higher quality than replay."""
+        from merkraum_dreaming import _DEFAULT_REPLAY_MODEL, _DEFAULT_CONSOLIDATION_MODEL
+        self.assertNotEqual(_DEFAULT_REPLAY_MODEL, _DEFAULT_CONSOLIDATION_MODEL)
+        self.assertIn("sonnet", _DEFAULT_CONSOLIDATION_MODEL.lower())
+        self.assertIn("haiku", _DEFAULT_REPLAY_MODEL.lower())
+
+
 if __name__ == "__main__":
     unittest.main()

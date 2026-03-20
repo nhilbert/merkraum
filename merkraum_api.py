@@ -1269,6 +1269,7 @@ def get_dreaming_config(project_id):
                 "replay_hops": 5,
                 "consolidation_threshold": 0.75,
             },
+            "models": _get_dreaming_model_config(),
         })
     except Exception as exc:
         logger.exception("get_dreaming_config failed for %s", project_id)
@@ -2781,7 +2782,7 @@ def revoke_token(token_prefix: str):
 # Dreaming — async graph dreaming with SSE progress streaming
 # ---------------------------------------------------------------------------
 
-from merkraum_dreaming import dream as _dream_engine
+from merkraum_dreaming import dream as _dream_engine, get_dreaming_config as _get_dreaming_model_config
 
 # In-memory dream job store (same pattern as MCP ingestion jobs)
 _dream_jobs: dict[str, dict] = {}
