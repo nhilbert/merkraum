@@ -595,7 +595,11 @@ class Neo4jBaseAdapter(BackendAdapter):
                             "name": ent["name"],
                             "node_type": node_type,
                             "summary": ent.get("summary", ""),
+                            "valid_until": valid_until,
+                            "vsm_level": vsm_level,
                         }
+                        if node_type == "Belief":
+                            after_payload["confidence"] = ent.get("confidence", 0.7)
                         self._log_history(tx, op_id, ent["name"], project_id,
                                           action,
                                           before_state if before_state else payload,
@@ -716,35 +720,36 @@ class Neo4jBaseAdapter(BackendAdapter):
                         }
                         action = "update_relationship" if before_state else "create_relationship"
 
-                        if summary.counters.relationships_created > 0:
+                        created = summary.counters.relationships_created > 0
+                        updated = summary.counters.properties_set > 0
+
+                        # Always log — even no-op MERGEs get an audit entry
+                        if created or updated:
                             written += 1
-                            self._log_history(tx, op_id, rel_name, project_id,
-                                              action, payload, actor)
-                            self._log_operation(tx, op_id, "relationship_upsert",
-                                                actor, project_id, payload=payload,
-                                                before_state=before_state,
-                                                after_state=payload)
-                            if rel_type in SYMMETRIC_TYPES:
-                                inverse = f"""
-                                MATCH (a {{name: $target, project_id: $project_id}})
-                                MATCH (b {{name: $source, project_id: $project_id}})
-                                MERGE (a)-[r:{rel_type}]->(b)
-                                ON CREATE SET
-                                    r.confidence = $confidence, r.reason = $reason,
-                                    r.source_cycle = $source_cycle,
-                                    r.source_type = $source_type,
-                                    r.created_at = $now, r.active = true,
-                                    r.weight = $confidence, r.valid_from = $valid_from
-                                """
-                                tx.run(inverse, **params)
-                        elif summary.counters.properties_set > 0:
-                            written += 1
-                            self._log_history(tx, op_id, rel_name, project_id,
-                                              action, before_state or payload, actor)
-                            self._log_operation(tx, op_id, "relationship_upsert",
-                                                actor, project_id, payload=payload,
-                                                before_state=before_state,
-                                                after_state=payload)
+                        op_type_detail = "relationship_upsert"
+                        if not created and not updated:
+                            action = "noop_relationship"
+                        self._log_history(tx, op_id, rel_name, project_id,
+                                          action,
+                                          before_state or payload, actor)
+                        self._log_operation(tx, op_id, op_type_detail,
+                                            actor, project_id, payload=payload,
+                                            before_state=before_state,
+                                            after_state=payload)
+
+                        if created and rel_type in SYMMETRIC_TYPES:
+                            inverse = f"""
+                            MATCH (a {{name: $target, project_id: $project_id}})
+                            MATCH (b {{name: $source, project_id: $project_id}})
+                            MERGE (a)-[r:{rel_type}]->(b)
+                            ON CREATE SET
+                                r.confidence = $confidence, r.reason = $reason,
+                                r.source_cycle = $source_cycle,
+                                r.source_type = $source_type,
+                                r.created_at = $now, r.active = true,
+                                r.weight = $confidence, r.valid_from = $valid_from
+                            """
+                            tx.run(inverse, **params)
 
                         tx.commit()
                     except Exception as inner_exc:
@@ -891,7 +896,10 @@ class Neo4jBaseAdapter(BackendAdapter):
                 WHERE b.active = true
                   AND (b.status IS NULL OR b.status = 'active')
                 RETURN b.name AS name, b.summary AS summary,
-                       b.confidence AS confidence, b.source_cycle AS cycle
+                       b.confidence AS confidence, b.source_cycle AS cycle,
+                       b.valid_until AS valid_until, b.vsm_level AS vsm_level,
+                       b.node_id AS node_id, b.updated_at AS updated_at,
+                       b.status AS status
                 ORDER BY b.confidence DESC
                 """
             else:
@@ -899,7 +907,10 @@ class Neo4jBaseAdapter(BackendAdapter):
                 MATCH (b:Belief {project_id: $pid})
                 WHERE b.status = $status
                 RETURN b.name AS name, b.summary AS summary,
-                       b.confidence AS confidence, b.source_cycle AS cycle
+                       b.confidence AS confidence, b.source_cycle AS cycle,
+                       b.valid_until AS valid_until, b.vsm_level AS vsm_level,
+                       b.node_id AS node_id, b.updated_at AS updated_at,
+                       b.status AS status
                 ORDER BY b.updated_at DESC
                 """
             records = session.run(cypher, pid=project_id, status=status)
@@ -909,6 +920,11 @@ class Neo4jBaseAdapter(BackendAdapter):
                     "summary": rec["summary"],
                     "confidence": rec["confidence"],
                     "cycle": rec["cycle"],
+                    "valid_until": rec["valid_until"],
+                    "vsm_level": rec["vsm_level"],
+                    "node_id": rec["node_id"],
+                    "updated_at": rec["updated_at"],
+                    "status": rec["status"] or "active",
                 })
         return beliefs
 
@@ -1171,7 +1187,7 @@ class Neo4jBaseAdapter(BackendAdapter):
     def update_belief(self, name, project_id="default", confidence=None,
                       status=None, summary=None, valid_until=None,
                       actor="api"):
-        valid_statuses = ("active", "superseded")
+        valid_statuses = ("active", "uncertain", "contradicted", "superseded")
         if status is not None and status not in valid_statuses:
             return {"updated": False, "name": name,
                     "error": f"Invalid status: {status}. Valid: {valid_statuses}"}
@@ -1187,9 +1203,9 @@ class Neo4jBaseAdapter(BackendAdapter):
             changes["confidence"] = confidence
         if status is not None:
             set_clauses.append("b.status = $status")
-            if status == "superseded":
+            if status in ("superseded",):
                 set_clauses.append("b.active = false")
-            elif status == "active":
+            elif status in ("active", "uncertain", "contradicted"):
                 set_clauses.append("b.active = true")
             changes["status"] = status
         if summary is not None:

@@ -674,13 +674,23 @@ def _map_stats(raw: dict) -> dict:
 
 def _map_belief(b: dict) -> dict:
     """Map adapter belief dict to frontend format."""
-    return {
+    result = {
         "name": b.get("name", ""),
         "summary": b.get("summary", ""),
         "confidence": b.get("confidence", 0),
         "status": b.get("status", "active"),
         "source": b.get("cycle", b.get("source_cycle", "")),
     }
+    # Include audit-relevant fields when available
+    if b.get("valid_until") is not None:
+        result["valid_until"] = b["valid_until"]
+    if b.get("vsm_level") is not None:
+        result["vsm_level"] = b["vsm_level"]
+    if b.get("node_id") is not None:
+        result["node_id"] = b["node_id"]
+    if b.get("updated_at") is not None:
+        result["updated_at"] = b["updated_at"]
+    return result
 
 
 def _map_node_for_graph(n: dict) -> dict:
@@ -1579,6 +1589,62 @@ def beliefs():
         return _error(str(exc))
 
 
+@app.route("/api/beliefs", methods=["PATCH"])
+@require_auth
+@require_scope("write")
+def update_belief_api():
+    """Update a belief's confidence, status, summary, or valid_until.
+
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
+
+    JSON body:
+        {
+            "name": "belief name (required)",
+            "project": "project_id (default: 'default')",
+            "confidence": 0.0-1.0 (optional),
+            "status": "active|uncertain|contradicted|superseded" (optional),
+            "summary": "updated summary text" (optional),
+            "valid_until": "ISO 8601 datetime" (optional)
+        }
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+
+    body = request.get_json(silent=True)
+    if not body:
+        return _error("Request body must be JSON", 400)
+
+    name = (body.get("name") or "").strip()
+    if not name:
+        return _error("'name' field is required", 400)
+
+    project = body.get("project") or "default"
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    actor = getattr(request, "username", None) or getattr(request, "user_id", None) or "api"
+
+    try:
+        result = adapter.update_belief(
+            name=name,
+            project_id=project,
+            confidence=body.get("confidence"),
+            status=body.get("status"),
+            summary=body.get("summary"),
+            valid_until=body.get("valid_until"),
+            actor=actor,
+        )
+        if result.get("updated"):
+            return jsonify(result)
+        else:
+            code = 404 if "not found" in result.get("error", "") else 400
+            return jsonify(result), code
+    except Exception as exc:
+        logger.exception("update_belief failed for name=%s project=%s", name, project)
+        return _error(str(exc))
+
+
 @app.route("/api/contradictions", methods=["GET"])
 @require_auth
 @require_scope("read")
@@ -1936,6 +2002,8 @@ def ingest():
         entities_written = 0
         relationships_written = 0
 
+        actor = getattr(request, "username", None) or getattr(request, "user_id", None) or "api"
+
         if entities:
             entities_written = adapter.write_entities(
                 entities,
@@ -1943,6 +2011,7 @@ def ingest():
                 source_type="api",
                 project_id=project,
                 node_limit=node_limit,
+                actor=actor,
             )
 
         if relationships:
@@ -1951,6 +2020,7 @@ def ingest():
                 source_cycle=source,
                 source_type="api",
                 project_id=project,
+                actor=actor,
             )
 
         return jsonify(
@@ -2087,6 +2157,7 @@ def ingest_text():
     try:
         entities_written = 0
         relationships_written = 0
+        actor = getattr(request, "username", None) or getattr(request, "user_id", None) or "text_extraction"
 
         if entities:
             entities_written = adapter.write_entities(
@@ -2095,6 +2166,7 @@ def ingest_text():
                 source_type="text_extraction",
                 project_id=project,
                 node_limit=node_limit,
+                actor=actor,
             )
 
         if relationships:
@@ -2103,6 +2175,7 @@ def ingest_text():
                 source_cycle=source,
                 source_type="text_extraction",
                 project_id=project,
+                actor=actor,
             )
 
         return jsonify({

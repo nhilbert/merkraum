@@ -390,17 +390,17 @@ class TestGetBeliefs(unittest.TestCase):
     def test_uncertain_status(self):
         self.adapter.get_beliefs(project_id="test", status="uncertain")
         cypher = self.session.run.call_args[0][0]
-        self.assertIn("confidence < 0.5", cypher)
+        self.assertIn("b.status = $status", cypher)
 
     def test_contradicted_status(self):
         self.adapter.get_beliefs(project_id="test", status="contradicted")
         cypher = self.session.run.call_args[0][0]
-        self.assertIn("CONTRADICTS", cypher)
+        self.assertIn("b.status = $status", cypher)
 
     def test_superseded_status(self):
         self.adapter.get_beliefs(project_id="test", status="superseded")
         cypher = self.session.run.call_args[0][0]
-        self.assertIn("superseded", cypher)
+        self.assertIn("b.status = $status", cypher)
 
 
 class TestGetStats(unittest.TestCase):
