@@ -1955,5 +1955,240 @@ class TestRenewNode(unittest.TestCase):
         self.assertEqual(result["new_valid_until"], "2027-12-31T00:00:00+00:00")
 
 
+class TestApplyConfidenceDecay(unittest.TestCase):
+    """Test apply_confidence_decay certainty management method."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.tx = MagicMock()
+        self.session.begin_transaction.return_value = self.tx
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def _make_belief_rec(self, name, confidence, knowledge_type, days_ago):
+        """Create a mock belief record updated days_ago days in the past."""
+        from datetime import datetime, timedelta, timezone
+        updated = (datetime.now(timezone.utc) - timedelta(days=days_ago)).isoformat()
+        data = {
+            "name": name, "confidence": confidence,
+            "knowledge_type": knowledge_type, "updated_at": updated,
+            "source_cycle": "Z1", "vsm_level": "S4",
+        }
+        rec = MagicMock()
+        rec.__getitem__ = lambda s, k: data[k]
+        rec.get = lambda k, d=None: data.get(k, d)
+        return rec
+
+    def test_dry_run_returns_decay_preview(self):
+        """dry_run=True should return affected beliefs without modifying."""
+        rec = self._make_belief_rec("Stale belief", 0.8, "belief", days_ago=30)
+        self.session.run.return_value = [rec]
+
+        result = self.adapter.apply_confidence_decay(project_id="proj", dry_run=True)
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["total"], 1)
+        self.assertLess(result["decayed"][0]["new_confidence"],
+                        result["decayed"][0]["old_confidence"])
+        self.session.begin_transaction.assert_not_called()
+
+    def test_facts_are_exempt_from_decay(self):
+        """Facts should not decay regardless of age."""
+        rec = self._make_belief_rec("Permanent fact", 0.9, "fact", days_ago=365)
+        self.session.run.return_value = [rec]
+
+        result = self.adapter.apply_confidence_decay(project_id="proj", dry_run=True)
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["unchanged"], 1)
+
+    def test_state_decays_fastest(self):
+        """State knowledge type should decay faster than belief."""
+        state_rec = self._make_belief_rec("Current state", 0.8, "state", days_ago=30)
+        belief_rec = self._make_belief_rec("An opinion", 0.8, "belief", days_ago=30)
+        self.session.run.return_value = [state_rec, belief_rec]
+
+        result = self.adapter.apply_confidence_decay(project_id="proj", dry_run=True)
+        self.assertEqual(result["total"], 2)
+        state_new = result["decayed"][0]["new_confidence"]
+        belief_new = result["decayed"][1]["new_confidence"]
+        self.assertLess(state_new, belief_new)
+
+    def test_respects_floor(self):
+        """Confidence should never decay below the floor for the knowledge type."""
+        rec = self._make_belief_rec("Very old state", 0.2, "state", days_ago=365)
+        self.session.run.return_value = [rec]
+
+        result = self.adapter.apply_confidence_decay(project_id="proj", dry_run=True)
+        if result["total"] > 0:
+            self.assertGreaterEqual(result["decayed"][0]["new_confidence"], 0.1)
+
+    def test_recent_beliefs_unchanged(self):
+        """Beliefs updated less than 1 day ago should not decay."""
+        rec = self._make_belief_rec("Fresh belief", 0.8, "belief", days_ago=0)
+        self.session.run.return_value = [rec]
+
+        result = self.adapter.apply_confidence_decay(project_id="proj", dry_run=True)
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["unchanged"], 1)
+
+    def test_apply_commits_changes(self):
+        """dry_run=False should commit confidence changes to Neo4j."""
+        rec = self._make_belief_rec("Old belief", 0.8, "belief", days_ago=60)
+        self.session.run.return_value = [rec]
+        self.tx.run.return_value = MagicMock()
+
+        result = self.adapter.apply_confidence_decay(
+            project_id="proj", dry_run=False)
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(result["total"], 1)
+        self.tx.commit.assert_called_once()
+
+    def test_unclassified_uses_default_rate(self):
+        """Beliefs with no knowledge_type should use the default decay rate."""
+        rec = self._make_belief_rec("Untyped belief", 0.8, None, days_ago=30)
+        self.session.run.return_value = [rec]
+
+        result = self.adapter.apply_confidence_decay(project_id="proj", dry_run=True)
+        self.assertEqual(result["total"], 1)
+        self.assertIn("decay_rate", result["decayed"][0])
+
+
+class TestGetCertaintyReviewQueue(unittest.TestCase):
+    """Test get_certainty_review_queue method."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_returns_all_categories(self):
+        """Review queue should have all 5 expected categories."""
+        self.session.run.return_value = []
+        result = self.adapter.get_certainty_review_queue(project_id="proj")
+        self.assertIn("queue", result)
+        self.assertIn("total_items", result)
+        for cat in ["stale", "low_confidence", "type_mismatch",
+                     "approaching_expiry", "unclassified"]:
+            self.assertIn(cat, result["queue"])
+
+    def test_stale_beliefs_detected(self):
+        """Beliefs not updated in 30+ days should appear in stale category."""
+        from datetime import datetime, timedelta, timezone
+        old_date = (datetime.now(timezone.utc) - timedelta(days=45)).isoformat()
+        stale_rec = MagicMock()
+        data = {"name": "Old belief", "confidence": 0.7, "kt": "belief",
+                "updated_at": old_date, "vsm_level": "S4"}
+        stale_rec.__getitem__ = lambda s, k: data[k]
+        stale_rec.get = lambda k, d=None: data.get(k, d)
+        # First call returns stale, rest return empty
+        self.session.run.side_effect = [[stale_rec], [], [], [], []]
+
+        result = self.adapter.get_certainty_review_queue(project_id="proj")
+        self.assertEqual(len(result["queue"]["stale"]), 1)
+        self.assertEqual(result["queue"]["stale"][0]["name"], "Old belief")
+
+    def test_empty_graph_returns_zero_items(self):
+        """Empty graph should return zero items in all categories."""
+        self.session.run.return_value = []
+        result = self.adapter.get_certainty_review_queue(project_id="proj")
+        self.assertEqual(result["total_items"], 0)
+
+
+class TestGetCertaintyStats(unittest.TestCase):
+    """Test get_certainty_stats method."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_returns_all_sections(self):
+        """Stats should include histogram, type_confidence, staleness, governance."""
+        # Mock all the queries to return empty/zero
+        zero_single = MagicMock(single=MagicMock(return_value={"c": 0}))
+        self.session.run.return_value = zero_single
+        # Override to return iterable for histogram and type-confidence
+        self.session.run.side_effect = [
+            [],  # histogram
+            [],  # type_confidence
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # fresh
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # aging
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # stale
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # total_active
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # low_conf
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # contradicted
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # unclassified
+        ]
+        result = self.adapter.get_certainty_stats(project_id="proj")
+        self.assertIn("confidence_histogram", result)
+        self.assertIn("type_confidence", result)
+        self.assertIn("staleness", result)
+        self.assertIn("governance_summary", result)
+
+    def test_governance_healthy_when_no_issues(self):
+        """Empty graph should report healthy governance."""
+        self.session.run.side_effect = [
+            [],  # histogram
+            [],  # type_confidence
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # fresh
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # aging
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # stale
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # total_active
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # low_conf
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # contradicted
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # unclassified
+        ]
+        result = self.adapter.get_certainty_stats(project_id="proj")
+        self.assertEqual(result["governance_summary"]["health"], "healthy")
+
+    def test_governance_needs_attention_with_contradictions(self):
+        """Contradicted beliefs should trigger needs_attention health."""
+        self.session.run.side_effect = [
+            [],  # histogram
+            [],  # type_confidence
+            MagicMock(single=MagicMock(return_value={"c": 5})),  # fresh
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # aging
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # stale
+            MagicMock(single=MagicMock(return_value={"c": 10})),  # total_active
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # low_conf
+            MagicMock(single=MagicMock(return_value={"c": 3})),  # contradicted
+            MagicMock(single=MagicMock(return_value={"c": 0})),  # unclassified
+        ]
+        result = self.adapter.get_certainty_stats(project_id="proj")
+        self.assertEqual(result["governance_summary"]["health"], "needs_attention")
+
+
+class TestConfidenceDecayRates(unittest.TestCase):
+    """Test CONFIDENCE_DECAY_RATES constants."""
+
+    def test_all_knowledge_types_have_decay_config(self):
+        """Every KNOWLEDGE_TYPE should have a decay config entry."""
+        from merkraum_backend import CONFIDENCE_DECAY_RATES, KNOWLEDGE_TYPES
+        for kt in KNOWLEDGE_TYPES:
+            self.assertIn(kt, CONFIDENCE_DECAY_RATES,
+                          f"Missing decay config for knowledge type: {kt}")
+
+    def test_default_decay_exists(self):
+        """None key should exist for unclassified nodes."""
+        from merkraum_backend import CONFIDENCE_DECAY_RATES
+        self.assertIn(None, CONFIDENCE_DECAY_RATES)
+
+    def test_fact_has_no_decay(self):
+        """Facts should have no decay rate (rate_per_day=None)."""
+        from merkraum_backend import CONFIDENCE_DECAY_RATES
+        self.assertIsNone(CONFIDENCE_DECAY_RATES["fact"]["rate_per_day"])
+
+    def test_state_decays_fastest(self):
+        """State should have the highest decay rate."""
+        from merkraum_backend import CONFIDENCE_DECAY_RATES
+        state_rate = CONFIDENCE_DECAY_RATES["state"]["rate_per_day"]
+        for kt in ["rule", "belief", "memory"]:
+            other_rate = CONFIDENCE_DECAY_RATES[kt]["rate_per_day"]
+            self.assertGreater(state_rate, other_rate,
+                               f"State decay rate should exceed {kt}")
+
+
 if __name__ == "__main__":
     unittest.main()

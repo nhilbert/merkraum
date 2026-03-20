@@ -1198,6 +1198,114 @@ async def renew_node(
         return {"error": str(e)}
 
 
+# --- Certainty Management (SUP-163) ---
+
+@mcp.tool()
+async def certainty_decay(
+    dry_run: bool = True,
+    project: str = None,
+) -> dict:
+    """Apply time-based confidence decay to active beliefs.
+
+    Confidence decays based on knowledge_type: 'state' decays fastest,
+    'memory' slowest, 'fact' is exempt. Use dry_run=True (default) to
+    preview which beliefs would be affected and by how much.
+
+    Args:
+        dry_run: If True, only show what would change without applying. Default True.
+        project: Project ID (uses authenticated user's default if omitted).
+    """
+    start = time.time()
+    auth = await _require_auth()
+    if isinstance(auth, dict) and "error" in auth:
+        return auth
+    project = project or auth.get("project_id", "default")
+    try:
+        result = adapter.apply_confidence_decay(
+            project_id=project, dry_run=dry_run,
+            actor=auth.get("sub", "mcp"),
+        )
+        audit_log("certainty_decay", "authed",
+                  {"project": project, "dry_run": dry_run},
+                  int((time.time() - start) * 1000),
+                  "ok" if result.get("total", 0) >= 0 else "error")
+        return result
+    except Exception as e:
+        audit_log("certainty_decay", "authed",
+                  {"project": project, "dry_run": dry_run},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def certainty_review(
+    limit: int = 50,
+    project: str = None,
+) -> dict:
+    """Get beliefs needing review based on certainty governance rules.
+
+    Surfaces beliefs that need attention: stale (not updated in 30+ days),
+    low confidence (<=0.3), type-confidence mismatches (e.g. 'fact' at low
+    confidence), approaching expiry (within 7 days), and unclassified
+    (no knowledge_type set).
+
+    Args:
+        limit: Maximum items per category (1-200). Default 50.
+        project: Project ID (uses authenticated user's default if omitted).
+    """
+    start = time.time()
+    auth = await _require_auth()
+    if isinstance(auth, dict) and "error" in auth:
+        return auth
+    project = project or auth.get("project_id", "default")
+    limit = max(1, min(limit, 200))
+    try:
+        result = adapter.get_certainty_review_queue(
+            project_id=project, limit=limit,
+        )
+        audit_log("certainty_review", "authed",
+                  {"project": project, "limit": limit},
+                  int((time.time() - start) * 1000), "ok")
+        return result
+    except Exception as e:
+        audit_log("certainty_review", "authed",
+                  {"project": project},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def certainty_stats(
+    project: str = None,
+) -> dict:
+    """Confidence distribution statistics for certainty governance.
+
+    Returns confidence histogram, average confidence per knowledge_type,
+    staleness distribution (fresh/aging/stale), and a governance health
+    summary. Use this to understand the overall epistemic health of a
+    knowledge graph.
+
+    Args:
+        project: Project ID (uses authenticated user's default if omitted).
+    """
+    start = time.time()
+    auth = await _require_auth()
+    if isinstance(auth, dict) and "error" in auth:
+        return auth
+    project = project or auth.get("project_id", "default")
+    try:
+        result = adapter.get_certainty_stats(project_id=project)
+        audit_log("certainty_stats", "authed",
+                  {"project": project},
+                  int((time.time() - start) * 1000), "ok")
+        return result
+    except Exception as e:
+        audit_log("certainty_stats", "authed",
+                  {"project": project},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
 @mcp.tool()
 async def get_usage(
     tier: str = "free",

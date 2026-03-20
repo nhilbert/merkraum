@@ -82,6 +82,19 @@ VSM_LEVELS = ["S1", "S2", "S3", "S4", "S5"]
 # - memory: Episodic memories of events (e.g., "Norman sent voice message on Mar 16").
 KNOWLEDGE_TYPES = ["fact", "state", "rule", "belief", "memory"]
 
+# Confidence decay rates per knowledge type (SUP-163, Certainty Management).
+# rate_per_day: daily multiplicative decay factor (applied as confidence * (1 - rate)^days)
+# floor: minimum confidence after decay (never decays below this)
+# None rate = no decay (facts are permanent truths).
+CONFIDENCE_DECAY_RATES = {
+    "fact": {"rate_per_day": None, "floor": 0.5},       # No decay — permanent truths
+    "state": {"rate_per_day": 0.02, "floor": 0.1},      # Fast decay — current-state facts go stale
+    "rule": {"rate_per_day": 0.002, "floor": 0.3},      # Slow decay — policies change rarely
+    "belief": {"rate_per_day": 0.005, "floor": 0.1},    # Medium decay — subjective assessments
+    "memory": {"rate_per_day": 0.001, "floor": 0.2},    # Very slow — episodic memories fade
+    None: {"rate_per_day": 0.003, "floor": 0.1},         # Default for unclassified nodes
+}
+
 # Default TTLs by VSM level (days). None = no expiration.
 VSM_DEFAULT_TTL_DAYS = {
     "S1": 30,    # Operational — fast-cycling task data
@@ -1753,6 +1766,432 @@ class Neo4jBaseAdapter(BackendAdapter):
             except Exception as exc:
                 tx.rollback()
                 return {"ok": False, "error": str(exc)}
+
+    # --- Certainty Management (SUP-163) ---
+
+    def apply_confidence_decay(self, project_id="default", dry_run=True,
+                               actor="system"):
+        """Apply time-based confidence decay to all active beliefs.
+
+        Decay rate depends on knowledge_type (CONFIDENCE_DECAY_RATES).
+        Confidence decays as: new = max(floor, current * (1 - rate)^days_since_update).
+        Facts (knowledge_type='fact') are exempt from decay.
+
+        Args:
+            project_id: Scope to a specific project.
+            dry_run: If True, return what would change without applying.
+            actor: Who triggered the decay (for audit trail).
+
+        Returns:
+            dict with 'decayed' list, 'total' count, 'unchanged' count.
+        """
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        decayed = []
+        unchanged = 0
+        op_id = self._operation_id()
+
+        with self._driver.session() as session:
+            # Get all active beliefs with their current state
+            records = list(session.run(
+                """
+                MATCH (b:Belief {project_id: $pid})
+                WHERE b.active = true AND b.confidence IS NOT NULL
+                RETURN b.name AS name, b.confidence AS confidence,
+                       b.knowledge_type AS knowledge_type,
+                       b.updated_at AS updated_at,
+                       b.source_cycle AS source_cycle,
+                       b.vsm_level AS vsm_level
+                ORDER BY b.confidence DESC
+                """,
+                pid=project_id,
+            ))
+
+            for rec in records:
+                kt = rec.get("knowledge_type")
+                decay_config = CONFIDENCE_DECAY_RATES.get(kt,
+                               CONFIDENCE_DECAY_RATES[None])
+
+                # No decay for this knowledge type
+                if decay_config["rate_per_day"] is None:
+                    unchanged += 1
+                    continue
+
+                # Calculate days since last update
+                updated_at = rec.get("updated_at")
+                if not updated_at:
+                    unchanged += 1
+                    continue
+                try:
+                    last_update = datetime.fromisoformat(
+                        updated_at.replace("Z", "+00:00"))
+                    days_elapsed = (now - last_update).total_seconds() / 86400.0
+                except (ValueError, TypeError):
+                    unchanged += 1
+                    continue
+
+                if days_elapsed < 1.0:
+                    unchanged += 1
+                    continue
+
+                current = rec["confidence"]
+                rate = decay_config["rate_per_day"]
+                floor = decay_config["floor"]
+                new_confidence = max(floor,
+                                     current * ((1.0 - rate) ** days_elapsed))
+                new_confidence = round(new_confidence, 4)
+
+                # Skip if change is negligible (< 0.001)
+                if abs(current - new_confidence) < 0.001:
+                    unchanged += 1
+                    continue
+
+                entry = {
+                    "name": rec["name"],
+                    "knowledge_type": kt,
+                    "old_confidence": current,
+                    "new_confidence": new_confidence,
+                    "days_since_update": round(days_elapsed, 1),
+                    "decay_rate": rate,
+                }
+
+                if not dry_run:
+                    tx = session.begin_transaction()
+                    try:
+                        before_state = {
+                            "confidence": current,
+                            "knowledge_type": kt,
+                        }
+                        tx.run(
+                            """
+                            MATCH (b:Belief {name: $name, project_id: $pid})
+                            SET b.confidence = $conf, b.updated_at = $now
+                            """,
+                            name=rec["name"], pid=project_id,
+                            conf=new_confidence, now=now_iso,
+                        )
+                        after_state = {
+                            "confidence": new_confidence,
+                            "knowledge_type": kt,
+                        }
+                        self._log_operation(
+                            tx, op_id, "confidence_decay", actor,
+                            project_id,
+                            payload={"name": rec["name"],
+                                     "old": current, "new": new_confidence,
+                                     "days": round(days_elapsed, 1)},
+                            before_state=before_state,
+                            after_state=after_state)
+                        tx.commit()
+                    except Exception:
+                        tx.rollback()
+                        continue
+
+                decayed.append(entry)
+
+        return {
+            "decayed": decayed,
+            "total": len(decayed),
+            "unchanged": unchanged,
+            "dry_run": dry_run,
+            "operation_id": op_id if not dry_run else None,
+        }
+
+    def get_certainty_review_queue(self, project_id="default", limit=50):
+        """Surface beliefs needing human review based on certainty governance.
+
+        Flags beliefs for review when:
+        - Stale: active belief not updated in 30+ days
+        - Low confidence: active belief with confidence <= 0.3
+        - Type-confidence mismatch: e.g. 'fact' at low confidence,
+          'belief' at 1.0 confidence
+        - Approaching expiry: valid_until within 7 days
+        - Unclassified: active belief with no knowledge_type set
+
+        Args:
+            project_id: Scope to a specific project.
+            limit: Max items per category.
+
+        Returns:
+            dict with categorized review items.
+        """
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        stale_cutoff = (now - timedelta(days=30)).isoformat()
+        expiry_horizon = (now + timedelta(days=7)).isoformat()
+        queue = {
+            "stale": [],
+            "low_confidence": [],
+            "type_mismatch": [],
+            "approaching_expiry": [],
+            "unclassified": [],
+        }
+
+        with self._driver.session() as session:
+            # Stale beliefs (not updated in 30+ days, still active)
+            records = session.run(
+                """
+                MATCH (b:Belief {project_id: $pid})
+                WHERE b.active = true
+                  AND b.updated_at IS NOT NULL
+                  AND b.updated_at < $cutoff
+                RETURN b.name AS name, b.confidence AS confidence,
+                       b.knowledge_type AS kt, b.updated_at AS updated_at,
+                       b.vsm_level AS vsm_level
+                ORDER BY b.updated_at ASC
+                LIMIT $lim
+                """,
+                pid=project_id, cutoff=stale_cutoff, lim=limit,
+            )
+            for rec in records:
+                try:
+                    last = datetime.fromisoformat(
+                        rec["updated_at"].replace("Z", "+00:00"))
+                    days = round((now - last).total_seconds() / 86400.0, 0)
+                except (ValueError, TypeError):
+                    days = None
+                queue["stale"].append({
+                    "name": rec["name"],
+                    "confidence": rec["confidence"],
+                    "knowledge_type": rec.get("kt"),
+                    "days_stale": int(days) if days else None,
+                    "reason": "Not updated in 30+ days",
+                })
+
+            # Low confidence (active beliefs with confidence <= 0.3)
+            records = session.run(
+                """
+                MATCH (b:Belief {project_id: $pid})
+                WHERE b.active = true AND b.confidence <= 0.3
+                RETURN b.name AS name, b.confidence AS confidence,
+                       b.knowledge_type AS kt, b.vsm_level AS vsm_level,
+                       b.updated_at AS updated_at
+                ORDER BY b.confidence ASC
+                LIMIT $lim
+                """,
+                pid=project_id, lim=limit,
+            )
+            for rec in records:
+                queue["low_confidence"].append({
+                    "name": rec["name"],
+                    "confidence": rec["confidence"],
+                    "knowledge_type": rec.get("kt"),
+                    "reason": "Confidence at or below 0.3",
+                })
+
+            # Type-confidence mismatches
+            # Case 1: 'fact' with confidence < 0.7 (if it's a fact, why so uncertain?)
+            # Case 2: 'belief' with confidence == 1.0 (should be reclassified as fact)
+            # Case 3: 'state' past valid_until but not yet expired
+            records = session.run(
+                """
+                MATCH (b:Belief {project_id: $pid})
+                WHERE b.active = true AND (
+                  (b.knowledge_type = 'fact' AND b.confidence < 0.7)
+                  OR (b.knowledge_type = 'belief' AND b.confidence >= 1.0)
+                  OR (b.knowledge_type = 'state' AND b.valid_until IS NOT NULL
+                      AND b.valid_until < $now AND b.expired_at IS NULL)
+                )
+                RETURN b.name AS name, b.confidence AS confidence,
+                       b.knowledge_type AS kt, b.valid_until AS valid_until,
+                       b.vsm_level AS vsm_level
+                ORDER BY b.name
+                LIMIT $lim
+                """,
+                pid=project_id, now=now_iso, lim=limit,
+            )
+            for rec in records:
+                kt = rec.get("kt")
+                conf = rec["confidence"]
+                if kt == "fact" and conf < 0.7:
+                    reason = f"Fact at low confidence ({conf}) — verify or reclassify"
+                elif kt == "belief" and conf >= 1.0:
+                    reason = "Belief at 100% confidence — should be reclassified as fact"
+                else:
+                    reason = "State node past valid_until — should be expired or renewed"
+                queue["type_mismatch"].append({
+                    "name": rec["name"],
+                    "confidence": conf,
+                    "knowledge_type": kt,
+                    "valid_until": rec.get("valid_until"),
+                    "reason": reason,
+                })
+
+            # Approaching expiry (valid_until within 7 days)
+            records = session.run(
+                """
+                MATCH (b:Belief {project_id: $pid})
+                WHERE b.active = true
+                  AND b.valid_until IS NOT NULL
+                  AND b.valid_until > $now
+                  AND b.valid_until < $horizon
+                  AND b.expired_at IS NULL
+                RETURN b.name AS name, b.confidence AS confidence,
+                       b.knowledge_type AS kt, b.valid_until AS valid_until,
+                       b.vsm_level AS vsm_level
+                ORDER BY b.valid_until ASC
+                LIMIT $lim
+                """,
+                pid=project_id, now=now_iso, horizon=expiry_horizon, lim=limit,
+            )
+            for rec in records:
+                queue["approaching_expiry"].append({
+                    "name": rec["name"],
+                    "confidence": rec["confidence"],
+                    "knowledge_type": rec.get("kt"),
+                    "valid_until": rec["valid_until"],
+                    "reason": "Expiring within 7 days — renew or let expire",
+                })
+
+            # Unclassified (no knowledge_type set)
+            records = session.run(
+                """
+                MATCH (b:Belief {project_id: $pid})
+                WHERE b.active = true
+                  AND (b.knowledge_type IS NULL OR b.knowledge_type = '')
+                RETURN b.name AS name, b.confidence AS confidence,
+                       b.vsm_level AS vsm_level, b.updated_at AS updated_at
+                ORDER BY b.updated_at DESC
+                LIMIT $lim
+                """,
+                pid=project_id, lim=limit,
+            )
+            for rec in records:
+                queue["unclassified"].append({
+                    "name": rec["name"],
+                    "confidence": rec["confidence"],
+                    "reason": "No knowledge_type — classify for proper decay and governance",
+                })
+
+        total = sum(len(v) for v in queue.values())
+        return {"queue": queue, "total_items": total}
+
+    def get_certainty_stats(self, project_id="default"):
+        """Confidence distribution statistics for certainty governance.
+
+        Returns:
+            dict with confidence histogram, type-confidence cross-tab,
+            staleness distribution, and governance summary.
+        """
+        now = datetime.now(timezone.utc)
+        stats = {
+            "confidence_histogram": {},
+            "type_confidence": {},
+            "staleness": {"fresh": 0, "aging": 0, "stale": 0},
+            "governance_summary": {},
+        }
+
+        with self._driver.session() as session:
+            # Confidence histogram (buckets of 0.1)
+            records = session.run(
+                """
+                MATCH (b:Belief {project_id: $pid})
+                WHERE b.active = true AND b.confidence IS NOT NULL
+                RETURN
+                  CASE
+                    WHEN b.confidence >= 0.9 THEN '0.9-1.0'
+                    WHEN b.confidence >= 0.8 THEN '0.8-0.9'
+                    WHEN b.confidence >= 0.7 THEN '0.7-0.8'
+                    WHEN b.confidence >= 0.6 THEN '0.6-0.7'
+                    WHEN b.confidence >= 0.5 THEN '0.5-0.6'
+                    WHEN b.confidence >= 0.4 THEN '0.4-0.5'
+                    WHEN b.confidence >= 0.3 THEN '0.3-0.4'
+                    WHEN b.confidence >= 0.2 THEN '0.2-0.3'
+                    WHEN b.confidence >= 0.1 THEN '0.1-0.2'
+                    ELSE '0.0-0.1'
+                  END AS bucket,
+                  count(b) AS c
+                ORDER BY bucket DESC
+                """,
+                pid=project_id,
+            )
+            for rec in records:
+                stats["confidence_histogram"][rec["bucket"]] = rec["c"]
+
+            # Type-confidence cross-tab (avg confidence per knowledge_type)
+            records = session.run(
+                """
+                MATCH (b:Belief {project_id: $pid})
+                WHERE b.active = true AND b.confidence IS NOT NULL
+                RETURN
+                  COALESCE(b.knowledge_type, 'unclassified') AS kt,
+                  count(b) AS count,
+                  round(avg(b.confidence) * 1000) / 1000.0 AS avg_conf,
+                  round(min(b.confidence) * 1000) / 1000.0 AS min_conf,
+                  round(max(b.confidence) * 1000) / 1000.0 AS max_conf
+                ORDER BY kt
+                """,
+                pid=project_id,
+            )
+            for rec in records:
+                stats["type_confidence"][rec["kt"]] = {
+                    "count": rec["count"],
+                    "avg_confidence": rec["avg_conf"],
+                    "min_confidence": rec["min_conf"],
+                    "max_confidence": rec["max_conf"],
+                }
+
+            # Staleness distribution (fresh <7d, aging 7-30d, stale >30d)
+            for label, where in [
+                ("fresh", "b.updated_at >= $d7"),
+                ("aging", "b.updated_at >= $d30 AND b.updated_at < $d7"),
+                ("stale", "b.updated_at < $d30"),
+            ]:
+                result = session.run(
+                    f"""
+                    MATCH (b:Belief {{project_id: $pid}})
+                    WHERE b.active = true AND b.updated_at IS NOT NULL
+                      AND {where}
+                    RETURN count(b) AS c
+                    """,
+                    pid=project_id,
+                    d7=(now - timedelta(days=7)).isoformat(),
+                    d30=(now - timedelta(days=30)).isoformat(),
+                )
+                stats["staleness"][label] = result.single()["c"]
+
+            # Governance summary
+            total_active = session.run(
+                "MATCH (b:Belief {project_id: $pid}) WHERE b.active = true "
+                "RETURN count(b) AS c",
+                pid=project_id,
+            ).single()["c"]
+
+            low_conf = session.run(
+                "MATCH (b:Belief {project_id: $pid}) "
+                "WHERE b.active = true AND b.confidence <= 0.3 "
+                "RETURN count(b) AS c",
+                pid=project_id,
+            ).single()["c"]
+
+            contradicted = session.run(
+                "MATCH (b:Belief {project_id: $pid}) "
+                "WHERE b.status = 'contradicted' AND b.active = true "
+                "RETURN count(b) AS c",
+                pid=project_id,
+            ).single()["c"]
+
+            unclassified = session.run(
+                "MATCH (b:Belief {project_id: $pid}) "
+                "WHERE b.active = true "
+                "AND (b.knowledge_type IS NULL OR b.knowledge_type = '') "
+                "RETURN count(b) AS c",
+                pid=project_id,
+            ).single()["c"]
+
+            stats["governance_summary"] = {
+                "total_active_beliefs": total_active,
+                "low_confidence_count": low_conf,
+                "contradicted_count": contradicted,
+                "unclassified_count": unclassified,
+                "stale_count": stats["staleness"]["stale"],
+                "health": ("healthy" if (low_conf == 0 and contradicted == 0
+                           and (total_active == 0
+                                or unclassified < total_active * 0.1))
+                           else "needs_attention"),
+            }
+
+        return stats
 
     def add_relationship(self, source, target, rel_type, project_id="default",
                          reason="", confidence=0.7,

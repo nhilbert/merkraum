@@ -2099,6 +2099,103 @@ def nodes_renew():
         return _error(str(exc))
 
 
+# --- Certainty Management (SUP-163) ---
+
+@app.route("/api/certainty/decay", methods=["POST"])
+@require_auth
+@require_scope("write")
+def certainty_decay():
+    """Apply time-based confidence decay to active beliefs.
+
+    Decay rates vary by knowledge_type. Facts are exempt.
+    Use dry_run=true (default) to preview changes.
+
+    JSON body (all optional):
+        project: project id (default: from JWT)
+        dry_run: if true, return what would change without applying (default: true)
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    body = request.get_json(silent=True) or {}
+    project = body.get("project") or _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+    dry_run = body.get("dry_run", True)
+    actor = getattr(request, "username", None) or getattr(request, "user_id", "api")
+
+    try:
+        result = adapter.apply_confidence_decay(
+            project_id=project, dry_run=dry_run, actor=actor,
+        )
+        return jsonify(result)
+    except Exception as exc:
+        logger.exception("certainty_decay failed for project=%s", project)
+        return _error(str(exc))
+
+
+@app.route("/api/certainty/review", methods=["GET"])
+@require_auth
+@require_scope("read")
+def certainty_review():
+    """Get beliefs needing review based on certainty governance rules.
+
+    Returns categorized items: stale, low_confidence, type_mismatch,
+    approaching_expiry, unclassified.
+
+    Query params:
+        project: project id (default: from JWT)
+        limit: max items per category (default: 50)
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+    try:
+        limit = int(request.args.get("limit", 50))
+    except (TypeError, ValueError):
+        limit = 50
+    limit = max(1, min(limit, 200))
+
+    try:
+        result = adapter.get_certainty_review_queue(
+            project_id=project, limit=limit,
+        )
+        return jsonify(result)
+    except Exception as exc:
+        logger.exception("certainty_review failed for project=%s", project)
+        return _error(str(exc))
+
+
+@app.route("/api/certainty/stats", methods=["GET"])
+@require_auth
+@require_scope("read")
+def certainty_stats():
+    """Confidence distribution statistics for certainty governance.
+
+    Returns confidence histogram, type-confidence cross-tab,
+    staleness distribution, and governance health summary.
+
+    Query params:
+        project: project id (default: from JWT)
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    try:
+        result = adapter.get_certainty_stats(project_id=project)
+        return jsonify(result)
+    except Exception as exc:
+        logger.exception("certainty_stats failed for project=%s", project)
+        return _error(str(exc))
+
+
 @app.route("/api/traverse/<path:entity>", methods=["GET"])
 @require_auth
 @require_scope("read")
