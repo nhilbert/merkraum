@@ -2834,6 +2834,7 @@ def _run_dream_job(job_id: str):
             consolidation_threshold=job.get("consolidation_threshold", 0.75),
             consolidation_dry_run=job.get("consolidation_dry_run", False),
             seed=job.get("seed"),
+            maintenance_dry_run=job.get("maintenance_dry_run", False),
         )
         result = None
         try:
@@ -2863,11 +2864,12 @@ def dream_trigger():
     """Trigger a dream session (async). Returns job_id for status polling / SSE.
 
     Request body (all optional):
-        phases: ["replay", "consolidation", "reflection"]
+        phases: ["replay", "consolidation", "reflection", "maintenance"]
         replay_hops: int (default 5)
         replay_walks: int (default 3)
         consolidation_threshold: float (default 0.75)
         consolidation_dry_run: bool (default false)
+        maintenance_dry_run: bool (default false)
         seed: str (optional starting entity for replay)
     """
     project = _project_id()
@@ -2906,6 +2908,7 @@ def dream_trigger():
             "replay_walks": min(body.get("replay_walks", 3), 5),
             "consolidation_threshold": body.get("consolidation_threshold", 0.75),
             "consolidation_dry_run": body.get("consolidation_dry_run", False),
+            "maintenance_dry_run": body.get("maintenance_dry_run", False),
             "seed": body.get("seed"),
         }
 

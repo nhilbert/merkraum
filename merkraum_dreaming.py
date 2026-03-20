@@ -5,7 +5,7 @@ Merkraum Dreaming Engine — neuroscience-inspired memory consolidation.
 Universal logic module: no Flask, no hosting dependencies.
 Designed for open-source sharing — all hosting/user logic stays in the API layer.
 
-Three operations inspired by memory consolidation research
+Four operations inspired by memory consolidation research
 (McClelland et al., O'Reilly & Frank):
 
 1. Replay (hippocampal replay): Random walks through the graph surface
@@ -14,6 +14,8 @@ Three operations inspired by memory consolidation research
    are merged into abstract, generalizable beliefs.
 3. Reflection (Default Mode Network): Structural health analysis —
    orphan detection, hub over-centralization, schema discipline.
+4. Maintenance (synaptic pruning): Confidence decay on stale beliefs,
+   certainty review queue, governance health assessment.
 
 All operations yield progress messages via generators, enabling
 async monitoring and live visualization in the frontend.
@@ -649,7 +651,116 @@ def reflect(
 
 
 # ---------------------------------------------------------------------------
-# Full Dream Session — orchestrates all three phases
+# Phase 4: Maintenance — confidence decay and knowledge hygiene
+# ---------------------------------------------------------------------------
+
+def maintain(
+    adapter: Neo4jBaseAdapter,
+    project_id: str = "default",
+    dry_run: bool = False,
+) -> Generator[dict, None, dict]:
+    """Synaptic pruning — apply confidence decay and surface review needs.
+
+    Biologically inspired: during sleep, synapses are pruned and
+    strengthened based on recent use. This phase decays stale beliefs
+    and surfaces nodes needing human review.
+
+    Args:
+        adapter: Backend adapter (Neo4j + vector store)
+        project_id: Project to maintain
+        dry_run: If True, preview changes without applying
+
+    Yields progress messages. Returns final result dict.
+    """
+    mode = "preview" if dry_run else "apply"
+    yield _msg("maintenance", "start",
+               f"Knowledge maintenance ({mode} mode)...")
+
+    # Step 1: Apply confidence decay
+    yield _msg("maintenance", "decay_start", "Applying confidence decay...")
+    decay_result = adapter.apply_confidence_decay(
+        project_id=project_id, dry_run=dry_run, actor="dreaming-maintenance")
+
+    decayed_count = decay_result.get("total", 0)
+    unchanged_count = decay_result.get("unchanged", 0)
+
+    yield _msg("maintenance", "decay_done",
+               f"Decay: {decayed_count} belief(s) {'would be ' if dry_run else ''}adjusted, "
+               f"{unchanged_count} unchanged",
+               {"decayed": decayed_count, "unchanged": unchanged_count,
+                "dry_run": dry_run})
+
+    # Log individual decays for transparency
+    for entry in decay_result.get("decayed", [])[:10]:  # Cap at 10 for progress
+        yield _msg("maintenance", "decay_item",
+                   f"  {entry['name']}: {entry['old_confidence']:.3f} → "
+                   f"{entry['new_confidence']:.3f} "
+                   f"({entry['days_since_update']:.0f}d, {entry['knowledge_type'] or 'unclassified'})")
+
+    if decayed_count > 10:
+        yield _msg("maintenance", "decay_truncated",
+                   f"  ... and {decayed_count - 10} more")
+
+    # Step 2: Surface review queue
+    yield _msg("maintenance", "review_start", "Checking certainty review queue...")
+    review_result = adapter.get_certainty_review_queue(
+        project_id=project_id, limit=20)
+
+    review_categories = review_result.get("categories", {})
+    total_review = sum(
+        len(items) for items in review_categories.values()
+    )
+
+    category_summary = {
+        cat: len(items)
+        for cat, items in review_categories.items()
+        if items
+    }
+
+    yield _msg("maintenance", "review_done",
+               f"Review queue: {total_review} item(s) across "
+               f"{len(category_summary)} categor{'y' if len(category_summary) == 1 else 'ies'}",
+               {"total": total_review, "categories": category_summary})
+
+    # Step 3: Certainty statistics summary
+    yield _msg("maintenance", "stats_start", "Computing governance statistics...")
+    stats_result = adapter.get_certainty_stats(project_id=project_id)
+
+    governance = stats_result.get("governance", {})
+    health_status = governance.get("status", "unknown")
+
+    yield _msg("maintenance", "stats_done",
+               f"Governance health: {health_status}",
+               {"governance": governance})
+
+    result = {
+        "phase": "maintenance",
+        "status": "completed",
+        "mode": mode,
+        "decay": {
+            "applied": not dry_run,
+            "decayed_count": decayed_count,
+            "unchanged_count": unchanged_count,
+            "items": decay_result.get("decayed", []),
+        },
+        "review_queue": {
+            "total": total_review,
+            "categories": category_summary,
+        },
+        "governance_health": health_status,
+    }
+
+    yield _msg("maintenance", "done",
+               f"Maintenance complete — {decayed_count} decay(s), "
+               f"{total_review} review item(s), health: {health_status}",
+               {"decayed": decayed_count, "review_items": total_review,
+                "health": health_status})
+
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Full Dream Session — orchestrates all four phases
 # ---------------------------------------------------------------------------
 
 def dream(
@@ -661,22 +772,24 @@ def dream(
     consolidation_threshold: float = 0.75,
     consolidation_dry_run: bool = False,
     seed: str | None = None,
+    maintenance_dry_run: bool = False,
 ) -> Generator[dict, None, dict]:
-    """Run a full dreaming session (replay → consolidation → reflection).
+    """Run a full dreaming session (replay → consolidation → reflection → maintenance).
 
     Args:
         adapter: Backend adapter (Neo4j + vector store)
         project_id: Project to dream about
-        phases: Which phases to run (default: all three)
+        phases: Which phases to run (default: all four)
         replay_hops: Steps per random walk
         replay_walks: Number of random walks
         consolidation_threshold: Similarity threshold for belief clustering
         consolidation_dry_run: If True, preview consolidation without applying
         seed: Optional starting entity for replay
+        maintenance_dry_run: If True, preview confidence decay without applying
 
     Yields progress messages. Returns combined result dict.
     """
-    active_phases = phases or ["replay", "consolidation", "reflection"]
+    active_phases = phases or ["replay", "consolidation", "reflection", "maintenance"]
     session_id = str(uuid.uuid4())[:8]
     start_time = time.time()
 
@@ -724,6 +837,18 @@ def dream(
         except StopIteration as e:
             reflection_result = e.value
         results["phases"]["reflection"] = reflection_result or {}
+
+    if "maintenance" in active_phases:
+        yield _msg("dream", "phase_start", "Phase 4: Maintenance (synaptic pruning)")
+        gen = maintain(adapter, project_id, dry_run=maintenance_dry_run)
+        maintenance_result = None
+        try:
+            while True:
+                progress = next(gen)
+                yield progress
+        except StopIteration as e:
+            maintenance_result = e.value
+        results["phases"]["maintenance"] = maintenance_result or {}
 
     elapsed = round(time.time() - start_time, 1)
     results["duration_seconds"] = elapsed

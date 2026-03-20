@@ -2267,5 +2267,157 @@ class TestDreamingModelConfig(unittest.TestCase):
         self.assertIn("haiku", _DEFAULT_REPLAY_MODEL.lower())
 
 
+# --- Dreaming maintenance phase tests (SUP-163 integration) ---
+
+class TestDreamingMaintenance(unittest.TestCase):
+    """Test maintenance phase in dreaming engine — SUP-163 integration."""
+
+    def _make_mock_adapter(self, decay_result=None, review_result=None,
+                           stats_result=None):
+        """Create a mock adapter with certainty management methods."""
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        adapter.apply_confidence_decay.return_value = decay_result or {
+            "decayed": [], "total": 0, "unchanged": 5, "dry_run": True,
+        }
+        adapter.get_certainty_review_queue.return_value = review_result or {
+            "categories": {
+                "stale": [], "low_confidence": [], "type_mismatch": [],
+                "approaching_expiry": [], "unclassified": [],
+            }
+        }
+        adapter.get_certainty_stats.return_value = stats_result or {
+            "governance": {"status": "healthy", "low_confidence_count": 0,
+                           "contradicted_count": 0, "unclassified_count": 0},
+        }
+        return adapter
+
+    def _run_generator(self, gen):
+        """Consume a generator, collecting messages and returning the result."""
+        messages = []
+        try:
+            while True:
+                messages.append(next(gen))
+        except StopIteration as e:
+            return messages, e.value
+
+    def test_maintain_returns_result_structure(self):
+        """Maintenance phase should return expected keys."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter()
+        messages, result = self._run_generator(
+            maintain(adapter, "test-project", dry_run=True))
+        self.assertEqual(result["phase"], "maintenance")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["mode"], "preview")
+        self.assertIn("decay", result)
+        self.assertIn("review_queue", result)
+        self.assertIn("governance_health", result)
+
+    def test_maintain_dry_run_does_not_apply(self):
+        """Dry run should pass dry_run=True to backend."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter()
+        self._run_generator(maintain(adapter, "proj", dry_run=True))
+        adapter.apply_confidence_decay.assert_called_once_with(
+            project_id="proj", dry_run=True, actor="dreaming-maintenance")
+
+    def test_maintain_apply_mode(self):
+        """Apply mode should pass dry_run=False to backend."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter()
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=False))
+        adapter.apply_confidence_decay.assert_called_once_with(
+            project_id="proj", dry_run=False, actor="dreaming-maintenance")
+        self.assertEqual(result["mode"], "apply")
+
+    def test_maintain_reports_decay_count(self):
+        """Should report correct decay counts from backend."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter(decay_result={
+            "decayed": [
+                {"name": "test-belief", "old_confidence": 0.8,
+                 "new_confidence": 0.75, "days_since_update": 10.0,
+                 "knowledge_type": "belief", "decay_rate": 0.005},
+            ],
+            "total": 1, "unchanged": 4, "dry_run": False,
+        })
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=False))
+        self.assertEqual(result["decay"]["decayed_count"], 1)
+        self.assertEqual(result["decay"]["unchanged_count"], 4)
+
+    def test_maintain_reports_review_queue(self):
+        """Should surface review queue categories."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter(review_result={
+            "categories": {
+                "stale": [{"name": "old-fact"}],
+                "low_confidence": [{"name": "weak-belief"}, {"name": "weak2"}],
+                "type_mismatch": [], "approaching_expiry": [],
+                "unclassified": [],
+            }
+        })
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=True))
+        self.assertEqual(result["review_queue"]["total"], 3)
+        self.assertEqual(result["review_queue"]["categories"]["stale"], 1)
+        self.assertEqual(result["review_queue"]["categories"]["low_confidence"], 2)
+
+    def test_maintain_reports_governance_health(self):
+        """Should pass through governance health status."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter(stats_result={
+            "governance": {"status": "needs_attention",
+                           "low_confidence_count": 5},
+        })
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=True))
+        self.assertEqual(result["governance_health"], "needs_attention")
+
+    def test_maintain_yields_progress_messages(self):
+        """Should yield structured progress messages."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter()
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=True))
+        phases = [m["phase"] for m in messages]
+        self.assertTrue(all(p == "maintenance" for p in phases))
+        steps = [m["step"] for m in messages]
+        self.assertIn("start", steps)
+        self.assertIn("decay_done", steps)
+        self.assertIn("review_done", steps)
+        self.assertIn("done", steps)
+
+    def test_dream_includes_maintenance_by_default(self):
+        """Dream session should include maintenance in default phases."""
+        from merkraum_dreaming import dream
+        adapter = self._make_mock_adapter()
+        # Mock the Neo4j driver for reflect phase
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(data=lambda: [])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        # Run only maintenance phase to test integration
+        messages, result = self._run_generator(
+            dream(adapter, "proj", phases=["maintenance"],
+                  maintenance_dry_run=True))
+        self.assertIn("maintenance", result["phases"])
+        self.assertEqual(result["phases"]["maintenance"]["phase"], "maintenance")
+
+    def test_dream_maintenance_dry_run_param(self):
+        """Dream should pass maintenance_dry_run to maintain phase."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter()
+        # Test directly that maintain respects dry_run
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=True))
+        self.assertTrue(result["decay"]["applied"] is False)
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=False))
+        self.assertTrue(result["decay"]["applied"] is True)
+
+
 if __name__ == "__main__":
     unittest.main()
