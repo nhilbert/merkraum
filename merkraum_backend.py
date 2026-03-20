@@ -1187,7 +1187,7 @@ class Neo4jBaseAdapter(BackendAdapter):
     def update_belief(self, name, project_id="default", confidence=None,
                       status=None, summary=None, valid_until=None,
                       actor="api"):
-        valid_statuses = ("active", "uncertain", "contradicted", "superseded")
+        valid_statuses = ("active", "uncertain", "contradicted", "superseded", "consolidated")
         if status is not None and status not in valid_statuses:
             return {"updated": False, "name": name,
                     "error": f"Invalid status: {status}. Valid: {valid_statuses}"}
@@ -1203,7 +1203,7 @@ class Neo4jBaseAdapter(BackendAdapter):
             changes["confidence"] = confidence
         if status is not None:
             set_clauses.append("b.status = $status")
-            if status in ("superseded",):
+            if status in ("superseded", "consolidated"):
                 set_clauses.append("b.active = false")
             elif status in ("active", "uncertain", "contradicted"):
                 set_clauses.append("b.active = true")
@@ -1269,6 +1269,185 @@ class Neo4jBaseAdapter(BackendAdapter):
             except Exception as exc:
                 tx.rollback()
                 return {"updated": False, "name": name, "error": str(exc)}
+
+    def consolidate_beliefs(self, belief_a_name, belief_b_name,
+                            resolution_text, project_id="default",
+                            new_name=None, actor="api"):
+        """Resolve a contradiction between two beliefs with a user-provided explanation.
+
+        Creates a new synthesis belief from the resolution text, marks both
+        originals as 'consolidated', removes the CONTRADICTS relationship,
+        and creates SUPERSEDES links from the new belief to both originals.
+
+        Args:
+            belief_a_name: Name of first contradicting belief.
+            belief_b_name: Name of second contradicting belief.
+            resolution_text: User's free-text explanation of the real situation.
+            project_id: Project scope.
+            new_name: Optional name for synthesis belief. Auto-generated if omitted.
+            actor: Who performed the consolidation.
+
+        Returns:
+            {"ok": bool, "synthesis": dict, "consolidated": list, "operation_id": str}
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        op_id = self._operation_id()
+
+        with self._driver.session() as session:
+            tx = session.begin_transaction()
+            try:
+                # 1. Find both beliefs
+                rec_a = tx.run(
+                    "MATCH (b:Belief {name: $name, project_id: $pid}) "
+                    "RETURN b.name AS name, b.summary AS summary, "
+                    "b.confidence AS confidence, b.status AS status, "
+                    "b.source_cycle AS source_cycle, b.node_id AS node_id",
+                    name=belief_a_name, pid=project_id,
+                ).single()
+                rec_b = tx.run(
+                    "MATCH (b:Belief {name: $name, project_id: $pid}) "
+                    "RETURN b.name AS name, b.summary AS summary, "
+                    "b.confidence AS confidence, b.status AS status, "
+                    "b.source_cycle AS source_cycle, b.node_id AS node_id",
+                    name=belief_b_name, pid=project_id,
+                ).single()
+
+                if not rec_a:
+                    tx.rollback()
+                    return {"ok": False,
+                            "error": f"Belief '{belief_a_name}' not found"}
+                if not rec_b:
+                    tx.rollback()
+                    return {"ok": False,
+                            "error": f"Belief '{belief_b_name}' not found"}
+
+                before_a = dict(rec_a)
+                before_b = dict(rec_b)
+
+                # 2. Verify CONTRADICTS relationship exists (either direction)
+                contra = tx.run(
+                    "MATCH (a:Belief {name: $a, project_id: $pid})"
+                    "-[r:CONTRADICTS]-"
+                    "(b:Belief {name: $b, project_id: $pid}) "
+                    "RETURN r.reason AS reason",
+                    a=belief_a_name, b=belief_b_name, pid=project_id,
+                ).single()
+                if not contra:
+                    tx.rollback()
+                    return {"ok": False,
+                            "error": f"No CONTRADICTS relationship between "
+                                     f"'{belief_a_name}' and '{belief_b_name}'"}
+
+                # 3. Generate synthesis belief name
+                synthesis_name = new_name or (
+                    f"Consolidated: {belief_a_name[:40]} + {belief_b_name[:40]}"
+                )
+
+                # 4. Create synthesis belief node
+                synthesis_id = self._operation_id()  # unique node_id
+                tx.run(
+                    """
+                    CREATE (b:Belief {
+                        name: $name,
+                        summary: $summary,
+                        confidence: 0.8,
+                        status: 'active',
+                        active: true,
+                        project_id: $pid,
+                        node_id: $nid,
+                        created_at: $now,
+                        updated_at: $now,
+                        source_cycle: $source,
+                        consolidated_from: $from_names
+                    })
+                    """,
+                    name=synthesis_name,
+                    summary=resolution_text,
+                    pid=project_id,
+                    nid=synthesis_id,
+                    now=now,
+                    source=f"consolidation:{op_id}",
+                    from_names=f"{belief_a_name} | {belief_b_name}",
+                )
+
+                # 5. Mark both originals as consolidated
+                for bname in (belief_a_name, belief_b_name):
+                    tx.run(
+                        "MATCH (b:Belief {name: $name, project_id: $pid}) "
+                        "SET b.status = 'consolidated', b.active = false, "
+                        "b.updated_at = $now, "
+                        "b.consolidated_into = $synth",
+                        name=bname, pid=project_id, now=now,
+                        synth=synthesis_name,
+                    )
+
+                # 6. Remove CONTRADICTS relationship (both directions for symmetric)
+                tx.run(
+                    "MATCH (a:Belief {name: $a, project_id: $pid})"
+                    "-[r:CONTRADICTS]-"
+                    "(b:Belief {name: $b, project_id: $pid}) "
+                    "DELETE r",
+                    a=belief_a_name, b=belief_b_name, pid=project_id,
+                )
+
+                # 7. Create SUPERSEDES from synthesis to both originals
+                for bname in (belief_a_name, belief_b_name):
+                    tx.run(
+                        """
+                        MATCH (s:Belief {name: $synth, project_id: $pid})
+                        MATCH (o:Belief {name: $orig, project_id: $pid})
+                        CREATE (s)-[:SUPERSEDES {
+                            created_at: $now,
+                            reason: 'Consolidation resolution',
+                            confidence: 0.9,
+                            active: true
+                        }]->(o)
+                        """,
+                        synth=synthesis_name, orig=bname,
+                        pid=project_id, now=now,
+                    )
+
+                # 8. Audit trail
+                payload = {
+                    "belief_a": belief_a_name,
+                    "belief_b": belief_b_name,
+                    "resolution": resolution_text,
+                    "synthesis_name": synthesis_name,
+                    "original_contradiction_reason": contra["reason"],
+                }
+                before_state = {
+                    "belief_a": before_a,
+                    "belief_b": before_b,
+                    "relationship": "CONTRADICTS",
+                }
+                after_state = {
+                    "synthesis": synthesis_name,
+                    "belief_a_status": "consolidated",
+                    "belief_b_status": "consolidated",
+                    "relationship": "SUPERSEDES",
+                }
+                self._log_history(tx, op_id, synthesis_name, project_id,
+                                  "consolidate_beliefs", before_state, actor)
+                self._log_operation(tx, op_id, "consolidate_beliefs", actor,
+                                    project_id, payload=payload,
+                                    before_state=before_state,
+                                    after_state=after_state)
+                tx.commit()
+
+                return {
+                    "ok": True,
+                    "operation_id": op_id,
+                    "synthesis": {
+                        "name": synthesis_name,
+                        "summary": resolution_text,
+                        "confidence": 0.8,
+                        "status": "active",
+                    },
+                    "consolidated": [belief_a_name, belief_b_name],
+                }
+            except Exception as exc:
+                tx.rollback()
+                return {"ok": False, "error": str(exc)}
 
     def add_relationship(self, source, target, rel_type, project_id="default",
                          reason="", confidence=0.7,

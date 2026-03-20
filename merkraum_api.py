@@ -1575,7 +1575,7 @@ def beliefs():
     if denied:
         return denied
     status = request.args.get("status", "active") or "active"
-    valid_statuses = {"active", "uncertain", "contradicted", "superseded"}
+    valid_statuses = {"active", "uncertain", "contradicted", "superseded", "consolidated"}
     if status not in valid_statuses:
         return _error(
             f"Invalid status '{status}'. Must be one of: {', '.join(sorted(valid_statuses))}",
@@ -1643,6 +1643,66 @@ def update_belief_api():
     except Exception as exc:
         logger.exception("update_belief failed for name=%s project=%s", name, project)
         return _error(str(exc))
+
+
+@app.route("/api/beliefs/consolidate", methods=["POST"])
+@require_auth
+@require_scope("write")
+def consolidate_beliefs_api():
+    """Resolve a contradiction between two beliefs with a user explanation.
+
+    Creates a synthesis belief, marks both originals as 'consolidated',
+    removes the CONTRADICTS relationship, adds SUPERSEDES links.
+
+    Requires: Authorization: Bearer <cognito_jwt_token> (when AUTH_REQUIRED=true)
+
+    JSON body:
+        {
+            "belief_a": "first belief name (required)",
+            "belief_b": "second belief name (required)",
+            "resolution": "free-text explanation of the real situation (required)",
+            "project": "project_id (default: 'default')",
+            "new_name": "optional name for the synthesis belief"
+        }
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+
+    body = request.get_json(silent=True)
+    if not body:
+        return _error("Request body must be JSON", 400)
+
+    belief_a = (body.get("belief_a") or "").strip()
+    belief_b = (body.get("belief_b") or "").strip()
+    resolution = (body.get("resolution") or "").strip()
+
+    if not belief_a:
+        return _error("'belief_a' field is required", 400)
+    if not belief_b:
+        return _error("'belief_b' field is required", 400)
+    if not resolution:
+        return _error("'resolution' field is required", 400)
+
+    project = body.get("project") or "default"
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    actor = getattr(request, "username", None) or getattr(request, "user_id", None) or "api"
+
+    result = adapter.consolidate_beliefs(
+        belief_a_name=belief_a,
+        belief_b_name=belief_b,
+        resolution_text=resolution,
+        project_id=project,
+        new_name=body.get("new_name"),
+        actor=actor,
+    )
+    if result.get("ok"):
+        return jsonify(result)
+    else:
+        code = 404 if "not found" in result.get("error", "") else 400
+        return jsonify(result), code
 
 
 @app.route("/api/contradictions", methods=["GET"])

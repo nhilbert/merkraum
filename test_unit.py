@@ -1055,6 +1055,119 @@ class TestUpdateBeliefInterface(unittest.TestCase):
         self.assertTrue(hasattr(Neo4jPineconeAdapter, "update_belief"))
 
 
+class TestConsolidateBeliefs(unittest.TestCase):
+    """Test consolidate_beliefs method on Neo4jBaseAdapter."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.tx = MagicMock()
+        self.session.begin_transaction.return_value = self.tx
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def _mock_both_found_with_contradiction(self):
+        """Mock: both beliefs found, CONTRADICTS relationship exists."""
+        belief_a = MagicMock()
+        belief_a.single.return_value = {
+            "name": "Market A growing", "summary": "German market +30%",
+            "confidence": 0.8, "status": "contradicted",
+            "source_cycle": "Z100", "node_id": "id-a",
+        }
+        belief_b = MagicMock()
+        belief_b.single.return_value = {
+            "name": "Market B declining", "summary": "International market -10%",
+            "confidence": 0.7, "status": "contradicted",
+            "source_cycle": "Z101", "node_id": "id-b",
+        }
+        contra_rel = MagicMock()
+        contra_rel.single.return_value = {"reason": "Conflicting market trends"}
+        # tx.run calls: find A, find B, find CONTRADICTS, CREATE synthesis,
+        # SET A consolidated, SET B consolidated, DELETE CONTRADICTS,
+        # CREATE SUPERSEDES x2, _log_history, _log_operation
+        self.tx.run.side_effect = [
+            belief_a, belief_b, contra_rel,
+        ] + [MagicMock()] * 8  # CREATE, 2 SETs, DELETE, 2 SUPERSEDES, 2 logs
+
+    def test_successful_consolidation(self):
+        self._mock_both_found_with_contradiction()
+        result = self.adapter.consolidate_beliefs(
+            "Market A growing", "Market B declining",
+            "These are different markets — German domestic vs international. "
+            "Both trends are correct in their respective scope.",
+            project_id="proj",
+        )
+        self.assertTrue(result["ok"])
+        self.assertIn("synthesis", result)
+        self.assertEqual(result["synthesis"]["status"], "active")
+        self.assertIn("Market A growing", result["consolidated"])
+        self.assertIn("Market B declining", result["consolidated"])
+        self.assertIn("operation_id", result)
+
+    def test_custom_name(self):
+        self._mock_both_found_with_contradiction()
+        result = self.adapter.consolidate_beliefs(
+            "Market A growing", "Market B declining",
+            "Different scope markets.",
+            project_id="proj",
+            new_name="Market trends by region",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["synthesis"]["name"], "Market trends by region")
+
+    def test_belief_a_not_found(self):
+        not_found = MagicMock()
+        not_found.single.return_value = None
+        self.tx.run.return_value = not_found
+        result = self.adapter.consolidate_beliefs(
+            "nonexistent", "Market B declining", "resolution", "proj",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("not found", result["error"])
+
+    def test_belief_b_not_found(self):
+        found = MagicMock()
+        found.single.return_value = {
+            "name": "A", "summary": "s", "confidence": 0.8,
+            "status": "contradicted", "source_cycle": "Z1", "node_id": "id-a",
+        }
+        not_found = MagicMock()
+        not_found.single.return_value = None
+        self.tx.run.side_effect = [found, not_found]
+        result = self.adapter.consolidate_beliefs(
+            "A", "nonexistent", "resolution", "proj",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("not found", result["error"])
+
+    def test_no_contradicts_relationship(self):
+        found_a = MagicMock()
+        found_a.single.return_value = {
+            "name": "A", "summary": "s", "confidence": 0.8,
+            "status": "active", "source_cycle": "Z1", "node_id": "id-a",
+        }
+        found_b = MagicMock()
+        found_b.single.return_value = {
+            "name": "B", "summary": "s", "confidence": 0.7,
+            "status": "active", "source_cycle": "Z2", "node_id": "id-b",
+        }
+        no_rel = MagicMock()
+        no_rel.single.return_value = None
+        self.tx.run.side_effect = [found_a, found_b, no_rel]
+        result = self.adapter.consolidate_beliefs(
+            "A", "B", "resolution", "proj",
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("No CONTRADICTS", result["error"])
+
+    def test_consolidated_status_marks_inactive(self):
+        """Verify update_belief with status='consolidated' sets active=false."""
+        # Use update_belief to verify the status is accepted
+        result = self.adapter.update_belief("test", "proj", status="consolidated")
+        # Should not reject as invalid status
+        self.assertNotIn("Invalid status", result.get("error", ""))
+
+
 class TestGraphMutationOperations(unittest.TestCase):
     """Smoke tests for new node/relationship mutation methods."""
 

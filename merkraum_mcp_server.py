@@ -1029,6 +1029,65 @@ async def update_belief(
 
 
 @mcp.tool()
+async def consolidate_beliefs(
+    belief_a: str,
+    belief_b: str,
+    resolution: str,
+    new_name: str = None,
+    project: str = None,
+) -> dict:
+    """Resolve a false contradiction between two beliefs with a user explanation.
+
+    When two beliefs are marked as contradicting but actually represent
+    complementary information (e.g., different markets, different time periods),
+    use this tool to consolidate them with a free-text resolution.
+
+    Creates a synthesis belief from the resolution, marks both originals as
+    'consolidated', removes the CONTRADICTS relationship, and adds SUPERSEDES
+    links from the synthesis to both originals.
+
+    Args:
+        belief_a: Name of the first contradicting belief
+        belief_b: Name of the second contradicting belief
+        resolution: Free-text explanation of the real situation — why the beliefs
+            are not actually contradictory, or what the synthesized truth is
+        new_name: Optional name for the new synthesis belief (auto-generated if omitted)
+        project: Project ID (default: your personal space)
+    """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("write", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    adapter = _get_adapter()
+    start = time.time()
+    try:
+        result = await _run_sync(
+            adapter.consolidate_beliefs,
+            belief_a_name=belief_a,
+            belief_b_name=belief_b,
+            resolution_text=resolution,
+            project_id=project,
+            new_name=new_name,
+            actor=_uid or "mcp",
+        )
+        result["duration_ms"] = int((time.time() - start) * 1000)
+        audit_log("consolidate_beliefs", "authed",
+                  {"belief_a": belief_a, "belief_b": belief_b, "project": project},
+                  int((time.time() - start) * 1000),
+                  "ok" if result.get("ok") else "error")
+        return result
+    except Exception as e:
+        audit_log("consolidate_beliefs", "authed",
+                  {"belief_a": belief_a, "belief_b": belief_b},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
 async def get_usage(
     tier: str = "free",
     project: str = None,
