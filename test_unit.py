@@ -373,6 +373,77 @@ class TestQueryNodes(unittest.TestCase):
         self.assertNotIn("FakeType", call_args)
 
 
+    def test_query_excludes_expired_by_default(self):
+        self.session.run.return_value = []
+        self.adapter.query_nodes(project_id="test")
+        call_args = self.session.run.call_args[0][0]
+        self.assertIn("n.expired_at IS NULL", call_args)
+
+    def test_query_includes_expired_when_requested(self):
+        self.session.run.return_value = []
+        self.adapter.query_nodes(project_id="test", include_expired=True)
+        call_args = self.session.run.call_args[0][0]
+        self.assertNotIn("expired_at", call_args)
+
+    def test_query_filtered_type_excludes_expired(self):
+        self.session.run.return_value = []
+        self.adapter.query_nodes(node_type="Belief", project_id="test")
+        call_args = self.session.run.call_args[0][0]
+        self.assertIn("n.expired_at IS NULL", call_args)
+
+
+class TestTraverseExpiryFilter(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        self.session.run.return_value = []
+
+    def test_traverse_excludes_expired_by_default(self):
+        self.adapter.traverse("Test", project_id="test")
+        call_args = self.session.run.call_args[0][0]
+        self.assertIn("expired_at IS NULL", call_args)
+
+    def test_traverse_includes_expired_when_requested(self):
+        self.adapter.traverse("Test", project_id="test", include_expired=True)
+        call_args = self.session.run.call_args[0][0]
+        self.assertNotIn("expired_at", call_args)
+
+
+class TestFilterExpiredResults(unittest.TestCase):
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_filters_expired_from_vector_results(self):
+        results = [
+            {"score": 0.9, "metadata": {"name": "Active Node"}, "content": "a"},
+            {"score": 0.8, "metadata": {"name": "Expired Node"}, "content": "b"},
+        ]
+        self.session.run.return_value = [{"name": "Expired Node"}]
+        filtered = self.adapter._filter_expired_results(results, "test")
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["metadata"]["name"], "Active Node")
+
+    def test_returns_all_when_none_expired(self):
+        results = [
+            {"score": 0.9, "metadata": {"name": "Node A"}, "content": "a"},
+            {"score": 0.8, "metadata": {"name": "Node B"}, "content": "b"},
+        ]
+        self.session.run.return_value = []
+        filtered = self.adapter._filter_expired_results(results, "test")
+        self.assertEqual(len(filtered), 2)
+
+    def test_handles_empty_results(self):
+        filtered = self.adapter._filter_expired_results([], "test")
+        self.assertEqual(filtered, [])
+
+
 class TestGetBeliefs(unittest.TestCase):
 
     def setUp(self):

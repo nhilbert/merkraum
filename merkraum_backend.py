@@ -396,6 +396,41 @@ class Neo4jBaseAdapter(BackendAdapter):
         )
         return deduped[:top_k]
 
+    def _filter_expired_results(self, results: list,
+                                project_id: str) -> list:
+        """Post-filter vector search results to exclude expired nodes."""
+        if not results or not self._driver:
+            return results
+        names = []
+        for r in results:
+            meta = r.get("metadata") or {}
+            name = (meta.get("name") or "").strip()
+            if name:
+                names.append(name)
+        if not names:
+            return results
+        expired_names = set()
+        try:
+            with self._driver.session() as session:
+                records = session.run(
+                    """
+                    MATCH (n {project_id: $pid})
+                    WHERE n.name IN $names AND n.expired_at IS NOT NULL
+                    RETURN n.name AS name
+                    """,
+                    pid=project_id,
+                    names=names,
+                )
+                for rec in records:
+                    expired_names.add(rec["name"])
+        except Exception:
+            return results
+        if not expired_names:
+            return results
+        return [r for r in results
+                if (r.get("metadata") or {}).get("name", "").strip()
+                not in expired_names]
+
     def _log_operation(self, tx, op_id: str, op_type: str, actor: str,
                        project_id: str, payload: dict,
                        before_state: Optional[dict] = None,
@@ -761,17 +796,18 @@ class Neo4jBaseAdapter(BackendAdapter):
         return written
 
     def query_nodes(self, node_type=None, project_id="default", limit=100,
-                    vsm_level=None):
+                    vsm_level=None, include_expired=False):
         self._ensure_project_node_ids(project_id)
         results = []
         with self._driver.session() as session:
             vsm_filter = ""
             if vsm_level and vsm_level in VSM_LEVELS:
                 vsm_filter = " AND n.vsm_level = $vsm_level"
+            expired_filter = "" if include_expired else " AND n.expired_at IS NULL"
             if node_type and node_type in NODE_TYPES:
                 cypher = f"""
                 MATCH (n:{node_type} {{project_id: $pid}})
-                WHERE true{vsm_filter}
+                WHERE true{vsm_filter}{expired_filter}
                 RETURN n.name AS name, n.summary AS summary,
                        labels(n)[0] AS type, n.created_at AS created,
                        n.node_id AS node_id, n.confidence AS confidence,
@@ -781,7 +817,7 @@ class Neo4jBaseAdapter(BackendAdapter):
             else:
                 cypher = f"""
                 MATCH (n {{project_id: $pid}})
-                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types){vsm_filter}
+                WHERE any(lbl IN labels(n) WHERE lbl IN $node_types){vsm_filter}{expired_filter}
                 RETURN n.name AS name, n.summary AS summary,
                        labels(n)[0] AS type, n.created_at AS created,
                        n.node_id AS node_id, n.confidence AS confidence,
@@ -1070,13 +1106,16 @@ class Neo4jBaseAdapter(BackendAdapter):
                 tx.rollback()
                 return {"renewed": False, "name": name, "error": str(exc)}
 
-    def traverse(self, entity_name, project_id="default", max_depth=2):
+    def traverse(self, entity_name, project_id="default", max_depth=2,
+                 include_expired=False):
         nodes = {}
         edges = []
         with self._driver.session() as session:
+            expired_clause = "" if include_expired else \
+                " AND start.expired_at IS NULL AND ALL(n IN nodes(path) WHERE n.expired_at IS NULL)"
             cypher = """
             MATCH path = (start {name: $name, project_id: $pid})-[*1..""" + str(max_depth) + """]->(end)
-            WHERE end.project_id = $pid
+            WHERE end.project_id = $pid""" + expired_clause + """
             RETURN path
             LIMIT 100
             """
@@ -2498,7 +2537,8 @@ class Neo4jQdrantAdapter(Neo4jBaseAdapter):
                     "content": payload.get("content", ""),
                     "metadata": payload,
                 })
-            return self._dedupe_vector_results(results, project_id=project_id, top_k=top_k)
+            deduped = self._dedupe_vector_results(results, project_id=project_id, top_k=top_k)
+            return self._filter_expired_results(deduped, project_id=project_id)
         except Exception as e:
             logger.warning("Qdrant search failed: %s", e)
             return []
@@ -2656,7 +2696,8 @@ class Neo4jPineconeAdapter(Neo4jBaseAdapter):
                     "content": m.get("metadata", {}).get("content", ""),
                     "metadata": m.get("metadata", {}),
                 })
-            return self._dedupe_vector_results(results, project_id=project_id, top_k=top_k)
+            deduped = self._dedupe_vector_results(results, project_id=project_id, top_k=top_k)
+            return self._filter_expired_results(deduped, project_id=project_id)
         except Exception as e:
             logger.warning("Pinecone search failed: %s", e)
             return []

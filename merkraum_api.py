@@ -182,6 +182,7 @@ def _get_all_edges(adp, project_id: str, limit: int = 1000) -> list:
             MATCH (a {project_id: $pid})-[r]->(b {project_id: $pid})
             WHERE any(lbl IN labels(a) WHERE lbl IN $node_types)
               AND any(lbl IN labels(b) WHERE lbl IN $node_types)
+              AND a.expired_at IS NULL AND b.expired_at IS NULL
             RETURN a.name AS source_name, b.name AS target_name,
                    labels(a)[0] AS source_type, labels(b)[0] AS target_type,
                    a.node_id AS source_node_id, b.node_id AS target_node_id,
@@ -287,9 +288,10 @@ def _get_semantic_subgraph(adp, project_id: str, query: str, *, limit: int, hops
         node_records = list(session.run(
             f"""
             MATCH (s {{project_id: $pid}})
-            WHERE s.name IN $seed_names
+            WHERE s.name IN $seed_names AND s.expired_at IS NULL
             MATCH p=(s)-[*0..{depth}]-(n {{project_id: $pid}})
             WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+              AND n.expired_at IS NULL
             WITH DISTINCT n
             LIMIT $limit
             RETURN elementId(n) AS eid,
@@ -376,6 +378,7 @@ def _get_text_subgraph(adp, project_id: str, query: str, *, limit: int, hops: in
             """
             MATCH (n {project_id: $pid})
             WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+              AND n.expired_at IS NULL
               AND (
                 toLower(coalesce(n.name, '')) CONTAINS $search_query
                 OR toLower(coalesce(n.summary, '')) CONTAINS $search_query
@@ -405,9 +408,10 @@ def _get_text_subgraph(adp, project_id: str, query: str, *, limit: int, hops: in
         node_records = list(session.run(
             f"""
             MATCH (s {{project_id: $pid}})
-            WHERE s.name IN $seed_names
+            WHERE s.name IN $seed_names AND s.expired_at IS NULL
             MATCH p=(s)-[*0..{depth}]-(n {{project_id: $pid}})
             WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+              AND n.expired_at IS NULL
             WITH DISTINCT n
             LIMIT $limit
             RETURN elementId(n) AS eid,
@@ -497,6 +501,7 @@ def _get_node_expansion(
             """
             MATCH (s {project_id: $pid})
             WHERE any(lbl IN labels(s) WHERE lbl IN $node_types)
+              AND s.expired_at IS NULL
               AND (
                 ($node_id <> '' AND coalesce(s.node_id, '') = $node_id)
                 OR
@@ -544,6 +549,7 @@ def _get_node_expansion(
             WHERE elementId(s) = $seed_eid
             MATCH (s)-[]-(n {project_id: $pid})
             WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+              AND n.expired_at IS NULL
             RETURN count(DISTINCT n) AS total
             """,
             seed_eid=seed_eid,
@@ -559,6 +565,7 @@ def _get_node_expansion(
                 WHERE elementId(s) = $seed_eid
                 MATCH (s)-[]-(n {project_id: $pid})
                 WHERE any(lbl IN labels(n) WHERE lbl IN $node_types)
+                  AND n.expired_at IS NULL
                 WITH DISTINCT n
                 LIMIT $limit
                 RETURN elementId(n) AS eid,
