@@ -2434,6 +2434,260 @@ class TestDreamingMaintenance(unittest.TestCase):
         self.assertTrue(result["decay"]["applied"] is True)
 
 
+# --- Dreaming replay associative edge creation tests (Z1839) ---
+
+class TestDreamingAssociativeEdges(unittest.TestCase):
+    """Test replay phase associative edge creation — Z1839 proposal #1."""
+
+    def _run_generator(self, gen):
+        """Consume a generator, collecting messages and returning the result."""
+        messages = []
+        try:
+            while True:
+                messages.append(next(gen))
+        except StopIteration as e:
+            return messages, e.value
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_replay_creates_edges_from_missing_relationship(self, mock_llm):
+        """Replay should write provisional edges for missing_relationship observations."""
+        from merkraum_dreaming import replay
+
+        mock_llm.return_value = {
+            "observations": [
+                {
+                    "type": "missing_relationship",
+                    "description": "Entity A and Entity B should be connected",
+                    "entities_involved": ["Alpha", "Beta"],
+                    "suggested_relationship": "RELATES_TO",
+                },
+            ],
+            "walk_quality": "productive",
+            "summary": "Found a missing link.",
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        # Seed selection returns one candidate
+        mock_session.run.return_value = MagicMock(
+            data=lambda: [{"name": "Alpha", "type": "Concept", "staleness": 10}])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.vector_search.return_value = []
+        adapter.write_relationships.return_value = 1
+
+        messages, result = self._run_generator(
+            replay(adapter, "test-proj", hops=0, walks=1, create_edges=True))
+
+        self.assertEqual(result["edges_created"], 1)
+        self.assertEqual(len(result["edge_details"]), 1)
+        self.assertEqual(result["edge_details"][0]["source"], "Alpha")
+        self.assertEqual(result["edge_details"][0]["target"], "Beta")
+        self.assertEqual(result["edge_details"][0]["rel_type"], "RELATES_TO")
+
+        # Verify write_relationships was called with correct params
+        adapter.write_relationships.assert_called_once()
+        call_args = adapter.write_relationships.call_args
+        rel = call_args[0][0][0]  # First positional arg, first element
+        self.assertEqual(rel["source"], "Alpha")
+        self.assertEqual(rel["target"], "Beta")
+        self.assertEqual(rel["confidence"], 0.3)
+        self.assertEqual(rel["type"], "RELATES_TO")
+        self.assertIn("valid_until", rel)
+        self.assertEqual(call_args[1]["source_type"], "dream")
+        self.assertEqual(call_args[1]["actor"], "dreaming-replay")
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_replay_no_edges_when_create_edges_false(self, mock_llm):
+        """Replay should not write edges when create_edges=False."""
+        from merkraum_dreaming import replay
+
+        mock_llm.return_value = {
+            "observations": [
+                {
+                    "type": "missing_relationship",
+                    "description": "Test",
+                    "entities_involved": ["A", "B"],
+                    "suggested_relationship": "SUPPORTS",
+                },
+            ],
+            "walk_quality": "productive",
+            "summary": "Test.",
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(
+            data=lambda: [{"name": "A", "type": "Concept", "staleness": 5}])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.vector_search.return_value = []
+
+        messages, result = self._run_generator(
+            replay(adapter, "test-proj", hops=0, walks=1, create_edges=False))
+
+        self.assertEqual(result["edges_created"], 0)
+        self.assertEqual(result["edge_details"], [])
+        adapter.write_relationships.assert_not_called()
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_replay_skips_insight_and_redundancy_types(self, mock_llm):
+        """Replay should NOT create edges for 'insight' or 'redundancy' observations."""
+        from merkraum_dreaming import replay
+
+        mock_llm.return_value = {
+            "observations": [
+                {
+                    "type": "insight",
+                    "description": "Interesting pattern",
+                    "entities_involved": ["X", "Y"],
+                },
+                {
+                    "type": "redundancy",
+                    "description": "Duplicate info",
+                    "entities_involved": ["X", "Z"],
+                },
+            ],
+            "walk_quality": "productive",
+            "summary": "Test.",
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(
+            data=lambda: [{"name": "X", "type": "Concept", "staleness": 5}])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.vector_search.return_value = []
+
+        messages, result = self._run_generator(
+            replay(adapter, "test-proj", hops=0, walks=1, create_edges=True))
+
+        self.assertEqual(result["edges_created"], 0)
+        adapter.write_relationships.assert_not_called()
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_replay_falls_back_to_relates_to_for_invalid_type(self, mock_llm):
+        """If LLM suggests an invalid relationship type, fall back to RELATES_TO."""
+        from merkraum_dreaming import replay
+
+        mock_llm.return_value = {
+            "observations": [
+                {
+                    "type": "surprising_connection",
+                    "description": "Unexpected link",
+                    "entities_involved": ["Foo", "Bar"],
+                    "suggested_relationship": "INVALID_TYPE",
+                },
+            ],
+            "walk_quality": "productive",
+            "summary": "Test.",
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(
+            data=lambda: [{"name": "Foo", "type": "Concept", "staleness": 5}])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.vector_search.return_value = []
+        adapter.write_relationships.return_value = 1
+
+        messages, result = self._run_generator(
+            replay(adapter, "test-proj", hops=0, walks=1, create_edges=True))
+
+        self.assertEqual(result["edges_created"], 1)
+        call_args = adapter.write_relationships.call_args
+        rel = call_args[0][0][0]
+        self.assertEqual(rel["type"], "RELATES_TO")  # Fallback
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_replay_edge_has_7day_ttl(self, mock_llm):
+        """Provisional edges should have valid_until set to ~7 days from now."""
+        from merkraum_dreaming import replay
+        from datetime import datetime, timezone, timedelta
+
+        mock_llm.return_value = {
+            "observations": [
+                {
+                    "type": "missing_relationship",
+                    "description": "Test",
+                    "entities_involved": ["A", "B"],
+                    "suggested_relationship": "SUPPORTS",
+                },
+            ],
+            "walk_quality": "productive",
+            "summary": "Test.",
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(
+            data=lambda: [{"name": "A", "type": "Concept", "staleness": 5}])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.vector_search.return_value = []
+        adapter.write_relationships.return_value = 1
+
+        before = datetime.now(timezone.utc)
+        messages, result = self._run_generator(
+            replay(adapter, "test-proj", hops=0, walks=1, create_edges=True))
+        after = datetime.now(timezone.utc)
+
+        call_args = adapter.write_relationships.call_args
+        rel = call_args[0][0][0]
+        valid_until = datetime.fromisoformat(rel["valid_until"])
+        # Should be ~7 days from now (within a 1-minute tolerance)
+        expected_min = before + timedelta(days=7) - timedelta(minutes=1)
+        expected_max = after + timedelta(days=7) + timedelta(minutes=1)
+        self.assertGreater(valid_until, expected_min)
+        self.assertLess(valid_until, expected_max)
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_replay_handles_write_failure_gracefully(self, mock_llm):
+        """If write_relationships fails, edge creation should continue without crashing."""
+        from merkraum_dreaming import replay
+
+        mock_llm.return_value = {
+            "observations": [
+                {
+                    "type": "missing_relationship",
+                    "description": "Test",
+                    "entities_involved": ["A", "B"],
+                    "suggested_relationship": "SUPPORTS",
+                },
+            ],
+            "walk_quality": "productive",
+            "summary": "Test.",
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(
+            data=lambda: [{"name": "A", "type": "Concept", "staleness": 5}])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.vector_search.return_value = []
+        adapter.write_relationships.side_effect = Exception("DB error")
+
+        messages, result = self._run_generator(
+            replay(adapter, "test-proj", hops=0, walks=1, create_edges=True))
+
+        # Should complete without raising, with 0 edges created
+        self.assertEqual(result["edges_created"], 0)
+        self.assertEqual(result["edge_details"], [])
+        self.assertEqual(result["status"], "completed")
+        # Should have an edge_failed message
+        failed_msgs = [m for m in messages if m["step"] == "edge_failed"]
+        self.assertEqual(len(failed_msgs), 1)
+
+
 class TestReconstructAt(unittest.TestCase):
     """Test Neo4jBaseAdapter.reconstruct_at — point-in-time reconstruction."""
 

@@ -2968,6 +2968,7 @@ def _run_dream_job(job_id: str):
             consolidation_dry_run=job.get("consolidation_dry_run", False),
             seed=job.get("seed"),
             maintenance_dry_run=job.get("maintenance_dry_run", False),
+            replay_create_edges=job.get("replay_create_edges", True),
         )
         result = None
         try:
@@ -3000,6 +3001,7 @@ def dream_trigger():
         phases: ["replay", "consolidation", "reflection", "maintenance"]
         replay_hops: int (default 5)
         replay_walks: int (default 3)
+        replay_create_edges: bool (default true) — create provisional edges from dream observations
         consolidation_threshold: float (default 0.75)
         consolidation_dry_run: bool (default false)
         maintenance_dry_run: bool (default false)
@@ -3042,6 +3044,7 @@ def dream_trigger():
             "consolidation_threshold": body.get("consolidation_threshold", 0.75),
             "consolidation_dry_run": body.get("consolidation_dry_run", False),
             "maintenance_dry_run": body.get("maintenance_dry_run", False),
+            "replay_create_edges": body.get("replay_create_edges", True),
             "seed": body.get("seed"),
         }
 

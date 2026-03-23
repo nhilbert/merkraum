@@ -97,8 +97,14 @@ def replay(
     hops: int = 5,
     walks: int = 3,
     seed: str | None = None,
+    create_edges: bool = True,
 ) -> Generator[dict, None, dict]:
     """Random walk through the graph, surfacing unexpected connections.
+
+    When create_edges=True (default), observations of type 'missing_relationship'
+    or 'surprising_connection' are written as provisional edges with low confidence
+    (0.3) and a 7-day TTL. This implements associative edge creation — dreaming
+    doesn't just observe, it writes new connections for later review.
 
     Yields progress messages. Returns final result dict.
     """
@@ -245,7 +251,12 @@ def replay(
                         "properties": {
                             "type": {"type": "string", "enum": ["surprising_connection", "missing_relationship", "redundancy", "insight"]},
                             "description": {"type": "string"},
-                            "entities_involved": {"type": "array", "items": {"type": "string"}},
+                            "entities_involved": {"type": "array", "items": {"type": "string"}, "minItems": 2},
+                            "suggested_relationship": {
+                                "type": "string",
+                                "enum": list(RELATIONSHIP_TYPES),
+                                "description": "For missing_relationship or surprising_connection: the relationship type to create between the first two entities_involved",
+                            },
                             "suggested_action": {"type": "string"},
                         },
                         "required": ["type", "description", "entities_involved"],
@@ -258,7 +269,10 @@ def replay(
         }
         analysis = llm_call(
             "You analyze knowledge graph walks to find surprising patterns, "
-            "missing relationships, redundancies, and insights.",
+            "missing relationships, redundancies, and insights. "
+            "For observations of type 'missing_relationship' or 'surprising_connection', "
+            "always include 'suggested_relationship' — a relationship type from the enum "
+            "that should connect the first two entities in 'entities_involved'.",
             f"Walk path: {walk_text}\n\nSubgraph:\n{subgraph_text}",
             temperature=0.4,
             json_schema=_replay_schema,
@@ -288,9 +302,74 @@ def replay(
         if w.get("analysis"):
             observations.extend(w["analysis"].get("observations", []))
 
+    # --- Associative Edge Creation (Proposal #1, Z1839) ---
+    # Write provisional edges for missing_relationship and surprising_connection
+    # observations. Low confidence (0.3), 7-day TTL, source_type="dream".
+    edges_created = 0
+    edge_details = []
+
+    if create_edges:
+        from datetime import timedelta
+        ttl_days = 7
+        valid_until = (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
+
+        actionable = [
+            obs for obs in observations
+            if obs.get("type") in ("missing_relationship", "surprising_connection")
+            and len(obs.get("entities_involved", [])) >= 2
+        ]
+
+        if actionable:
+            yield _msg("replay", "edge_creation_start",
+                       f"Creating {len(actionable)} provisional edge(s) from dream observations")
+
+            for obs in actionable:
+                entities = obs["entities_involved"]
+                rel_type = obs.get("suggested_relationship", "RELATES_TO")
+                if rel_type not in RELATIONSHIP_TYPES:
+                    rel_type = "RELATES_TO"
+
+                rel = {
+                    "source": entities[0],
+                    "target": entities[1],
+                    "type": rel_type,
+                    "confidence": 0.3,
+                    "reason": f"Dream observation: {obs.get('description', '')[:200]}",
+                    "valid_until": valid_until,
+                }
+
+                try:
+                    count = adapter.write_relationships(
+                        [rel],
+                        source_cycle="dream",
+                        source_type="dream",
+                        project_id=project_id,
+                        actor="dreaming-replay",
+                    )
+                    if count > 0:
+                        edges_created += 1
+                        detail = {
+                            "source": entities[0],
+                            "target": entities[1],
+                            "rel_type": rel_type,
+                            "observation_type": obs["type"],
+                            "valid_until": valid_until,
+                        }
+                        edge_details.append(detail)
+                        yield _msg("replay", "edge_created",
+                                   f"  {entities[0]} --[{rel_type}]--> {entities[1]} "
+                                   f"(conf: 0.3, TTL: {ttl_days}d)",
+                                   detail)
+                except Exception as e:
+                    logger.warning("Dream edge creation failed: %s -> %s: %s",
+                                   entities[0], entities[1], e)
+                    yield _msg("replay", "edge_failed",
+                               f"  Failed: {entities[0]} -> {entities[1]}: {e}")
+
+    edge_summary = f", {edges_created} edge(s) created" if edges_created else ""
     yield _msg("replay", "done",
                f"Replay complete: {walks} walk(s), "
-               f"{len(observations)} observation(s)")
+               f"{len(observations)} observation(s){edge_summary}")
 
     return {
         "phase": "replay",
@@ -298,6 +377,8 @@ def replay(
         "walks": all_walks,
         "observations": observations,
         "total_observations": len(observations),
+        "edges_created": edges_created,
+        "edge_details": edge_details,
     }
 
 
@@ -773,6 +854,7 @@ def dream(
     consolidation_dry_run: bool = False,
     seed: str | None = None,
     maintenance_dry_run: bool = False,
+    replay_create_edges: bool = True,
 ) -> Generator[dict, None, dict]:
     """Run a full dreaming session (replay → consolidation → reflection → maintenance).
 
@@ -786,6 +868,7 @@ def dream(
         consolidation_dry_run: If True, preview consolidation without applying
         seed: Optional starting entity for replay
         maintenance_dry_run: If True, preview confidence decay without applying
+        replay_create_edges: If True, create provisional edges from dream observations
 
     Yields progress messages. Returns combined result dict.
     """
@@ -802,7 +885,8 @@ def dream(
     if "replay" in active_phases:
         yield _msg("dream", "phase_start", "Phase 1: Replay (hippocampal)")
         gen = replay(adapter, project_id, hops=replay_hops,
-                     walks=replay_walks, seed=seed)
+                     walks=replay_walks, seed=seed,
+                     create_edges=replay_create_edges)
         replay_result = None
         try:
             while True:
