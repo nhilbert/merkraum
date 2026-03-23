@@ -1851,6 +1851,43 @@ def history_reconstruct():
         return _error(str(exc))
 
 
+@app.route("/api/history/verify", methods=["GET"])
+@require_auth
+@require_scope("read")
+def history_verify():
+    """Verify hash chain integrity of the audit trail.
+
+    Walks OperationLog entries chronologically, recomputes hashes,
+    and reports any chain breaks indicating potential tampering.
+
+    Query params:
+        project: project id (default: from auth context)
+        limit: max entries to verify (default: 1000)
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    try:
+        limit = int(request.args.get("limit", 1000))
+    except (TypeError, ValueError):
+        limit = 1000
+    limit = max(1, min(limit, 10000))
+
+    try:
+        result = adapter.verify_chain(
+            project_id=project,
+            limit=limit,
+        )
+        return jsonify(result)
+    except Exception as exc:
+        logger.exception("verify_chain failed for project=%s", project)
+        return _error(str(exc))
+
+
 @app.route("/api/graph", methods=["GET"])
 @require_auth
 @require_scope("read")

@@ -1278,10 +1278,10 @@ class TestConsolidateBeliefs(unittest.TestCase):
         contra_rel.single.return_value = {"reason": "Conflicting market trends"}
         # tx.run calls: find A, find B, find CONTRADICTS, CREATE synthesis,
         # SET A consolidated, SET B consolidated, DELETE CONTRADICTS,
-        # CREATE SUPERSEDES x2, _log_history, _log_operation
+        # CREATE SUPERSEDES x2, _log_history, _log_operation (prev_hash lookup + CREATE)
         self.tx.run.side_effect = [
             belief_a, belief_b, contra_rel,
-        ] + [MagicMock()] * 8  # CREATE, 2 SETs, DELETE, 2 SUPERSEDES, 2 logs
+        ] + [MagicMock()] * 9  # CREATE, 2 SETs, DELETE, 2 SUPERSEDES, 3 logs
 
     def test_successful_consolidation(self):
         self._mock_both_found_with_contradiction()
@@ -1903,7 +1903,8 @@ class TestRenewNode(unittest.TestCase):
             MagicMock(single=MagicMock(return_value=before)),
             MagicMock(),  # UPDATE
             MagicMock(),  # _log_history
-            MagicMock(),  # _log_operation
+            MagicMock(single=MagicMock(return_value=None)),  # _log_operation prev_hash lookup
+            MagicMock(),  # _log_operation CREATE
         ]
         result = self.adapter.renew_node("Test node", project_id="proj", extend_days=90)
         self.assertTrue(result["renewed"])
@@ -1924,7 +1925,8 @@ class TestRenewNode(unittest.TestCase):
             MagicMock(single=MagicMock(return_value=before)),
             MagicMock(),  # UPDATE
             MagicMock(),  # _log_history
-            MagicMock(),  # _log_operation
+            MagicMock(single=MagicMock(return_value=None)),  # _log_operation prev_hash lookup
+            MagicMock(),  # _log_operation CREATE
         ]
         result = self.adapter.renew_node("Old belief", project_id="proj", extend_days=180)
         self.assertTrue(result["renewed"])
@@ -1955,7 +1957,10 @@ class TestRenewNode(unittest.TestCase):
         before.get = lambda k, d=None: data.get(k, d)
         self.tx.run.side_effect = [
             MagicMock(single=MagicMock(return_value=before)),
-            MagicMock(), MagicMock(), MagicMock(),
+            MagicMock(),  # UPDATE
+            MagicMock(),  # _log_history
+            MagicMock(single=MagicMock(return_value=None)),  # _log_operation prev_hash lookup
+            MagicMock(),  # _log_operation CREATE
         ]
         result = self.adapter.renew_node(
             "Test event", project_id="proj",
@@ -2639,6 +2644,206 @@ class TestConfidenceDecayUniqueOpId(unittest.TestCase):
         self.adapter.apply_confidence_decay(project_id="test", dry_run=False)
         self.assertEqual(len(op_ids), 2)
         self.assertNotEqual(op_ids[0], op_ids[1])
+
+
+class TestHashChainIntegrity(unittest.TestCase):
+    """Test hash chain integrity for audit trail (SUP-167)."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_compute_entry_hash_deterministic(self):
+        """Same inputs should produce the same hash."""
+        h1 = Neo4jBaseAdapter._compute_entry_hash(
+            "GENESIS", "op1", "entity_upsert", "system",
+            "proj1", "2026-03-23T06:00:00+00:00", '{"name": "Test"}')
+        h2 = Neo4jBaseAdapter._compute_entry_hash(
+            "GENESIS", "op1", "entity_upsert", "system",
+            "proj1", "2026-03-23T06:00:00+00:00", '{"name": "Test"}')
+        self.assertEqual(h1, h2)
+        self.assertEqual(len(h1), 64)  # SHA-256 hex digest
+
+    def test_compute_entry_hash_changes_with_input(self):
+        """Different inputs should produce different hashes."""
+        h1 = Neo4jBaseAdapter._compute_entry_hash(
+            "GENESIS", "op1", "entity_upsert", "system",
+            "proj1", "2026-03-23T06:00:00+00:00", '{"name": "A"}')
+        h2 = Neo4jBaseAdapter._compute_entry_hash(
+            "GENESIS", "op1", "entity_upsert", "system",
+            "proj1", "2026-03-23T06:00:00+00:00", '{"name": "B"}')
+        self.assertNotEqual(h1, h2)
+
+    def test_compute_entry_hash_chain_dependency(self):
+        """Hash should change when prev_hash changes."""
+        h1 = Neo4jBaseAdapter._compute_entry_hash(
+            "GENESIS", "op1", "entity_upsert", "system",
+            "proj1", "2026-03-23T06:00:00+00:00", '{"name": "Test"}')
+        h2 = Neo4jBaseAdapter._compute_entry_hash(
+            "abc123def456", "op1", "entity_upsert", "system",
+            "proj1", "2026-03-23T06:00:00+00:00", '{"name": "Test"}')
+        self.assertNotEqual(h1, h2)
+
+    def test_log_operation_includes_hash_fields(self):
+        """_log_operation should include prev_hash and entry_hash in CREATE."""
+        tx = MagicMock()
+        prev_result = MagicMock()
+        prev_result.single.return_value = None  # GENESIS
+        # First call is prev hash lookup, second is CREATE
+        tx.run.side_effect = [prev_result, None]
+
+        self.adapter._log_operation(
+            tx, "op1", "entity_upsert", "system", "test",
+            {"name": "Test"})
+
+        # Second tx.run call should be the CREATE with hash fields
+        create_call = tx.run.call_args_list[1]
+        create_query = create_call[0][0]
+        create_kwargs = create_call[1]
+        self.assertIn("prev_hash", create_query)
+        self.assertIn("entry_hash", create_query)
+        self.assertEqual(create_kwargs["prev_hash"], "GENESIS")
+        self.assertEqual(len(create_kwargs["entry_hash"]), 64)
+
+    def test_log_operation_chains_from_previous(self):
+        """_log_operation should use previous entry's hash as prev_hash."""
+        tx = MagicMock()
+        prev_result = MagicMock()
+        prev_result.single.return_value = {
+            "entry_hash": "abc123" * 10 + "abcd",  # 64 chars
+            "created_at": "2026-03-23T05:00:00+00:00",
+        }
+        tx.run.side_effect = [prev_result, None]
+
+        self.adapter._log_operation(
+            tx, "op2", "update_belief", "api", "test",
+            {"confidence": 0.9})
+
+        create_kwargs = tx.run.call_args_list[1][1]
+        self.assertEqual(create_kwargs["prev_hash"], "abc123" * 10 + "abcd")
+
+    def test_verify_chain_empty(self):
+        """Empty project should return valid=True with 0 entries."""
+        self.session.run.return_value = iter([])
+        result = self.adapter.verify_chain(project_id="empty")
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["total_entries"], 0)
+        self.assertEqual(result["verified"], 0)
+
+    def test_verify_chain_valid(self):
+        """Valid chain should return valid=True."""
+        h1 = Neo4jBaseAdapter._compute_entry_hash(
+            "GENESIS", "op1", "entity_upsert", "system",
+            "test", "2026-03-23T06:00:00+00:00", '{"n": "A"}')
+        h2 = Neo4jBaseAdapter._compute_entry_hash(
+            h1, "op2", "update_belief", "api",
+            "test", "2026-03-23T06:01:00+00:00", '{"c": 0.9}')
+
+        entries = [
+            {"id": "op1", "type": "entity_upsert", "actor": "system",
+             "project_id": "test", "created_at": "2026-03-23T06:00:00+00:00",
+             "payload_json": '{"n": "A"}', "prev_hash": "GENESIS",
+             "entry_hash": h1},
+            {"id": "op2", "type": "update_belief", "actor": "api",
+             "project_id": "test", "created_at": "2026-03-23T06:01:00+00:00",
+             "payload_json": '{"c": 0.9}', "prev_hash": h1,
+             "entry_hash": h2},
+        ]
+        self.session.run.return_value = iter(entries)
+        result = self.adapter.verify_chain(project_id="test")
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["verified"], 2)
+        self.assertEqual(len(result["breaks"]), 0)
+
+    def test_verify_chain_tampered(self):
+        """Tampered entry hash should be detected."""
+        h1 = Neo4jBaseAdapter._compute_entry_hash(
+            "GENESIS", "op1", "entity_upsert", "system",
+            "test", "2026-03-23T06:00:00+00:00", '{"n": "A"}')
+
+        entries = [
+            {"id": "op1", "type": "entity_upsert", "actor": "system",
+             "project_id": "test", "created_at": "2026-03-23T06:00:00+00:00",
+             "payload_json": '{"n": "A"}', "prev_hash": "GENESIS",
+             "entry_hash": "tampered" + "0" * 56},  # wrong hash
+        ]
+        self.session.run.return_value = iter(entries)
+        result = self.adapter.verify_chain(project_id="test")
+        self.assertFalse(result["valid"])
+        self.assertEqual(len(result["breaks"]), 1)
+        self.assertEqual(result["breaks"][0]["error"], "entry_hash_mismatch")
+
+    def test_verify_chain_broken_link(self):
+        """Mismatched prev_hash should be detected."""
+        h1 = Neo4jBaseAdapter._compute_entry_hash(
+            "GENESIS", "op1", "entity_upsert", "system",
+            "test", "2026-03-23T06:00:00+00:00", '{"n": "A"}')
+
+        entries = [
+            {"id": "op1", "type": "entity_upsert", "actor": "system",
+             "project_id": "test", "created_at": "2026-03-23T06:00:00+00:00",
+             "payload_json": '{"n": "A"}', "prev_hash": "GENESIS",
+             "entry_hash": h1},
+            {"id": "op2", "type": "update_belief", "actor": "api",
+             "project_id": "test", "created_at": "2026-03-23T06:01:00+00:00",
+             "payload_json": '{"c": 0.9}', "prev_hash": "wrong_prev_hash",
+             "entry_hash": Neo4jBaseAdapter._compute_entry_hash(
+                 "wrong_prev_hash", "op2", "update_belief", "api",
+                 "test", "2026-03-23T06:01:00+00:00", '{"c": 0.9}')},
+        ]
+        self.session.run.return_value = iter(entries)
+        result = self.adapter.verify_chain(project_id="test")
+        self.assertFalse(result["valid"])
+        self.assertEqual(result["breaks"][0]["error"], "prev_hash_mismatch")
+
+    def test_verify_chain_unchained_entries(self):
+        """Pre-hash entries should be counted as unchained."""
+        entries = [
+            {"id": "old1", "type": "entity_upsert", "actor": "system",
+             "project_id": "test", "created_at": "2026-03-20T06:00:00+00:00",
+             "payload_json": '{"n": "Old"}', "prev_hash": None,
+             "entry_hash": None},
+        ]
+        self.session.run.return_value = iter(entries)
+        result = self.adapter.verify_chain(project_id="test")
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["unchained"], 1)
+        self.assertEqual(result["verified"], 0)
+
+    def test_history_returns_hash_fields(self):
+        """get_history should include prev_hash and entry_hash in operation."""
+        import json as _json
+        count_result = MagicMock()
+        count_result.single.return_value = {"total": 1}
+
+        h = Neo4jBaseAdapter._compute_entry_hash(
+            "GENESIS", "op1", "entity_upsert", "system",
+            "test", "2026-03-23T06:00:00+00:00",
+            _json.dumps({"name": "Test"}, ensure_ascii=True))
+
+        data_records = [
+            {
+                "operation": {
+                    "id": "op1", "type": "entity_upsert",
+                    "actor": "system", "project_id": "test",
+                    "payload_json": _json.dumps({"name": "Test"}),
+                    "before_json": None, "after_json": _json.dumps({"name": "Test"}),
+                    "status": "committed",
+                    "created_at": "2026-03-23T06:00:00+00:00",
+                    "prev_hash": "GENESIS",
+                    "entry_hash": h,
+                },
+                "history_entries": [],
+            }
+        ]
+        self.session.run.side_effect = [count_result, data_records]
+
+        result = self.adapter.get_history(project_id="test")
+        op = result["entries"][0]["operation"]
+        self.assertEqual(op.get("prev_hash"), "GENESIS")
+        self.assertEqual(op.get("entry_hash"), h)
 
 
 if __name__ == "__main__":

@@ -1632,6 +1632,49 @@ async def reconstruct_entity(
 
 
 @mcp.tool()
+async def verify_audit_chain(
+    project: str = None,
+    limit: int = 1000,
+) -> dict:
+    """Verify the hash chain integrity of the audit trail.
+
+    Walks OperationLog entries chronologically, recomputes each hash,
+    and reports any chain breaks indicating potential tampering or corruption.
+
+    Args:
+        project: Project ID (default: your personal space)
+        limit: Max entries to verify (default: 1000, max: 10000)
+    """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    adapter = _get_adapter()
+    limit = max(1, min(limit, 10000))
+    start = time.time()
+    try:
+        result = await _run_sync(
+            adapter.verify_chain,
+            project_id=project,
+            limit=limit,
+        )
+        result["duration_ms"] = int((time.time() - start) * 1000)
+        audit_log("verify_audit_chain", "authed",
+                  {"project": project, "limit": limit},
+                  int((time.time() - start) * 1000), "ok")
+        return result
+    except Exception as e:
+        audit_log("verify_audit_chain", "authed",
+                  {"project": project},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
 async def health_check() -> dict:
     """Check if the knowledge graph backends are healthy."""
     auth_ctx = _get_auth_context()

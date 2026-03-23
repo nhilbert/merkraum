@@ -302,6 +302,17 @@ class BackendAdapter(ABC):
             {"entries": [...], "total": int, "limit": int, "offset": int}
         """
 
+    @abstractmethod
+    def verify_chain(self, project_id: str = "default",
+                     limit: int = 1000) -> dict:
+        """Verify hash chain integrity of the audit trail.
+
+        Returns:
+            {"valid": bool, "total_entries": int, "verified": int,
+             "breaks": list, "first_entry": str, "last_entry": str,
+             "unchained": int}
+        """
+
     # --- Vector Operations ---
 
     @abstractmethod
@@ -453,11 +464,54 @@ class Neo4jBaseAdapter(BackendAdapter):
                 if (r.get("metadata") or {}).get("name", "").strip()
                 not in expired_names]
 
+    @staticmethod
+    def _compute_entry_hash(prev_hash: str, op_id: str, op_type: str,
+                            actor: str, project_id: str,
+                            created_at: str, payload_json: str) -> str:
+        """Compute SHA-256 hash for an audit log entry.
+
+        Hash input: prev_hash|op_id|op_type|actor|project_id|created_at|payload_json
+        """
+        import hashlib
+        canonical = "|".join([
+            prev_hash, op_id, op_type, actor,
+            project_id, created_at, payload_json,
+        ])
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
     def _log_operation(self, tx, op_id: str, op_type: str, actor: str,
                        project_id: str, payload: dict,
                        before_state: Optional[dict] = None,
                        after_state: Optional[dict] = None,
                        status: str = "committed"):
+        now = datetime.now(timezone.utc).isoformat()
+        payload_json = json.dumps(payload, ensure_ascii=True)
+
+        # Fetch the previous entry's hash for chain linking
+        prev_hash = "GENESIS"
+        try:
+            prev_result = tx.run(
+                """
+                MATCH (prev:OperationLog {project_id: $project_id})
+                WHERE prev.entry_hash IS NOT NULL
+                RETURN prev.entry_hash AS entry_hash
+                ORDER BY prev.created_at DESC
+                LIMIT 1
+                """,
+                project_id=project_id,
+            )
+            prev_record = prev_result.single()
+            if prev_record is not None:
+                val = prev_record["entry_hash"]
+                if isinstance(val, str):
+                    prev_hash = val
+        except Exception:
+            pass  # GENESIS default for first entry or lookup failure
+
+        entry_hash = self._compute_entry_hash(
+            prev_hash, op_id, op_type, actor, project_id, now, payload_json,
+        )
+
         tx.run(
             """
             CREATE (op:OperationLog {
@@ -469,20 +523,24 @@ class Neo4jBaseAdapter(BackendAdapter):
                 before_json: $before_json,
                 after_json: $after_json,
                 status: $status,
-                created_at: $now
+                created_at: $now,
+                prev_hash: $prev_hash,
+                entry_hash: $entry_hash
             })
             """,
             id=op_id,
             type=op_type,
             actor=actor,
             project_id=project_id,
-            payload_json=json.dumps(payload, ensure_ascii=True),
+            payload_json=payload_json,
             before_json=json.dumps(before_state, ensure_ascii=True)
             if before_state is not None else None,
             after_json=json.dumps(after_state, ensure_ascii=True)
             if after_state is not None else None,
             status=status,
-            now=datetime.now(timezone.utc).isoformat(),
+            now=now,
+            prev_hash=prev_hash,
+            entry_hash=entry_hash,
         )
 
     def _log_history(self, tx, op_id: str, entity_name: str, project_id: str,
@@ -2796,7 +2854,8 @@ class Neo4jBaseAdapter(BackendAdapter):
                     SKIP $offset LIMIT $limit
                     RETURN op {{
                         .id, .type, .actor, .project_id, .payload_json,
-                        .before_json, .after_json, .status, .created_at
+                        .before_json, .after_json, .status, .created_at,
+                        .prev_hash, .entry_hash
                     }} AS operation, history_entries
                 """
             else:
@@ -2821,7 +2880,8 @@ class Neo4jBaseAdapter(BackendAdapter):
                     WITH op, [x IN raw_history WHERE x IS NOT NULL] AS history_entries
                     RETURN op {{
                         .id, .type, .actor, .project_id, .payload_json,
-                        .before_json, .after_json, .status, .created_at
+                        .before_json, .after_json, .status, .created_at,
+                        .prev_hash, .entry_hash
                     }} AS operation, history_entries
                 """
 
@@ -2978,6 +3038,106 @@ class Neo4jBaseAdapter(BackendAdapter):
                 "found": True,
                 "total_ops": total_ops,
             }
+
+    def verify_chain(self, project_id="default", limit=1000):
+        """Verify the hash chain integrity of the audit trail.
+
+        Walks OperationLog entries in chronological order, recomputes each
+        entry_hash from its fields and prev_hash, and checks for breaks.
+
+        Args:
+            project_id: Scope to a specific project.
+            limit: Max entries to verify (default 1000).
+
+        Returns:
+            dict with valid (bool), total_entries, verified, breaks (list),
+            first_entry, last_entry, unchained (count of entries without hashes).
+        """
+        with self._driver.session() as session:
+            records = session.run(
+                """
+                MATCH (op:OperationLog {project_id: $project_id})
+                RETURN op.id AS id, op.type AS type, op.actor AS actor,
+                       op.project_id AS project_id,
+                       op.created_at AS created_at,
+                       op.payload_json AS payload_json,
+                       op.prev_hash AS prev_hash,
+                       op.entry_hash AS entry_hash
+                ORDER BY op.created_at ASC
+                LIMIT $limit
+                """,
+                project_id=project_id,
+                limit=limit,
+            )
+            entries = list(records)
+
+        if not entries:
+            return {
+                "valid": True,
+                "total_entries": 0,
+                "verified": 0,
+                "breaks": [],
+                "first_entry": None,
+                "last_entry": None,
+                "unchained": 0,
+            }
+
+        breaks = []
+        verified = 0
+        unchained = 0
+        prev_hash = "GENESIS"
+
+        for entry in entries:
+            entry_hash = entry.get("entry_hash")
+            stored_prev = entry.get("prev_hash")
+
+            # Skip entries created before hash chaining was added
+            if entry_hash is None:
+                unchained += 1
+                continue
+
+            # Verify prev_hash links correctly
+            if stored_prev != prev_hash:
+                breaks.append({
+                    "op_id": entry["id"],
+                    "created_at": entry["created_at"],
+                    "error": "prev_hash_mismatch",
+                    "expected_prev": prev_hash,
+                    "stored_prev": stored_prev,
+                })
+
+            # Recompute entry hash and verify
+            expected_hash = self._compute_entry_hash(
+                stored_prev or "GENESIS",
+                entry["id"],
+                entry["type"],
+                entry["actor"],
+                entry["project_id"],
+                entry["created_at"],
+                entry["payload_json"] or "",
+            )
+
+            if entry_hash != expected_hash:
+                breaks.append({
+                    "op_id": entry["id"],
+                    "created_at": entry["created_at"],
+                    "error": "entry_hash_mismatch",
+                    "expected": expected_hash,
+                    "stored": entry_hash,
+                })
+
+            prev_hash = entry_hash
+            verified += 1
+
+        return {
+            "valid": len(breaks) == 0,
+            "total_entries": len(entries),
+            "verified": verified,
+            "breaks": breaks,
+            "first_entry": entries[0]["created_at"] if entries else None,
+            "last_entry": entries[-1]["created_at"] if entries else None,
+            "unchained": unchained,
+        }
 
 
 class Neo4jQdrantAdapter(Neo4jBaseAdapter):
