@@ -2394,8 +2394,9 @@ def ingest():
     if not isinstance(entities, list) or not isinstance(relationships, list):
         return _error("'entities' and 'relationships' must be arrays", 400)
 
-    # Resolve node limit from tier (passed in body or default "free")
-    tier = body.get("tier") or "free"
+    # Resolve node limit from project's stored tier (not request body)
+    proj_meta = adapter.get_project(project) if adapter else None
+    tier = (proj_meta or {}).get("tier", "free")
     node_limit = TIER_LIMITS.get(tier)
 
     try:
@@ -2549,8 +2550,9 @@ def ingest_text():
             "message": "No extractable knowledge found in the text.",
         })
 
-    # Resolve node limit from tier
-    tier = body.get("tier") or "free"
+    # Resolve node limit from project's stored tier (not request body)
+    proj_meta = adapter.get_project(project) if adapter else None
+    tier = (proj_meta or {}).get("tier", "free")
     node_limit = TIER_LIMITS.get(tier)
 
     # Step 2: Ingest into graph
