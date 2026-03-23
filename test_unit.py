@@ -2504,8 +2504,10 @@ class TestDreamingMaintenance(unittest.TestCase):
         adapter = self._make_mock_adapter()
         messages, result = self._run_generator(
             maintain(adapter, "proj", dry_run=True))
-        phases = [m["phase"] for m in messages]
-        self.assertTrue(all(p == "maintenance" for p in phases))
+        phases = set(m["phase"] for m in messages)
+        # Maintenance includes reconsolidation sub-phase
+        self.assertIn("maintenance", phases)
+        self.assertIn("reconsolidation", phases)
         steps = [m["step"] for m in messages]
         self.assertIn("start", steps)
         self.assertIn("decay_done", steps)
@@ -2574,12 +2576,14 @@ class TestDreamingMaintenance(unittest.TestCase):
         )
         messages, result = self._run_generator(
             maintain(adapter, "proj", dry_run=False))
-        done_msgs = [m for m in messages if m["step"] == "done"]
+        done_msgs = [m for m in messages
+                     if m["step"] == "done" and m["phase"] == "maintenance"]
         self.assertEqual(len(done_msgs), 1)
         self.assertIn("2 decay", done_msgs[0]["detail"])
         self.assertIn("1 expired", done_msgs[0]["detail"])
         self.assertIn("3 pruned", done_msgs[0]["detail"])
         self.assertIn("4 deduped", done_msgs[0]["detail"])
+        self.assertIn("reconsolidated", done_msgs[0]["detail"])
 
     def test_dream_includes_maintenance_by_default(self):
         """Dream session should include maintenance in default phases."""
@@ -2611,6 +2615,155 @@ class TestDreamingMaintenance(unittest.TestCase):
         messages, result = self._run_generator(
             maintain(adapter, "proj", dry_run=False))
         self.assertTrue(result["decay"]["applied"])
+
+
+# --- Dreaming reconsolidation tests (Z1857, Proposal #5) ---
+
+class TestDreamingReconsolidation(unittest.TestCase):
+    """Test importance-weighted confidence strengthening — Z1857 proposal #5."""
+
+    def _run_generator(self, gen):
+        """Consume a generator, collecting messages and returning the result."""
+        messages = []
+        try:
+            while True:
+                messages.append(next(gen))
+        except StopIteration as e:
+            return messages, e.value
+
+    def _make_mock_adapter(self, beliefs=None):
+        """Create a mock adapter with configurable belief query results."""
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(
+            data=lambda: beliefs or [])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        return adapter
+
+    def test_reconsolidate_strengthens_accessed_beliefs(self):
+        """Beliefs with high access_count should get confidence boost."""
+        from merkraum_dreaming import reconsolidate
+        beliefs = [
+            {"name": "B1", "confidence": 0.6, "access_count": 5,
+             "knowledge_type": "opinion", "vsm_level": "S3"},
+        ]
+        adapter = self._make_mock_adapter(beliefs)
+        messages, result = self._run_generator(
+            reconsolidate(adapter, "proj", dry_run=False))
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["items"][0]["name"], "B1")
+        self.assertAlmostEqual(result["items"][0]["boost"], 0.05, places=3)
+        self.assertAlmostEqual(result["items"][0]["new_confidence"], 0.65, places=3)
+
+    def test_reconsolidate_caps_at_max_boost(self):
+        """Boost should be capped at RECONSOLIDATION_MAX_BOOST."""
+        from merkraum_dreaming import reconsolidate
+        beliefs = [
+            {"name": "B1", "confidence": 0.5, "access_count": 100,
+             "knowledge_type": "opinion", "vsm_level": "S1"},
+        ]
+        adapter = self._make_mock_adapter(beliefs)
+        messages, result = self._run_generator(
+            reconsolidate(adapter, "proj", dry_run=False))
+        self.assertEqual(result["count"], 1)
+        # 100 * 0.01 = 1.0, but capped at 0.15
+        self.assertAlmostEqual(result["items"][0]["boost"], 0.15, places=3)
+        self.assertAlmostEqual(result["items"][0]["new_confidence"], 0.65, places=3)
+
+    def test_reconsolidate_caps_confidence_at_1(self):
+        """New confidence should never exceed 1.0."""
+        from merkraum_dreaming import reconsolidate
+        beliefs = [
+            {"name": "B1", "confidence": 0.95, "access_count": 20,
+             "knowledge_type": "hypothesis", "vsm_level": "S4"},
+        ]
+        adapter = self._make_mock_adapter(beliefs)
+        messages, result = self._run_generator(
+            reconsolidate(adapter, "proj", dry_run=False))
+        self.assertEqual(result["count"], 1)
+        self.assertAlmostEqual(result["items"][0]["new_confidence"], 1.0, places=3)
+
+    def test_reconsolidate_skips_below_min_access(self):
+        """Beliefs with access_count < min_access should be excluded by query."""
+        from merkraum_dreaming import reconsolidate
+        # Empty result since the query filters access_count < 3
+        adapter = self._make_mock_adapter([])
+        messages, result = self._run_generator(
+            reconsolidate(adapter, "proj", dry_run=False))
+        self.assertEqual(result["count"], 0)
+
+    def test_reconsolidate_dry_run_no_writes(self):
+        """Dry run should not write to Neo4j."""
+        from merkraum_dreaming import reconsolidate
+        beliefs = [
+            {"name": "B1", "confidence": 0.6, "access_count": 5,
+             "knowledge_type": "opinion", "vsm_level": "S3"},
+        ]
+        adapter = self._make_mock_adapter(beliefs)
+        messages, result = self._run_generator(
+            reconsolidate(adapter, "proj", dry_run=True))
+        self.assertEqual(result["count"], 1)
+        self.assertEqual(result["mode"], "preview")
+        # session.run called once for the query, not for writes
+        mock_session = adapter._driver.session.return_value.__enter__()
+        self.assertEqual(mock_session.run.call_count, 1)
+
+    def test_reconsolidate_skips_negligible_change(self):
+        """Changes < 0.001 should be skipped."""
+        from merkraum_dreaming import reconsolidate
+        beliefs = [
+            {"name": "B1", "confidence": 0.999, "access_count": 3,
+             "knowledge_type": "fact_derived", "vsm_level": "S1"},
+        ]
+        adapter = self._make_mock_adapter(beliefs)
+        messages, result = self._run_generator(
+            reconsolidate(adapter, "proj", dry_run=False))
+        # 0.999 + 0.03 = 1.0, diff = 0.001 — borderline, should be included
+        # since 1.0 - 0.999 = 0.001, abs < 0.001 is false (it equals 0.001)
+        self.assertEqual(result["count"], 1)
+
+    def test_reconsolidate_custom_params(self):
+        """Custom factor and max_boost should be respected."""
+        from merkraum_dreaming import reconsolidate
+        beliefs = [
+            {"name": "B1", "confidence": 0.5, "access_count": 10,
+             "knowledge_type": "opinion", "vsm_level": "S2"},
+        ]
+        adapter = self._make_mock_adapter(beliefs)
+        messages, result = self._run_generator(
+            reconsolidate(adapter, "proj", factor=0.02, max_boost=0.10,
+                          dry_run=True))
+        self.assertEqual(result["count"], 1)
+        # 10 * 0.02 = 0.20, capped at 0.10
+        self.assertAlmostEqual(result["items"][0]["boost"], 0.10, places=3)
+        self.assertEqual(result["params"]["factor"], 0.02)
+        self.assertEqual(result["params"]["max_boost"], 0.10)
+
+    def test_maintain_includes_reconsolidation(self):
+        """Maintain should include reconsolidation results."""
+        from merkraum_dreaming import maintain
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        # Return empty for all queries
+        mock_session.run.return_value = MagicMock(data=lambda: [])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.apply_confidence_decay.return_value = {
+            "decayed": [], "total": 0, "unchanged": 0}
+        adapter.expire_nodes.return_value = {"expired": [], "total": 0}
+        adapter.prune_orphan_nodes.return_value = {"pruned": [], "total": 0}
+        adapter.deduplicate_edges.return_value = {
+            "duplicates_found": 0, "edges_removed": 0, "groups": []}
+        adapter.get_certainty_review_queue.return_value = {"categories": {}}
+        adapter.get_certainty_stats.return_value = {
+            "governance": {"status": "healthy"}}
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=False))
+        self.assertIn("reconsolidation", result)
+        self.assertEqual(result["reconsolidation"]["count"], 0)
 
 
 # --- Dreaming replay associative edge creation tests (Z1839) ---

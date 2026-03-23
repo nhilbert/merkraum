@@ -67,6 +67,15 @@ _DEFAULT_COMPRESSION_MODEL = _DEFAULT_CONSOLIDATION_MODEL
 # With base_ttl=30: 30 * (1 + 10 * 1.12) = 366 days ≈ 1 year
 TTL_SCALE_FACTOR = 1.12
 
+# Reconsolidation: importance-weighted confidence strengthening (Proposal #5)
+# Biological basis: frequently recalled memories undergo reconsolidation,
+# strengthening synaptic traces. This counters confidence decay for actively
+# used knowledge. Boost = min(access_count * RECONSOLIDATION_FACTOR, MAX_BOOST).
+# Threshold: only beliefs accessed >= MIN_ACCESS_FOR_RECONSOLIDATION get boosted.
+RECONSOLIDATION_FACTOR = 0.01  # +0.01 confidence per access
+RECONSOLIDATION_MAX_BOOST = 0.15  # Cap: max +0.15 confidence per maintenance cycle
+RECONSOLIDATION_MIN_ACCESS = 3  # Minimum access_count to qualify
+
 
 def _get_walk_model() -> str | None:
     """Return the model for walk phase (env override or default)."""
@@ -1777,6 +1786,146 @@ def reflect(
 
 
 # ---------------------------------------------------------------------------
+# Reconsolidation — importance-weighted confidence strengthening (Proposal #5)
+# ---------------------------------------------------------------------------
+
+def reconsolidate(
+    adapter: Neo4jBaseAdapter,
+    project_id: str = "default",
+    min_access: int = RECONSOLIDATION_MIN_ACCESS,
+    factor: float = RECONSOLIDATION_FACTOR,
+    max_boost: float = RECONSOLIDATION_MAX_BOOST,
+    dry_run: bool = False,
+) -> Generator[dict, None, dict]:
+    """Strengthen confidence of frequently-accessed beliefs (reconsolidation).
+
+    Biological basis: memories that are frequently recalled undergo
+    reconsolidation, strengthening synaptic traces. This counters
+    confidence decay for actively used knowledge — the inverse of
+    forgetting. Only beliefs with access_count >= min_access qualify.
+
+    The boost is proportional to access frequency but capped:
+      boost = min(access_count * factor, max_boost)
+      new_confidence = min(old_confidence + boost, 1.0)
+
+    S5 beliefs and facts (knowledge_type='fact') are exempt — they have
+    their own stability mechanisms.
+
+    Args:
+        adapter: Backend adapter (Neo4j + vector store)
+        project_id: Project scope
+        min_access: Minimum access_count to qualify (default 3)
+        factor: Confidence boost per access (default 0.01)
+        max_boost: Maximum boost per cycle (default 0.15)
+        dry_run: If True, preview without applying
+
+    Yields progress messages. Returns result dict.
+    """
+    mode = "preview" if dry_run else "apply"
+    yield _msg("reconsolidation", "start",
+               f"Importance-weighted strengthening ({mode} mode, "
+               f"min_access={min_access}, factor={factor}, max_boost={max_boost})")
+
+    strengthened = []
+    skipped = 0
+
+    try:
+        with adapter._driver.session() as session:
+            # Find active beliefs with sufficient access_count
+            candidates = session.run(
+                "MATCH (b:Belief {project_id: $pid}) "
+                "WHERE b.active = true "
+                "AND b.confidence IS NOT NULL "
+                "AND b.access_count IS NOT NULL "
+                "AND b.access_count >= $min_access "
+                "AND b.confidence < 1.0 "
+                "AND COALESCE(b.vsm_level, 'S1') <> 'S5' "
+                "AND COALESCE(b.knowledge_type, 'unclassified') <> 'fact' "
+                "RETURN b.name AS name, b.confidence AS confidence, "
+                "b.access_count AS access_count, "
+                "COALESCE(b.knowledge_type, 'unclassified') AS knowledge_type, "
+                "COALESCE(b.vsm_level, 'S1') AS vsm_level",
+                pid=project_id, min_access=min_access,
+            ).data()
+
+            yield _msg("reconsolidation", "candidates",
+                       f"Found {len(candidates)} belief(s) with access_count >= {min_access}")
+
+            now_iso = datetime.now(timezone.utc).isoformat()
+
+            for c in candidates:
+                ac = c["access_count"]
+                old_conf = c["confidence"]
+                boost = min(ac * factor, max_boost)
+                new_conf = round(min(old_conf + boost, 1.0), 4)
+
+                # Skip if change is negligible (< 0.001)
+                if abs(new_conf - old_conf) < 0.001:
+                    skipped += 1
+                    continue
+
+                entry = {
+                    "name": c["name"],
+                    "knowledge_type": c["knowledge_type"],
+                    "access_count": ac,
+                    "old_confidence": old_conf,
+                    "new_confidence": new_conf,
+                    "boost": round(boost, 4),
+                }
+                strengthened.append(entry)
+
+                if not dry_run:
+                    session.run(
+                        "MATCH (b:Belief {project_id: $pid, name: $name}) "
+                        "SET b.confidence = $new_conf, "
+                        "    b.reconsolidated_at = $now, "
+                        "    b.last_boost = $boost",
+                        pid=project_id, name=c["name"],
+                        new_conf=new_conf, now=now_iso,
+                        boost=round(boost, 4),
+                    )
+
+    except Exception as e:
+        logger.warning("Reconsolidation failed: %s", e)
+        yield _msg("reconsolidation", "error", f"Reconsolidation error: {e}")
+        return {
+            "phase": "reconsolidation", "status": "error",
+            "error": str(e), "strengthened": [], "count": 0,
+        }
+
+    # Progress: show top strengthened beliefs
+    for entry in strengthened[:10]:
+        yield _msg("reconsolidation", "strengthened",
+                   f"  {entry['name']}: {entry['old_confidence']:.3f} → "
+                   f"{entry['new_confidence']:.3f} "
+                   f"(+{entry['boost']:.3f}, {entry['access_count']} accesses)")
+
+    if len(strengthened) > 10:
+        yield _msg("reconsolidation", "truncated",
+                   f"  ... and {len(strengthened) - 10} more")
+
+    yield _msg("reconsolidation", "done",
+               f"Reconsolidation: {len(strengthened)} belief(s) "
+               f"{'would be ' if dry_run else ''}strengthened, {skipped} skipped",
+               {"strengthened": len(strengthened), "skipped": skipped,
+                "dry_run": dry_run})
+
+    return {
+        "phase": "reconsolidation",
+        "status": "completed",
+        "mode": mode,
+        "count": len(strengthened),
+        "skipped": skipped,
+        "items": strengthened,
+        "params": {
+            "min_access": min_access,
+            "factor": factor,
+            "max_boost": max_boost,
+        },
+    }
+
+
+# ---------------------------------------------------------------------------
 # Phase 6: Maintenance — confidence decay and knowledge hygiene
 # ---------------------------------------------------------------------------
 
@@ -1913,6 +2062,19 @@ def maintain(
         yield _msg("maintenance", "decay_truncated",
                    f"  ... and {decayed_count - 10} more")
 
+    # Step 1b: Reconsolidation — importance-weighted strengthening (Proposal #5)
+    # Counters decay for frequently-accessed beliefs. Runs after decay so
+    # both forces apply: stale beliefs decay, actively-used beliefs strengthen.
+    gen = reconsolidate(adapter, project_id, dry_run=dry_run)
+    reconsolidation_result = None
+    try:
+        while True:
+            progress = next(gen)
+            yield progress
+    except StopIteration as e:
+        reconsolidation_result = e.value
+    reconsolidated_count = (reconsolidation_result or {}).get("count", 0)
+
     # Step 2: TTL enforcement — expire nodes past their valid_until
     yield _msg("maintenance", "expire_start",
                "Enforcing TTL expirations...")
@@ -2015,6 +2177,9 @@ def maintain(
             "unchanged_count": unchanged_count,
             "items": decay_result.get("decayed", []),
         },
+        "reconsolidation": reconsolidation_result or {
+            "count": 0, "skipped": 0,
+        },
         "expired": {
             "count": expired_count,
             "items": expire_result.get("expired", []),
@@ -2036,12 +2201,14 @@ def maintain(
 
     yield _msg("maintenance", "done",
                f"Maintenance complete — {ttl_extended} TTL extended, "
-               f"{decayed_count} decay(s), "
+               f"{decayed_count} decay(s), {reconsolidated_count} reconsolidated, "
                f"{expired_count} expired, {pruned_count} pruned, "
                f"{dedup_removed} deduped, "
                f"{total_review} review item(s), health: {health_status}",
                {"ttl_extended": ttl_extended,
-                "decayed": decayed_count, "expired": expired_count,
+                "decayed": decayed_count,
+                "reconsolidated": reconsolidated_count,
+                "expired": expired_count,
                 "pruned": pruned_count, "deduped": dedup_removed,
                 "review_items": total_review, "health": health_status})
 
