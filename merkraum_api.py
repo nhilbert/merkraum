@@ -31,7 +31,7 @@ import urllib.error
 from functools import lru_cache
 from typing import cast
 
-from merkraum_llm import llm_extract, llm_call, get_provider_info
+from merkraum_llm import llm_extract, llm_call, llm_text_call, get_provider_info
 
 from merkraum_acl import is_auth_required, is_project_allowed, split_csv_env
 
@@ -2487,6 +2487,141 @@ def search():
     except Exception as exc:
         logger.exception("search failed for q=%s project=%s", query, project)
         return _error(str(exc))
+
+
+@app.route("/api/chat", methods=["POST"])
+@require_auth
+def chat():
+    """Conversational chat over the knowledge graph.
+
+    Uses vector search for context retrieval, then LLM (Haiku) to
+    synthesize a natural-language answer.  Supports conversation
+    history for follow-up questions.
+
+    JSON body:
+        query:   user question (required, max 2000 chars)
+        history: [{role: "user"|"assistant", content: "..."}] (optional, max 20)
+        project: project id (optional)
+
+    Returns: {answer: "...", sources: [{name, type, summary, score}]}
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+
+    body = request.get_json(silent=True) or {}
+    query = str(body.get("query", "")).strip()
+    if not query:
+        return _error("'query' is required", 400)
+    if len(query) > 2000:
+        return _error("'query' must not exceed 2000 characters", 400)
+
+    project = body.get("project") or _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    history = body.get("history", [])
+    if not isinstance(history, list):
+        history = []
+    # Cap history to prevent abuse
+    history = history[-20:]
+
+    # 1. Retrieve context via vector search
+    try:
+        raw_results = adapter.vector_search(
+            query_text=query, top_k=8, project_id=project,
+        )
+    except Exception as exc:
+        logger.exception("chat search failed for q=%s project=%s", query, project)
+        return _error(str(exc))
+
+    # Build context string + source list from search results
+    context_parts = []
+    sources = []
+    for r in raw_results:
+        meta = r.get("metadata", {})
+        name = meta.get("name", "")
+        node_type = meta.get("node_type", "")
+        summary = meta.get("summary", "") or r.get("content", "")
+        score = r.get("score", 0)
+        confidence = meta.get("confidence")
+
+        if name or summary:
+            entry = f"- {name}" if name else "-"
+            if node_type:
+                entry += f" ({node_type})"
+            if summary:
+                entry += f": {summary}"
+            context_parts.append(entry)
+
+        sources.append({
+            "name": name,
+            "type": node_type,
+            "summary": summary[:300] if summary else "",
+            "score": round(score, 3) if score else None,
+            "confidence": confidence,
+        })
+
+    context_text = "\n".join(context_parts) if context_parts else "(no relevant knowledge found)"
+
+    # 2. Build conversation for LLM
+    history_text = ""
+    for msg in history:
+        role = msg.get("role", "user")
+        content = str(msg.get("content", ""))[:2000]
+        if role in ("user", "assistant") and content:
+            label = "User" if role == "user" else "Assistant"
+            history_text += f"{label}: {content}\n\n"
+
+    system_prompt = (
+        "You are Merkraum, a knowledge graph assistant. "
+        "Answer the user's question based on the knowledge context provided below. "
+        "Be concise, factual, and helpful. If the context doesn't contain enough "
+        "information to fully answer, say so honestly. "
+        "Respond in the same language as the user's question. "
+        "Do not make up information that is not in the context."
+    )
+
+    user_prompt = f"Knowledge context:\n{context_text}\n\n"
+    if history_text:
+        user_prompt += f"Conversation so far:\n{history_text}\n"
+    user_prompt += f"Current question: {query}"
+
+    # 3. Call LLM for answer synthesis
+    try:
+        answer = llm_text_call(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.3,
+            max_tokens=1500,
+        )
+    except Exception as exc:
+        logger.error("Chat LLM call failed: %s", exc)
+        answer = None
+
+    if not answer:
+        answer = _fallback_answer(sources, query)
+
+    return jsonify({
+        "answer": answer,
+        "sources": sources,
+    })
+
+
+def _fallback_answer(sources, query):
+    """Build a basic answer from sources when LLM is unavailable."""
+    named = [s for s in sources if s.get("name")]
+    if not named:
+        return "I couldn't find relevant information in your knowledge graph for this query."
+    parts = []
+    for s in named[:5]:
+        line = s["name"]
+        if s.get("type"):
+            line += f" ({s['type']})"
+        if s.get("summary"):
+            line += f": {s['summary'][:200]}"
+        parts.append(line)
+    return "Here's what I found:\n\n" + "\n\n".join(parts)
 
 
 @app.route("/api/ingest/text", methods=["POST"])

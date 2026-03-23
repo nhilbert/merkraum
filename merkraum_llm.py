@@ -283,6 +283,77 @@ def llm_call(
         return None
 
 
+def llm_text_call(
+    system_prompt: str,
+    user_prompt: str,
+    temperature: float = 0.5,
+    max_tokens: int = 2000,
+    provider: str | None = None,
+    model: str | None = None,
+) -> str | None:
+    """LLM call that returns plain text (no JSON / Tool Use).
+
+    Unlike llm_call(), does not force structured output.  Used for
+    conversational responses where free-form text is desired.
+    """
+    prov = (provider or LLM_PROVIDER).lower()
+
+    try:
+        if prov == "bedrock":
+            raw = _llm_text_call_bedrock(
+                system_prompt, user_prompt,
+                model=model, temperature=temperature, max_tokens=max_tokens,
+            )
+        elif prov == "openai":
+            # Reuse existing OpenAI path — it already returns text
+            raw = _llm_call_openai(
+                system_prompt, user_prompt,
+                model=model, temperature=temperature, max_tokens=max_tokens,
+            )
+        else:
+            raise ValueError(f"Unknown LLM provider: {prov}")
+    except Exception as e:
+        logger.error("LLM text call failed (provider=%s): %s", prov, e)
+        return None
+
+    return raw.strip() if raw else None
+
+
+def _llm_text_call_bedrock(
+    system_prompt: str,
+    user_prompt: str,
+    model: str | None = None,
+    temperature: float = 0.5,
+    max_tokens: int = 2000,
+) -> str:
+    """Call Bedrock Converse API for plain text output (no Tool Use)."""
+    import boto3
+
+    model_id = model or _get_model()
+    client = boto3.client("bedrock-runtime", region_name=LLM_REGION)
+
+    messages = [{"role": "user", "content": [{"text": user_prompt}]}]
+
+    kwargs = {
+        "modelId": model_id,
+        "messages": messages,
+        "inferenceConfig": {
+            "temperature": temperature,
+            "maxTokens": max_tokens,
+        },
+    }
+    if system_prompt:
+        kwargs["system"] = [{"text": system_prompt}]
+
+    response = client.converse(**kwargs)
+    content_blocks = response.get("output", {}).get("message", {}).get("content", [])
+
+    for block in content_blocks:
+        if "text" in block:
+            return block["text"]
+    return ""
+
+
 def get_provider_info() -> dict:
     """Return current LLM configuration for diagnostics."""
     return {
