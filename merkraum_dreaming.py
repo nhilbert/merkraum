@@ -5,25 +5,29 @@ Merkraum Dreaming Engine — neuroscience-inspired memory consolidation.
 Universal logic module: no Flask, no hosting dependencies.
 Designed for open-source sharing — all hosting/user logic stays in the API layer.
 
-Five operations inspired by memory consolidation research
+Six operations inspired by memory consolidation research
 (McClelland et al., O'Reilly & Frank):
 
 1. Replay (hippocampal replay): Random walks through the graph surface
    unexpected connections between distant knowledge clusters.
 2. Consolidation (hippocampus-to-neocortex transfer): Episodic beliefs
-   are merged into abstract, generalizable beliefs.
-3. Bridging (free association): Cross-domain connection discovery between
+   are merged into abstract, generalizable beliefs (textual similarity).
+3. Compression (hippocampus-to-neocortex transfer): Entity-based topic
+   clustering — beliefs about the same entity are compressed into
+   higher-level abstractions (structural/semantic grouping).
+4. Bridging (free association): Cross-domain connection discovery between
    distant belief clusters — picks random belief pairs with high graph
    distance and evaluates whether a meaningful relationship exists.
-4. Reflection (Default Mode Network): Structural health analysis —
+5. Reflection (Default Mode Network): Structural health analysis —
    orphan detection, hub over-centralization, schema discipline.
-5. Maintenance (synaptic pruning): Confidence decay on stale beliefs,
+6. Maintenance (synaptic pruning): Confidence decay on stale beliefs,
    certainty review queue, governance health assessment.
 
 All operations yield progress messages via generators, enabling
 async monitoring and live visualization in the frontend.
 
 v1.1 — Bridging phase added (2026-03-23)
+v1.2 — Compression phase added (2026-03-23)
 """
 
 import json
@@ -51,6 +55,7 @@ logger = logging.getLogger("merkraum-dreaming")
 _DEFAULT_REPLAY_MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
 _DEFAULT_CONSOLIDATION_MODEL = "eu.anthropic.claude-sonnet-4-6"
 _DEFAULT_BRIDGING_MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+_DEFAULT_COMPRESSION_MODEL = "eu.anthropic.claude-sonnet-4-6"
 
 
 def _get_replay_model() -> str | None:
@@ -68,16 +73,23 @@ def _get_bridging_model() -> str | None:
     return os.environ.get("MERKRAUM_DREAMING_BRIDGING_MODEL") or _DEFAULT_BRIDGING_MODEL
 
 
+def _get_compression_model() -> str | None:
+    """Return the model for compression phase (env override or default)."""
+    return os.environ.get("MERKRAUM_DREAMING_COMPRESSION_MODEL") or _DEFAULT_COMPRESSION_MODEL
+
+
 def get_dreaming_config() -> dict:
     """Return current dreaming model configuration for diagnostics."""
     return {
         "replay_model": _get_replay_model(),
         "consolidation_model": _get_consolidation_model(),
         "bridging_model": _get_bridging_model(),
+        "compression_model": _get_compression_model(),
         "reflection_model": None,  # No LLM used
         "replay_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL") else "default",
         "consolidation_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_CONSOLIDATION_MODEL") else "default",
         "bridging_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_BRIDGING_MODEL") else "default",
+        "compression_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_COMPRESSION_MODEL") else "default",
     }
 
 
@@ -602,7 +614,291 @@ def consolidate(
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: Bridging — cross-domain connection discovery (free association)
+# Phase 3: Compression — entity-based topic abstraction (hippocampus→neocortex)
+# ---------------------------------------------------------------------------
+
+def compress(
+    adapter: Neo4jBaseAdapter,
+    project_id: str = "default",
+    min_cluster_size: int = 3,
+    max_clusters: int = 10,
+    dry_run: bool = False,
+) -> Generator[dict, None, dict]:
+    """Compress episodic beliefs into higher-level abstractions by topic.
+
+    Unlike consolidation (which merges textually similar beliefs), compression
+    identifies beliefs clustered around the same graph entities and creates
+    abstract generalizations — the hippocampus-to-neocortex transfer.
+
+    Strategy: Beliefs sharing connections to the same entities form natural
+    topic groups. For each group with enough members, an LLM synthesizes a
+    higher-level abstract belief. Original beliefs are marked as compressed
+    and linked to the abstraction.
+
+    Args:
+        adapter: Backend adapter (Neo4j + vector store)
+        project_id: Project to compress
+        min_cluster_size: Minimum beliefs per entity to form a cluster (default 3)
+        max_clusters: Maximum clusters to process per session (default 10)
+        dry_run: If True, preview compressions without applying
+
+    Yields progress messages. Returns final result dict.
+    """
+    mode = "preview" if dry_run else "apply"
+    yield _msg("compression", "start",
+               f"Topic compression ({mode}): grouping beliefs by shared entities "
+               f"(min cluster size: {min_cluster_size})")
+
+    # Find entity-based belief clusters: beliefs connected to the same entity
+    with adapter._driver.session() as session:
+        clusters_raw = session.run(
+            "MATCH (b:Belief {project_id: $pid})-[r]-(e {project_id: $pid}) "
+            "WHERE (b.status IS NULL OR b.status = 'active') "
+            "AND (b.active = true OR b.active IS NULL) "
+            "AND any(lbl IN labels(e) WHERE lbl IN $entity_types) "
+            "WITH e.name AS entity, labels(e)[0] AS entity_type, "
+            "collect(DISTINCT b.name) AS beliefs, "
+            "collect(DISTINCT type(r)) AS rel_types "
+            "WHERE size(beliefs) >= $min_size "
+            "RETURN entity, entity_type, beliefs, rel_types "
+            "ORDER BY size(beliefs) DESC "
+            "LIMIT $max_clusters",
+            pid=project_id,
+            entity_types=[t for t in NODE_TYPES if t != "Belief"],
+            min_size=min_cluster_size,
+            max_clusters=max_clusters,
+        ).data()
+
+    if not clusters_raw:
+        yield _msg("compression", "done",
+                   f"No entity clusters with >= {min_cluster_size} beliefs found")
+        return {
+            "phase": "compression",
+            "status": "completed",
+            "clusters_found": 0,
+            "clusters_compressed": 0,
+            "abstractions_created": 0,
+        }
+
+    yield _msg("compression", "clusters_found",
+               f"Found {len(clusters_raw)} entity cluster(s) with "
+               f">= {min_cluster_size} beliefs",
+               {"clusters_count": len(clusters_raw)})
+
+    # Filter out beliefs already compressed in a previous session
+    with adapter._driver.session() as session:
+        already_compressed = session.run(
+            "MATCH (b:Belief {project_id: $pid}) "
+            "WHERE b.status = 'compressed' "
+            "RETURN collect(b.name) AS names",
+            pid=project_id,
+        ).data()
+    compressed_names = set(already_compressed[0]["names"]) if already_compressed else set()
+
+    compressed_count = 0
+    abstractions_created = 0
+    results = []
+    now = datetime.now(timezone.utc).isoformat()
+
+    for i, cluster in enumerate(clusters_raw):
+        entity = cluster["entity"]
+        entity_type = cluster["entity_type"]
+        beliefs = [b for b in cluster["beliefs"] if b not in compressed_names]
+
+        if len(beliefs) < min_cluster_size:
+            yield _msg("compression", "cluster_skip",
+                       f"Cluster {i + 1} ({entity}): {len(beliefs)} uncompressed "
+                       f"beliefs after filtering (< {min_cluster_size}), skipping")
+            continue
+
+        yield _msg("compression", "cluster_start",
+                   f"Cluster {i + 1}/{len(clusters_raw)}: {entity} [{entity_type}] "
+                   f"— {len(beliefs)} belief(s)",
+                   {"entity": entity, "entity_type": entity_type,
+                    "belief_count": len(beliefs)})
+
+        # Fetch belief details for LLM
+        with adapter._driver.session() as session:
+            belief_details = session.run(
+                "MATCH (b:Belief {project_id: $pid}) "
+                "WHERE b.name IN $names "
+                "RETURN b.name AS name, b.confidence AS confidence, "
+                "b.summary AS summary",
+                pid=project_id, names=beliefs,
+            ).data()
+
+        beliefs_text = "\n".join(
+            f"  - {bd['name']} (confidence: {bd['confidence']}, "
+            f"summary: {bd.get('summary') or 'none'})"
+            for bd in belief_details
+        )
+
+        _compression_schema = {
+            "type": "object",
+            "properties": {
+                "abstract_belief": {
+                    "type": "string",
+                    "maxLength": 200,
+                    "description": "A single higher-level proposition that captures "
+                                   "the collective meaning of these beliefs about "
+                                   "the entity. Must be falsifiable.",
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": "Confidence in the abstract belief (weighted by "
+                                   "source belief confidences)",
+                },
+                "reasoning": {
+                    "type": "string",
+                    "description": "Brief explanation of the abstraction logic",
+                },
+                "beliefs_used": {
+                    "type": "integer",
+                    "description": "Number of source beliefs that contributed to "
+                                   "the abstraction (may be fewer than total if "
+                                   "some are irrelevant)",
+                },
+            },
+            "required": ["abstract_belief", "confidence", "reasoning", "beliefs_used"],
+        }
+
+        result = llm_call(
+            "You compress multiple specific beliefs about the same entity/topic "
+            "into a single higher-level abstraction. This is hippocampus-to-"
+            "neocortex transfer: converting many episodic memories into one "
+            "generalizable understanding. The abstract belief should be:\n"
+            "  1. Higher-level than any individual source belief\n"
+            "  2. Falsifiable — a testable proposition, not a vague summary\n"
+            "  3. Faithful to the evidence — don't overstate\n"
+            "  4. Max 200 characters\n"
+            "If the beliefs are too diverse to meaningfully compress, set "
+            "beliefs_used to 0 and explain why in reasoning.",
+            f"Entity: {entity} [{entity_type}]\n\n"
+            f"Beliefs about this entity:\n{beliefs_text}",
+            temperature=0.3,
+            json_schema=_compression_schema,
+            model=_get_compression_model(),
+        )
+
+        if not result or "abstract_belief" not in result:
+            yield _msg("compression", "cluster_skip",
+                       f"Cluster {i + 1} ({entity}): LLM analysis unavailable")
+            continue
+
+        beliefs_used = result.get("beliefs_used", len(beliefs))
+        if beliefs_used == 0:
+            yield _msg("compression", "cluster_skip",
+                       f"Cluster {i + 1} ({entity}): beliefs too diverse to "
+                       f"compress — {result.get('reasoning', '')[:120]}")
+            results.append({
+                "entity": entity,
+                "entity_type": entity_type,
+                "original_beliefs": beliefs,
+                "abstract_belief": None,
+                "skipped": True,
+                "reason": result.get("reasoning", ""),
+            })
+            continue
+
+        abstract = result["abstract_belief"]
+        confidence = result.get("confidence", 0.7)
+        reasoning = result.get("reasoning", "")
+
+        cluster_result = {
+            "entity": entity,
+            "entity_type": entity_type,
+            "original_beliefs": beliefs,
+            "abstract_belief": abstract,
+            "confidence": confidence,
+            "reasoning": reasoning,
+            "beliefs_used": beliefs_used,
+            "applied": not dry_run,
+        }
+        results.append(cluster_result)
+
+        if dry_run:
+            yield _msg("compression", "cluster_preview",
+                       f"Would create: \"{abstract}\" (conf: {confidence:.2f}) "
+                       f"from {beliefs_used} beliefs about {entity}",
+                       cluster_result)
+            compressed_count += 1
+            continue
+
+        # Write abstract belief and mark originals as compressed
+        with adapter._driver.session() as session:
+            # Create the abstract belief
+            session.run(
+                "MERGE (b:Belief {name: $name, project_id: $pid}) "
+                "ON CREATE SET b.summary = $reasoning, "
+                "b.created_at = $now, b.source_type = 'compression', "
+                "b.active = true, b.status = 'active', "
+                "b.confidence = $confidence, b.mentions = 1 "
+                "ON MATCH SET b.confidence = CASE "
+                "WHEN $confidence > b.confidence THEN $confidence "
+                "ELSE b.confidence END, b.updated_at = $now",
+                name=abstract, pid=project_id,
+                reasoning=reasoning, now=now, confidence=confidence,
+            )
+
+            # Link abstract belief to the entity
+            session.run(
+                "MATCH (b:Belief {name: $belief_name, project_id: $pid}), "
+                "(e {name: $entity_name, project_id: $pid}) "
+                "WHERE any(lbl IN labels(e) WHERE lbl IN $entity_types) "
+                "MERGE (b)-[r:APPLIES]->(e) "
+                "ON CREATE SET r.confidence = $confidence, "
+                "r.reason = 'compressed abstraction', "
+                "r.source_type = 'compression', r.created_at = $now, "
+                "r.active = true, r.weight = 0.9",
+                belief_name=abstract, entity_name=entity,
+                pid=project_id, now=now, confidence=confidence,
+                entity_types=[t for t in NODE_TYPES if t != "Belief"],
+            )
+
+            # Mark originals as compressed
+            for member in beliefs:
+                session.run(
+                    "MATCH (orig:Belief {name: $orig_name, project_id: $pid}) "
+                    "MATCH (abst:Belief {name: $abst_name, project_id: $pid}) "
+                    "MERGE (orig)-[r:SUPPORTS]->(abst) "
+                    "ON CREATE SET r.confidence = 0.9, "
+                    "r.reason = 'compressed into topic abstraction', "
+                    "r.source_type = 'compression', r.created_at = $now, "
+                    "r.active = true, r.weight = 0.9 "
+                    "SET orig.status = 'compressed', orig.active = false, "
+                    "orig.compressed_into = $abst_name, "
+                    "orig.compressed_at = $now",
+                    orig_name=member, abst_name=abstract,
+                    pid=project_id, now=now,
+                )
+
+        compressed_count += 1
+        abstractions_created += 1
+        yield _msg("compression", "cluster_done",
+                   f"Compressed: \"{abstract}\" (conf: {confidence:.2f}) "
+                   f"← {len(beliefs)} beliefs about {entity}",
+                   cluster_result)
+
+    yield _msg("compression", "done",
+               f"Compression {mode}: {compressed_count} cluster(s) processed, "
+               f"{abstractions_created} abstraction(s) created",
+               {"compressed": compressed_count,
+                "abstractions_created": abstractions_created})
+
+    return {
+        "phase": "compression",
+        "status": mode,
+        "clusters_found": len(clusters_raw),
+        "clusters_compressed": compressed_count,
+        "abstractions_created": abstractions_created,
+        "results": results,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Bridging — cross-domain connection discovery (free association)
 # ---------------------------------------------------------------------------
 
 def bridge(
@@ -863,7 +1159,7 @@ def bridge(
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: Reflection — structural health analysis
+# Phase 5: Reflection — structural health analysis
 # ---------------------------------------------------------------------------
 
 def reflect(
@@ -1004,7 +1300,7 @@ def reflect(
 
 
 # ---------------------------------------------------------------------------
-# Phase 4: Maintenance — confidence decay and knowledge hygiene
+# Phase 6: Maintenance — confidence decay and knowledge hygiene
 # ---------------------------------------------------------------------------
 
 def maintain(
@@ -1209,13 +1505,16 @@ def dream(
     replay_create_edges: bool = True,
     bridging_pairs: int = 15,
     bridging_create_edges: bool = True,
+    compression_min_cluster: int = 3,
+    compression_max_clusters: int = 10,
+    compression_dry_run: bool = False,
 ) -> Generator[dict, None, dict]:
-    """Run a full dreaming session (replay → consolidation → bridging → reflection → maintenance).
+    """Run a full dreaming session (replay → consolidation → compression → bridging → reflection → maintenance).
 
     Args:
         adapter: Backend adapter (Neo4j + vector store)
         project_id: Project to dream about
-        phases: Which phases to run (default: all five)
+        phases: Which phases to run (default: all six)
         replay_hops: Steps per random walk
         replay_walks: Number of random walks
         consolidation_threshold: Similarity threshold for belief clustering
@@ -1225,10 +1524,13 @@ def dream(
         replay_create_edges: If True, create provisional edges from dream observations
         bridging_pairs: Number of distant belief pairs to evaluate (default 15)
         bridging_create_edges: If True, create provisional edges from bridge discoveries
+        compression_min_cluster: Minimum beliefs per entity for compression (default 3)
+        compression_max_clusters: Maximum clusters to compress per session (default 10)
+        compression_dry_run: If True, preview compressions without applying
 
     Yields progress messages. Returns combined result dict.
     """
-    active_phases = phases or ["replay", "consolidation", "bridging", "reflection", "maintenance"]
+    active_phases = phases or ["replay", "consolidation", "compression", "bridging", "reflection", "maintenance"]
     session_id = str(uuid.uuid4())[:8]
     start_time = time.time()
 
@@ -1266,8 +1568,23 @@ def dream(
             consolidation_result = e.value
         results["phases"]["consolidation"] = consolidation_result or {}
 
+    if "compression" in active_phases:
+        yield _msg("dream", "phase_start", "Phase 3: Compression (topic abstraction)")
+        gen = compress(adapter, project_id,
+                       min_cluster_size=compression_min_cluster,
+                       max_clusters=compression_max_clusters,
+                       dry_run=compression_dry_run)
+        compression_result = None
+        try:
+            while True:
+                progress = next(gen)
+                yield progress
+        except StopIteration as e:
+            compression_result = e.value
+        results["phases"]["compression"] = compression_result or {}
+
     if "bridging" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 3: Bridging (cross-domain free association)")
+        yield _msg("dream", "phase_start", "Phase 4: Bridging (cross-domain free association)")
         gen = bridge(adapter, project_id, pairs=bridging_pairs,
                      create_edges=bridging_create_edges)
         bridging_result = None
@@ -1280,7 +1597,7 @@ def dream(
         results["phases"]["bridging"] = bridging_result or {}
 
     if "reflection" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 4: Reflection (structural health)")
+        yield _msg("dream", "phase_start", "Phase 5: Reflection (structural health)")
         gen = reflect(adapter, project_id)
         reflection_result = None
         try:
@@ -1292,7 +1609,7 @@ def dream(
         results["phases"]["reflection"] = reflection_result or {}
 
     if "maintenance" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 5: Maintenance (synaptic pruning)")
+        yield _msg("dream", "phase_start", "Phase 6: Maintenance (synaptic pruning)")
         gen = maintain(adapter, project_id, dry_run=maintenance_dry_run)
         maintenance_result = None
         try:

@@ -3706,5 +3706,254 @@ class TestHashChainIntegrity(unittest.TestCase):
         self.assertIn("LIMIT 1", merge_query)
 
 
+class TestDreamingCompression(unittest.TestCase):
+    """Test compression phase — entity-based topic abstraction (Proposal #4)."""
+
+    def _run_generator(self, gen):
+        """Consume a generator, collecting messages and returning the result."""
+        messages = []
+        try:
+            while True:
+                messages.append(next(gen))
+        except StopIteration as e:
+            return messages, e.value
+
+    def _make_mock_adapter(self, clusters_data=None, compressed_names=None,
+                           belief_details=None):
+        """Create a mock adapter for compression tests."""
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+
+        call_count = [0]
+        def mock_run(*args, **kwargs):
+            call_count[0] += 1
+            query = args[0] if args else kwargs.get("query", "")
+            mock_result = MagicMock()
+
+            if "collect(DISTINCT b.name)" in query:
+                # Entity cluster query
+                mock_result.data = lambda: (clusters_data or [])
+            elif "b.status = 'compressed'" in query:
+                # Already-compressed filter
+                mock_result.data = lambda: [{"names": list(compressed_names or [])}]
+            elif "b.summary" in query:
+                # Belief details query
+                mock_result.data = lambda: (belief_details or [
+                    {"name": "Belief: X is growing", "confidence": 0.8, "summary": "Growth signal"},
+                    {"name": "Belief: X has strong team", "confidence": 0.7, "summary": "Team quality"},
+                    {"name": "Belief: X raised funding", "confidence": 0.9, "summary": "Funding"},
+                ])
+            else:
+                # MERGE/SET operations (write queries)
+                mock_result.data = lambda: []
+            return mock_result
+
+        mock_session.run = mock_run
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        return adapter
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_compress_creates_abstraction_from_entity_cluster(self, mock_llm):
+        """Compression should create abstract beliefs from entity-based clusters."""
+        from merkraum_dreaming import compress
+
+        mock_llm.return_value = {
+            "abstract_belief": "Company X is a well-funded, high-growth organization with strong talent",
+            "confidence": 0.8,
+            "reasoning": "Three beliefs converge on X's organizational strength",
+            "beliefs_used": 3,
+        }
+
+        clusters = [{
+            "entity": "Company X",
+            "entity_type": "Organization",
+            "beliefs": ["Belief: X is growing", "Belief: X has strong team", "Belief: X raised funding"],
+            "rel_types": ["APPLIES"],
+        }]
+
+        adapter = self._make_mock_adapter(clusters_data=clusters)
+        messages, result = self._run_generator(
+            compress(adapter, "test-proj", min_cluster_size=3, dry_run=False))
+
+        self.assertEqual(result["phase"], "compression")
+        self.assertEqual(result["status"], "apply")
+        self.assertEqual(result["clusters_found"], 1)
+        self.assertEqual(result["clusters_compressed"], 1)
+        self.assertEqual(result["abstractions_created"], 1)
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_compress_dry_run_does_not_write(self, mock_llm):
+        """Dry run should preview compressions without writing to graph."""
+        from merkraum_dreaming import compress
+
+        mock_llm.return_value = {
+            "abstract_belief": "Abstract belief about X",
+            "confidence": 0.75,
+            "reasoning": "Test",
+            "beliefs_used": 3,
+        }
+
+        clusters = [{
+            "entity": "Entity A",
+            "entity_type": "Concept",
+            "beliefs": ["Belief: A1", "Belief: A2", "Belief: A3"],
+            "rel_types": ["APPLIES"],
+        }]
+
+        adapter = self._make_mock_adapter(clusters_data=clusters)
+        messages, result = self._run_generator(
+            compress(adapter, "test-proj", min_cluster_size=3, dry_run=True))
+
+        self.assertEqual(result["status"], "preview")
+        self.assertEqual(result["clusters_compressed"], 1)
+        # In dry_run, no abstractions are created in the graph
+        self.assertEqual(result["abstractions_created"], 0)
+
+    def test_compress_no_clusters_found(self):
+        """Compression should handle empty graphs gracefully."""
+        from merkraum_dreaming import compress
+
+        adapter = self._make_mock_adapter(clusters_data=[])
+        messages, result = self._run_generator(
+            compress(adapter, "test-proj", min_cluster_size=3))
+
+        self.assertEqual(result["phase"], "compression")
+        self.assertEqual(result["clusters_found"], 0)
+        self.assertEqual(result["clusters_compressed"], 0)
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_compress_skips_already_compressed_beliefs(self, mock_llm):
+        """Already compressed beliefs should be filtered out."""
+        from merkraum_dreaming import compress
+
+        clusters = [{
+            "entity": "Entity B",
+            "entity_type": "Concept",
+            "beliefs": ["Belief: B1", "Belief: B2", "Belief: B3"],
+            "rel_types": ["APPLIES"],
+        }]
+
+        # All three beliefs are already compressed → cluster too small after filtering
+        adapter = self._make_mock_adapter(
+            clusters_data=clusters,
+            compressed_names={"Belief: B1", "Belief: B2"})
+        messages, result = self._run_generator(
+            compress(adapter, "test-proj", min_cluster_size=3))
+
+        # Only 1 uncompressed belief remains → cluster skipped
+        self.assertEqual(result["clusters_compressed"], 0)
+        mock_llm.assert_not_called()
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_compress_skips_diverse_cluster(self, mock_llm):
+        """If LLM says beliefs are too diverse, skip the cluster."""
+        from merkraum_dreaming import compress
+
+        mock_llm.return_value = {
+            "abstract_belief": "",
+            "confidence": 0.0,
+            "reasoning": "These beliefs address completely different aspects with no common thread",
+            "beliefs_used": 0,
+        }
+
+        clusters = [{
+            "entity": "Entity C",
+            "entity_type": "Person",
+            "beliefs": ["Belief: C1", "Belief: C2", "Belief: C3"],
+            "rel_types": ["APPLIES"],
+        }]
+
+        adapter = self._make_mock_adapter(clusters_data=clusters)
+        messages, result = self._run_generator(
+            compress(adapter, "test-proj", min_cluster_size=3))
+
+        self.assertEqual(result["clusters_compressed"], 0)
+        self.assertEqual(result["abstractions_created"], 0)
+        # Should have a result entry with skipped=True
+        self.assertTrue(any(r.get("skipped") for r in result.get("results", [])))
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_compress_handles_llm_failure(self, mock_llm):
+        """Compression should gracefully handle LLM failures."""
+        from merkraum_dreaming import compress
+
+        mock_llm.return_value = None  # LLM failure
+
+        clusters = [{
+            "entity": "Entity D",
+            "entity_type": "Organization",
+            "beliefs": ["Belief: D1", "Belief: D2", "Belief: D3"],
+            "rel_types": ["APPLIES"],
+        }]
+
+        adapter = self._make_mock_adapter(clusters_data=clusters)
+        messages, result = self._run_generator(
+            compress(adapter, "test-proj", min_cluster_size=3))
+
+        self.assertEqual(result["clusters_compressed"], 0)
+        self.assertEqual(result["abstractions_created"], 0)
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_compress_yields_progress_messages(self, mock_llm):
+        """Compression should yield structured progress messages."""
+        from merkraum_dreaming import compress
+
+        mock_llm.return_value = {
+            "abstract_belief": "Test abstraction",
+            "confidence": 0.7,
+            "reasoning": "Test",
+            "beliefs_used": 3,
+        }
+
+        clusters = [{
+            "entity": "Entity E",
+            "entity_type": "Concept",
+            "beliefs": ["Belief: E1", "Belief: E2", "Belief: E3"],
+            "rel_types": ["APPLIES"],
+        }]
+
+        adapter = self._make_mock_adapter(clusters_data=clusters)
+        messages, result = self._run_generator(
+            compress(adapter, "test-proj", min_cluster_size=3))
+
+        phases = [m["phase"] for m in messages]
+        self.assertTrue(all(p == "compression" for p in phases))
+        steps = [m["step"] for m in messages]
+        self.assertIn("start", steps)
+        self.assertIn("done", steps)
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_dream_includes_compression_by_default(self, mock_llm):
+        """The dream() orchestrator should include compression phase by default."""
+        from merkraum_dreaming import dream
+
+        adapter = self._make_mock_adapter(clusters_data=[])
+
+        # Run dream with only compression phase to verify integration
+        messages, result = self._run_generator(
+            dream(adapter, "test-proj", phases=["compression"]))
+
+        self.assertIn("compression", result["phases"])
+        self.assertEqual(result["phases"]["compression"]["phase"], "compression")
+
+    def test_compression_model_config(self):
+        """Compression model should default to Sonnet."""
+        from merkraum_dreaming import _DEFAULT_COMPRESSION_MODEL, _get_compression_model
+        self.assertIn("sonnet", _DEFAULT_COMPRESSION_MODEL.lower())
+        # Default getter returns same
+        with patch.dict(os.environ, {}, clear=False):
+            if "MERKRAUM_DREAMING_COMPRESSION_MODEL" in os.environ:
+                del os.environ["MERKRAUM_DREAMING_COMPRESSION_MODEL"]
+            self.assertIn("sonnet", _get_compression_model().lower())
+
+    def test_compression_model_env_override(self):
+        """Env var should override compression model."""
+        from merkraum_dreaming import _get_compression_model
+        with patch.dict(os.environ, {"MERKRAUM_DREAMING_COMPRESSION_MODEL": "custom-model"}):
+            self.assertEqual(_get_compression_model(), "custom-model")
+
+
 if __name__ == "__main__":
     unittest.main()

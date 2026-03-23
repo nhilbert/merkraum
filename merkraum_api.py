@@ -2971,6 +2971,9 @@ def _run_dream_job(job_id: str):
             replay_create_edges=job.get("replay_create_edges", True),
             bridging_pairs=job.get("bridging_pairs", 15),
             bridging_create_edges=job.get("bridging_create_edges", True),
+            compression_min_cluster=job.get("compression_min_cluster", 3),
+            compression_max_clusters=job.get("compression_max_clusters", 10),
+            compression_dry_run=job.get("compression_dry_run", False),
         )
         result = None
         try:
@@ -3000,12 +3003,15 @@ def dream_trigger():
     """Trigger a dream session (async). Returns job_id for status polling / SSE.
 
     Request body (all optional):
-        phases: ["replay", "consolidation", "bridging", "reflection", "maintenance"]
+        phases: ["replay", "consolidation", "compression", "bridging", "reflection", "maintenance"]
         replay_hops: int (default 5)
         replay_walks: int (default 3)
         replay_create_edges: bool (default true) — create provisional edges from dream observations
         consolidation_threshold: float (default 0.75)
         consolidation_dry_run: bool (default false)
+        compression_min_cluster: int (default 3) — minimum beliefs per entity for topic compression
+        compression_max_clusters: int (default 10, max 20) — max entity clusters to compress
+        compression_dry_run: bool (default false)
         bridging_pairs: int (default 15, max 30) — number of distant belief pairs to evaluate
         bridging_create_edges: bool (default true) — create provisional edges from bridge discoveries
         maintenance_dry_run: bool (default false)
@@ -3049,6 +3055,9 @@ def dream_trigger():
             "consolidation_dry_run": body.get("consolidation_dry_run", False),
             "bridging_pairs": min(body.get("bridging_pairs", 15), 30),
             "bridging_create_edges": body.get("bridging_create_edges", True),
+            "compression_min_cluster": max(2, min(body.get("compression_min_cluster", 3), 10)),
+            "compression_max_clusters": min(body.get("compression_max_clusters", 10), 20),
+            "compression_dry_run": body.get("compression_dry_run", False),
             "maintenance_dry_run": body.get("maintenance_dry_run", False),
             "replay_create_edges": body.get("replay_create_edges", True),
             "seed": body.get("seed"),
