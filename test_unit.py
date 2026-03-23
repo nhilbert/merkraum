@@ -2867,6 +2867,316 @@ class TestDreamingAssociativeEdges(unittest.TestCase):
         self.assertEqual(len(failed_msgs), 1)
 
 
+class TestDreamingBridging(unittest.TestCase):
+    """Test bridging phase — cross-domain connection discovery (Proposal #3)."""
+
+    def _run_generator(self, gen):
+        """Consume a generator, collecting messages and returning the result."""
+        messages = []
+        try:
+            while True:
+                messages.append(next(gen))
+        except StopIteration as e:
+            return messages, e.value
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_bridge_finds_connections_between_distant_beliefs(self, mock_llm):
+        """Bridge should evaluate distant belief pairs and create edges for connections."""
+        from merkraum_dreaming import bridge
+
+        mock_llm.return_value = {
+            "relationship_exists": True,
+            "relationship_type": "COMPLEMENTS",
+            "description": "Both beliefs address organizational resilience",
+            "confidence": 0.6,
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+
+        # Return beliefs
+        beliefs_data = [
+            {"name": "Belief: Regulatory compliance requires documentation", "confidence": 0.8},
+            {"name": "Belief: Agile teams self-organize around goals", "confidence": 0.7},
+            {"name": "Belief: Knowledge graphs improve information retrieval", "confidence": 0.9},
+        ]
+        call_count = [0]
+        def mock_run(*args, **kwargs):
+            call_count[0] += 1
+            query = args[0] if args else kwargs.get("query", "")
+            mock_result = MagicMock()
+            if "shortestPath" in query:
+                mock_result.data = lambda: [{"distance": 5}]
+            else:
+                mock_result.data = lambda: beliefs_data
+            return mock_result
+
+        mock_session.run = mock_run
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.write_relationships.return_value = 1
+
+        messages, result = self._run_generator(
+            bridge(adapter, "test-proj", pairs=2, min_distance=4, create_edges=True))
+
+        self.assertEqual(result["phase"], "bridging")
+        self.assertEqual(result["status"], "completed")
+        self.assertEqual(result["pairs_evaluated"], 2)
+        self.assertEqual(result["connections_found"], 2)
+        self.assertEqual(result["edges_created"], 2)
+        self.assertGreater(result["hit_rate"], 0)
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_bridge_no_edges_when_create_edges_false(self, mock_llm):
+        """Bridge should not write edges when create_edges=False."""
+        from merkraum_dreaming import bridge
+
+        mock_llm.return_value = {
+            "relationship_exists": True,
+            "relationship_type": "SUPPORTS",
+            "description": "Connection found",
+            "confidence": 0.5,
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+
+        beliefs_data = [
+            {"name": "Belief: A", "confidence": 0.8},
+            {"name": "Belief: B", "confidence": 0.7},
+        ]
+        def mock_run(*args, **kwargs):
+            mock_result = MagicMock()
+            query = args[0] if args else ""
+            if "shortestPath" in query:
+                mock_result.data = lambda: [{"distance": 6}]
+            else:
+                mock_result.data = lambda: beliefs_data
+            return mock_result
+
+        mock_session.run = mock_run
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+
+        messages, result = self._run_generator(
+            bridge(adapter, "test-proj", pairs=1, create_edges=False))
+
+        self.assertEqual(result["connections_found"], 1)
+        self.assertEqual(result["edges_created"], 0)
+        adapter.write_relationships.assert_not_called()
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_bridge_handles_no_connection(self, mock_llm):
+        """Bridge should handle pairs where LLM finds no relationship."""
+        from merkraum_dreaming import bridge
+
+        mock_llm.return_value = {
+            "relationship_exists": False,
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+
+        beliefs_data = [
+            {"name": "Belief: X", "confidence": 0.8},
+            {"name": "Belief: Y", "confidence": 0.7},
+        ]
+        def mock_run(*args, **kwargs):
+            mock_result = MagicMock()
+            query = args[0] if args else ""
+            if "shortestPath" in query:
+                mock_result.data = lambda: [{"distance": 5}]
+            else:
+                mock_result.data = lambda: beliefs_data
+            return mock_result
+
+        mock_session.run = mock_run
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+
+        messages, result = self._run_generator(
+            bridge(adapter, "test-proj", pairs=3, create_edges=True))
+
+        self.assertEqual(result["connections_found"], 0)
+        self.assertEqual(result["edges_created"], 0)
+        adapter.write_relationships.assert_not_called()
+
+    def test_bridge_too_few_beliefs(self):
+        """Bridge should gracefully handle fewer than 2 beliefs."""
+        from merkraum_dreaming import bridge
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(
+            data=lambda: [{"name": "Belief: Only one", "confidence": 0.8}])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+
+        messages, result = self._run_generator(
+            bridge(adapter, "test-proj", pairs=5))
+
+        self.assertEqual(result["pairs_evaluated"], 0)
+        self.assertEqual(result["connections_found"], 0)
+        self.assertEqual(result["status"], "completed")
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_bridge_caps_confidence_at_03(self, mock_llm):
+        """Bridge edges should have confidence capped at 0.3 (provisional)."""
+        from merkraum_dreaming import bridge
+
+        mock_llm.return_value = {
+            "relationship_exists": True,
+            "relationship_type": "SUPPORTS",
+            "description": "Strong connection",
+            "confidence": 0.9,  # LLM says high confidence
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+
+        beliefs_data = [
+            {"name": "Belief: A", "confidence": 0.8},
+            {"name": "Belief: B", "confidence": 0.7},
+        ]
+        def mock_run(*args, **kwargs):
+            mock_result = MagicMock()
+            query = args[0] if args else ""
+            if "shortestPath" in query:
+                mock_result.data = lambda: [{"distance": 5}]
+            else:
+                mock_result.data = lambda: beliefs_data
+            return mock_result
+
+        mock_session.run = mock_run
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.write_relationships.return_value = 1
+
+        messages, result = self._run_generator(
+            bridge(adapter, "test-proj", pairs=1, create_edges=True))
+
+        # Verify confidence is capped at 0.3
+        call_args = adapter.write_relationships.call_args
+        rel = call_args[0][0][0]
+        self.assertEqual(rel["confidence"], 0.3)  # Capped, not 0.9
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_bridge_falls_back_to_complements_for_invalid_type(self, mock_llm):
+        """Bridge should fall back to COMPLEMENTS for invalid relationship types."""
+        from merkraum_dreaming import bridge
+
+        mock_llm.return_value = {
+            "relationship_exists": True,
+            "relationship_type": "INVALID_REL",
+            "description": "Some connection",
+            "confidence": 0.4,
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+
+        beliefs_data = [
+            {"name": "Belief: A", "confidence": 0.8},
+            {"name": "Belief: B", "confidence": 0.7},
+        ]
+        def mock_run(*args, **kwargs):
+            mock_result = MagicMock()
+            query = args[0] if args else ""
+            if "shortestPath" in query:
+                mock_result.data = lambda: [{"distance": 5}]
+            else:
+                mock_result.data = lambda: beliefs_data
+            return mock_result
+
+        mock_session.run = mock_run
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.write_relationships.return_value = 1
+
+        messages, result = self._run_generator(
+            bridge(adapter, "test-proj", pairs=1, create_edges=True))
+
+        call_args = adapter.write_relationships.call_args
+        rel = call_args[0][0][0]
+        self.assertEqual(rel["type"], "COMPLEMENTS")  # Fallback
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_bridge_accepts_disconnected_pairs(self, mock_llm):
+        """Disconnected belief pairs (no path) should be accepted as candidates."""
+        from merkraum_dreaming import bridge
+
+        mock_llm.return_value = {
+            "relationship_exists": True,
+            "relationship_type": "EXTENDS",
+            "description": "Cross-domain insight",
+            "confidence": 0.3,
+        }
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+
+        beliefs_data = [
+            {"name": "Belief: A", "confidence": 0.8},
+            {"name": "Belief: B", "confidence": 0.7},
+        ]
+        def mock_run(*args, **kwargs):
+            mock_result = MagicMock()
+            query = args[0] if args else ""
+            if "shortestPath" in query:
+                mock_result.data = lambda: [{"distance": -1}]  # Disconnected
+            else:
+                mock_result.data = lambda: beliefs_data
+            return mock_result
+
+        mock_session.run = mock_run
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.write_relationships.return_value = 1
+
+        messages, result = self._run_generator(
+            bridge(adapter, "test-proj", pairs=1, create_edges=True))
+
+        self.assertEqual(result["pairs_evaluated"], 1)
+        self.assertEqual(result["connections_found"], 1)
+        self.assertEqual(result["edges_created"], 1)
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_dream_includes_bridging_by_default(self, mock_llm):
+        """The dream() orchestrator should include bridging phase by default."""
+        from merkraum_dreaming import dream
+
+        mock_llm.return_value = None
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(data=lambda: [])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.vector_search.return_value = []
+        adapter.apply_confidence_decay.return_value = {"total": 0, "unchanged": 0, "decayed": []}
+        adapter.expire_nodes.return_value = {"total": 0, "expired": []}
+        adapter.prune_orphan_nodes.return_value = {"total": 0, "pruned": []}
+        adapter.deduplicate_edges.return_value = {"duplicates_found": 0, "edges_removed": 0}
+        adapter.get_certainty_review_queue.return_value = {"categories": {}}
+        adapter.get_certainty_stats.return_value = {"governance": {"status": "healthy"}}
+
+        messages, result = self._run_generator(dream(adapter, "test-proj"))
+
+        # Bridging phase should be present in results
+        self.assertIn("bridging", result["phases"])
+        # Check that bridging phase start message exists
+        bridging_msgs = [m for m in messages if m.get("phase") == "bridging"]
+        self.assertGreater(len(bridging_msgs), 0)
+
+
 class TestReconstructAt(unittest.TestCase):
     """Test Neo4jBaseAdapter.reconstruct_at — point-in-time reconstruction."""
 

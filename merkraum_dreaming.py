@@ -5,22 +5,25 @@ Merkraum Dreaming Engine — neuroscience-inspired memory consolidation.
 Universal logic module: no Flask, no hosting dependencies.
 Designed for open-source sharing — all hosting/user logic stays in the API layer.
 
-Four operations inspired by memory consolidation research
+Five operations inspired by memory consolidation research
 (McClelland et al., O'Reilly & Frank):
 
 1. Replay (hippocampal replay): Random walks through the graph surface
    unexpected connections between distant knowledge clusters.
 2. Consolidation (hippocampus-to-neocortex transfer): Episodic beliefs
    are merged into abstract, generalizable beliefs.
-3. Reflection (Default Mode Network): Structural health analysis —
+3. Bridging (free association): Cross-domain connection discovery between
+   distant belief clusters — picks random belief pairs with high graph
+   distance and evaluates whether a meaningful relationship exists.
+4. Reflection (Default Mode Network): Structural health analysis —
    orphan detection, hub over-centralization, schema discipline.
-4. Maintenance (synaptic pruning): Confidence decay on stale beliefs,
+5. Maintenance (synaptic pruning): Confidence decay on stale beliefs,
    certainty review queue, governance health assessment.
 
 All operations yield progress messages via generators, enabling
 async monitoring and live visualization in the frontend.
 
-v1.0 — SUP-146/SUP-147 (2026-03-14)
+v1.1 — Bridging phase added (2026-03-23)
 """
 
 import json
@@ -47,6 +50,7 @@ logger = logging.getLogger("merkraum-dreaming")
 
 _DEFAULT_REPLAY_MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
 _DEFAULT_CONSOLIDATION_MODEL = "eu.anthropic.claude-sonnet-4-6"
+_DEFAULT_BRIDGING_MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 
 def _get_replay_model() -> str | None:
@@ -59,14 +63,21 @@ def _get_consolidation_model() -> str | None:
     return os.environ.get("MERKRAUM_DREAMING_CONSOLIDATION_MODEL") or _DEFAULT_CONSOLIDATION_MODEL
 
 
+def _get_bridging_model() -> str | None:
+    """Return the model for bridging phase (env override or default)."""
+    return os.environ.get("MERKRAUM_DREAMING_BRIDGING_MODEL") or _DEFAULT_BRIDGING_MODEL
+
+
 def get_dreaming_config() -> dict:
     """Return current dreaming model configuration for diagnostics."""
     return {
         "replay_model": _get_replay_model(),
         "consolidation_model": _get_consolidation_model(),
+        "bridging_model": _get_bridging_model(),
         "reflection_model": None,  # No LLM used
         "replay_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL") else "default",
         "consolidation_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_CONSOLIDATION_MODEL") else "default",
+        "bridging_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_BRIDGING_MODEL") else "default",
     }
 
 
@@ -591,7 +602,268 @@ def consolidate(
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: Reflection — structural health analysis
+# Phase 3: Bridging — cross-domain connection discovery (free association)
+# ---------------------------------------------------------------------------
+
+def bridge(
+    adapter: Neo4jBaseAdapter,
+    project_id: str = "default",
+    pairs: int = 15,
+    min_distance: int = 4,
+    create_edges: bool = True,
+) -> Generator[dict, None, dict]:
+    """Pick random belief pairs from distant graph clusters and evaluate
+    whether a meaningful relationship exists between them.
+
+    Biologically inspired by free association — the "random dream" effect
+    that connects concepts from completely different mental domains.
+
+    Args:
+        adapter: Backend adapter (Neo4j + vector store)
+        project_id: Project to bridge
+        pairs: Number of belief pairs to evaluate (default 15)
+        min_distance: Minimum shortest-path hops to consider "distant" (default 4)
+        create_edges: If True, write provisional edges for discovered connections
+
+    Yields progress messages. Returns final result dict.
+    """
+    yield _msg("bridging", "start",
+               f"Cross-domain bridging: evaluating up to {pairs} distant belief pairs "
+               f"(min distance: {min_distance} hops)")
+
+    # Fetch all active beliefs with their names
+    with adapter._driver.session() as session:
+        all_beliefs = session.run(
+            "MATCH (b:Belief {project_id: $pid}) "
+            "WHERE (b.status IS NULL OR b.status = 'active') "
+            "AND (b.active = true OR b.active IS NULL) "
+            "RETURN b.name AS name, b.confidence AS confidence",
+            pid=project_id,
+        ).data()
+
+    if len(all_beliefs) < 2:
+        yield _msg("bridging", "done",
+                   f"Too few beliefs ({len(all_beliefs)}) for cross-domain bridging")
+        return {
+            "phase": "bridging",
+            "status": "completed",
+            "pairs_evaluated": 0,
+            "connections_found": 0,
+            "edges_created": 0,
+        }
+
+    yield _msg("bridging", "beliefs_loaded",
+               f"Loaded {len(all_beliefs)} active beliefs",
+               {"belief_count": len(all_beliefs)})
+
+    # Sample candidate pairs and check graph distance
+    # Strategy: random sample pairs, then verify distance via shortest path query
+    candidate_pairs = []
+    max_attempts = pairs * 5  # Allow some failures to find distant pairs
+    attempts = 0
+
+    yield _msg("bridging", "sampling",
+               f"Sampling distant pairs (shortest path >= {min_distance} hops)...")
+
+    with adapter._driver.session() as session:
+        while len(candidate_pairs) < pairs and attempts < max_attempts:
+            attempts += 1
+            pair = random.sample(all_beliefs, 2)
+            a_name, b_name = pair[0]["name"], pair[1]["name"]
+
+            # Check shortest path length between the two beliefs
+            result = session.run(
+                "MATCH (a:Belief {name: $a_name, project_id: $pid}), "
+                "      (b:Belief {name: $b_name, project_id: $pid}) "
+                "OPTIONAL MATCH path = shortestPath((a)-[*..10]-(b)) "
+                "RETURN CASE WHEN path IS NULL THEN -1 "
+                "       ELSE length(path) END AS distance",
+                a_name=a_name, b_name=b_name, pid=project_id,
+            ).data()
+
+            distance = result[0]["distance"] if result else -1
+
+            # Accept if distant enough: path >= min_distance, or disconnected (-1)
+            if distance >= min_distance or distance == -1:
+                candidate_pairs.append({
+                    "belief_a": a_name,
+                    "confidence_a": pair[0]["confidence"],
+                    "belief_b": b_name,
+                    "confidence_b": pair[1]["confidence"],
+                    "distance": distance,
+                })
+
+    if not candidate_pairs:
+        yield _msg("bridging", "done",
+                   f"No distant pairs found after {attempts} attempts "
+                   f"(graph may be too densely connected)")
+        return {
+            "phase": "bridging",
+            "status": "completed",
+            "pairs_evaluated": 0,
+            "connections_found": 0,
+            "edges_created": 0,
+        }
+
+    yield _msg("bridging", "pairs_found",
+               f"Found {len(candidate_pairs)} distant pair(s) "
+               f"(from {attempts} attempts)",
+               {"pairs_count": len(candidate_pairs), "attempts": attempts})
+
+    # Evaluate each pair with LLM
+    connections_found = 0
+    edges_created = 0
+    edge_details = []
+    evaluated_pairs = []
+
+    _bridging_schema = {
+        "type": "object",
+        "properties": {
+            "relationship_exists": {
+                "type": "boolean",
+                "description": "Is there a meaningful, non-trivial relationship?",
+            },
+            "relationship_type": {
+                "type": "string",
+                "enum": list(RELATIONSHIP_TYPES),
+                "description": "The type of relationship, if one exists",
+            },
+            "description": {
+                "type": "string",
+                "description": "Brief explanation of the connection (max 200 chars)",
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0.0,
+                "maximum": 1.0,
+                "description": "How confident are you in this connection?",
+            },
+        },
+        "required": ["relationship_exists"],
+    }
+
+    for i, pair in enumerate(candidate_pairs):
+        dist_label = "disconnected" if pair["distance"] == -1 else f"{pair['distance']} hops"
+        yield _msg("bridging", "evaluating",
+                   f"Pair {i + 1}/{len(candidate_pairs)}: "
+                   f"'{pair['belief_a'][:60]}' ↔ '{pair['belief_b'][:60]}' "
+                   f"({dist_label})")
+
+        analysis = llm_call(
+            "You evaluate whether two beliefs from different domains of a "
+            "knowledge graph have a meaningful, non-trivial relationship. "
+            "Most pairs will NOT be related — only say yes if there is a "
+            "genuine conceptual connection worth recording. "
+            "Be selective: a ~10-20% hit rate is expected.",
+            f"Belief A: {pair['belief_a']}\n"
+            f"  (confidence: {pair['confidence_a']})\n\n"
+            f"Belief B: {pair['belief_b']}\n"
+            f"  (confidence: {pair['confidence_b']})\n\n"
+            f"Graph distance: {dist_label}\n\n"
+            f"Is there a meaningful relationship between these beliefs?",
+            temperature=0.3,
+            json_schema=_bridging_schema,
+            model=_get_bridging_model(),
+        )
+
+        pair_result = {
+            "belief_a": pair["belief_a"],
+            "belief_b": pair["belief_b"],
+            "distance": pair["distance"],
+            "analysis": analysis,
+        }
+
+        if analysis and analysis.get("relationship_exists"):
+            connections_found += 1
+            rel_type = analysis.get("relationship_type", "COMPLEMENTS")
+            if rel_type not in RELATIONSHIP_TYPES:
+                rel_type = "COMPLEMENTS"
+            description = analysis.get("description", "Cross-domain bridge")
+            confidence = analysis.get("confidence", 0.3)
+
+            pair_result["connected"] = True
+            pair_result["rel_type"] = rel_type
+
+            yield _msg("bridging", "connection_found",
+                       f"  CONNECTION: {pair['belief_a'][:50]} "
+                       f"--[{rel_type}]--> {pair['belief_b'][:50]} "
+                       f"({description[:80]})",
+                       {"rel_type": rel_type, "description": description,
+                        "confidence": confidence})
+
+            if create_edges:
+                from datetime import timedelta
+                ttl_days = 7
+                valid_until = (datetime.now(timezone.utc) + timedelta(days=ttl_days)).isoformat()
+
+                rel = {
+                    "source": pair["belief_a"],
+                    "target": pair["belief_b"],
+                    "type": rel_type,
+                    "confidence": min(confidence, 0.3),  # Cap at 0.3 for provisional
+                    "reason": f"Dream bridging: {description[:200]}",
+                    "valid_until": valid_until,
+                }
+
+                try:
+                    count = adapter.write_relationships(
+                        [rel],
+                        source_cycle="dream",
+                        source_type="dream",
+                        project_id=project_id,
+                        actor="dreaming-bridging",
+                    )
+                    if count > 0:
+                        edges_created += 1
+                        detail = {
+                            "source": pair["belief_a"],
+                            "target": pair["belief_b"],
+                            "rel_type": rel_type,
+                            "description": description,
+                            "valid_until": valid_until,
+                        }
+                        edge_details.append(detail)
+                        yield _msg("bridging", "edge_created",
+                                   f"  Edge written: {rel_type} "
+                                   f"(conf: 0.3, TTL: {ttl_days}d)",
+                                   detail)
+                except Exception as e:
+                    logger.warning("Bridge edge creation failed: %s -> %s: %s",
+                                   pair["belief_a"], pair["belief_b"], e)
+                    yield _msg("bridging", "edge_failed",
+                               f"  Failed: {e}")
+        else:
+            pair_result["connected"] = False
+            yield _msg("bridging", "no_connection",
+                       f"  No connection (pair {i + 1})")
+
+        evaluated_pairs.append(pair_result)
+
+    hit_rate = round(100 * connections_found / max(len(candidate_pairs), 1), 1)
+    edge_summary = f", {edges_created} edge(s) created" if edges_created else ""
+    yield _msg("bridging", "done",
+               f"Bridging complete: {len(candidate_pairs)} pairs evaluated, "
+               f"{connections_found} connection(s) found ({hit_rate}% hit rate)"
+               f"{edge_summary}",
+               {"pairs_evaluated": len(candidate_pairs),
+                "connections_found": connections_found,
+                "hit_rate": hit_rate,
+                "edges_created": edges_created})
+
+    return {
+        "phase": "bridging",
+        "status": "completed",
+        "pairs_evaluated": len(candidate_pairs),
+        "connections_found": connections_found,
+        "hit_rate": hit_rate,
+        "edges_created": edges_created,
+        "edge_details": edge_details,
+        "evaluated_pairs": evaluated_pairs,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Phase 4: Reflection — structural health analysis
 # ---------------------------------------------------------------------------
 
 def reflect(
@@ -935,13 +1207,15 @@ def dream(
     seed: str | None = None,
     maintenance_dry_run: bool = False,
     replay_create_edges: bool = True,
+    bridging_pairs: int = 15,
+    bridging_create_edges: bool = True,
 ) -> Generator[dict, None, dict]:
-    """Run a full dreaming session (replay → consolidation → reflection → maintenance).
+    """Run a full dreaming session (replay → consolidation → bridging → reflection → maintenance).
 
     Args:
         adapter: Backend adapter (Neo4j + vector store)
         project_id: Project to dream about
-        phases: Which phases to run (default: all four)
+        phases: Which phases to run (default: all five)
         replay_hops: Steps per random walk
         replay_walks: Number of random walks
         consolidation_threshold: Similarity threshold for belief clustering
@@ -949,10 +1223,12 @@ def dream(
         seed: Optional starting entity for replay
         maintenance_dry_run: If True, preview confidence decay without applying
         replay_create_edges: If True, create provisional edges from dream observations
+        bridging_pairs: Number of distant belief pairs to evaluate (default 15)
+        bridging_create_edges: If True, create provisional edges from bridge discoveries
 
     Yields progress messages. Returns combined result dict.
     """
-    active_phases = phases or ["replay", "consolidation", "reflection", "maintenance"]
+    active_phases = phases or ["replay", "consolidation", "bridging", "reflection", "maintenance"]
     session_id = str(uuid.uuid4())[:8]
     start_time = time.time()
 
@@ -990,8 +1266,21 @@ def dream(
             consolidation_result = e.value
         results["phases"]["consolidation"] = consolidation_result or {}
 
+    if "bridging" in active_phases:
+        yield _msg("dream", "phase_start", "Phase 3: Bridging (cross-domain free association)")
+        gen = bridge(adapter, project_id, pairs=bridging_pairs,
+                     create_edges=bridging_create_edges)
+        bridging_result = None
+        try:
+            while True:
+                progress = next(gen)
+                yield progress
+        except StopIteration as e:
+            bridging_result = e.value
+        results["phases"]["bridging"] = bridging_result or {}
+
     if "reflection" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 3: Reflection (structural health)")
+        yield _msg("dream", "phase_start", "Phase 4: Reflection (structural health)")
         gen = reflect(adapter, project_id)
         reflection_result = None
         try:
@@ -1003,7 +1292,7 @@ def dream(
         results["phases"]["reflection"] = reflection_result or {}
 
     if "maintenance" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 4: Maintenance (synaptic pruning)")
+        yield _msg("dream", "phase_start", "Phase 5: Maintenance (synaptic pruning)")
         gen = maintain(adapter, project_id, dry_run=maintenance_dry_run)
         maintenance_result = None
         try:
