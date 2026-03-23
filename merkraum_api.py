@@ -1664,6 +1664,7 @@ def update_belief_api():
             status=body.get("status"),
             summary=body.get("summary"),
             valid_until=body.get("valid_until"),
+            knowledge_type=body.get("knowledge_type"),
             actor=actor,
         )
         if result.get("updated"):

@@ -169,14 +169,16 @@ class BackendAdapter(ABC):
     def update_belief(self, name: str, project_id: str = "default",
                       confidence: Optional[float] = None,
                       status: Optional[str] = None,
-                      summary: Optional[str] = None) -> dict:
-        """Update an existing belief's confidence, status, or summary.
+                      summary: Optional[str] = None,
+                      knowledge_type: Optional[str] = None) -> dict:
+        """Update an existing belief's confidence, status, summary, or knowledge_type.
 
         Args:
             name: Belief name (must exist).
             confidence: New confidence score (0.0-1.0). None = no change.
             status: New status — 'active', 'superseded'. None = no change.
             summary: New summary text. None = no change.
+            knowledge_type: One of KNOWLEDGE_TYPES. None = no change.
 
         Returns:
             {"updated": bool, "name": str, "changes": dict}
@@ -1603,13 +1605,16 @@ class Neo4jBaseAdapter(BackendAdapter):
 
     def update_belief(self, name, project_id="default", confidence=None,
                       status=None, summary=None, valid_until=None,
-                      actor="api"):
+                      knowledge_type=None, actor="api"):
         valid_statuses = ("active", "uncertain", "contradicted", "superseded", "consolidated")
         if status is not None and status not in valid_statuses:
             return {"updated": False, "name": name,
                     "error": f"Invalid status: {status}. Valid: {valid_statuses}"}
         if confidence is not None:
             confidence = max(0.0, min(1.0, float(confidence)))
+        if knowledge_type is not None and knowledge_type not in KNOWLEDGE_TYPES:
+            return {"updated": False, "name": name,
+                    "error": f"Invalid knowledge_type: {knowledge_type}. Valid: {KNOWLEDGE_TYPES}"}
 
         now = datetime.now(timezone.utc).isoformat()
         changes = {}
@@ -1631,6 +1636,9 @@ class Neo4jBaseAdapter(BackendAdapter):
         if valid_until is not None:
             set_clauses.append("b.valid_until = $valid_until")
             changes["valid_until"] = valid_until
+        if knowledge_type is not None:
+            set_clauses.append("b.knowledge_type = $knowledge_type")
+            changes["knowledge_type"] = knowledge_type
 
         if not changes:
             return {"updated": False, "name": name, "error": "No changes specified"}
@@ -1645,7 +1653,8 @@ class Neo4jBaseAdapter(BackendAdapter):
                     MATCH (b:Belief {name: $name, project_id: $pid})
                     RETURN b.confidence AS confidence, b.status AS status,
                            b.summary AS summary, b.valid_until AS valid_until,
-                           b.active AS active, b.updated_at AS updated_at
+                           b.active AS active, b.updated_at AS updated_at,
+                           b.knowledge_type AS knowledge_type
                     """,
                     name=name, pid=project_id,
                 ).single()
@@ -1663,12 +1672,13 @@ class Neo4jBaseAdapter(BackendAdapter):
                 SET {', '.join(set_clauses)}
                 RETURN b.confidence AS confidence, b.status AS status,
                        b.summary AS summary, b.valid_until AS valid_until,
-                       b.active AS active, b.updated_at AS updated_at
+                       b.active AS active, b.updated_at AS updated_at,
+                       b.knowledge_type AS knowledge_type
                 """
                 after_rec = tx.run(
                     cypher, name=name, pid=project_id, now=now,
                     confidence=confidence, status=status, summary=summary,
-                    valid_until=valid_until,
+                    valid_until=valid_until, knowledge_type=knowledge_type,
                 ).single()
 
                 after_state = dict(after_rec) if after_rec else None
