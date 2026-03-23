@@ -2846,5 +2846,122 @@ class TestHashChainIntegrity(unittest.TestCase):
         self.assertEqual(op.get("entry_hash"), h)
 
 
+    # --- Edge deduplication tests ---
+
+    def test_deduplicate_edges_no_duplicates(self):
+        """Empty result when no duplicate edges exist."""
+        self.session.run.return_value = iter([])
+        result = self.adapter.deduplicate_edges(project_id="test", dry_run=True)
+        self.assertEqual(result["duplicates_found"], 0)
+        self.assertEqual(result["edges_removed"], 0)
+        self.assertTrue(result["dry_run"])
+
+    def test_deduplicate_edges_dry_run(self):
+        """Dry run reports duplicates without removing them."""
+        dup_group = MagicMock()
+        dup_group.__getitem__ = lambda s, k: {
+            "src": "VSG", "tgt": "Merkraum", "rtype": "CONTRADICTS",
+            "edges": [
+                {"id": 100, "confidence": 0.8, "created_at": "2026-03-20T06:00:00",
+                 "source_label": "Organization", "target_label": "Project"},
+                {"id": 101, "confidence": 0.7, "created_at": "2026-03-19T06:00:00",
+                 "source_label": "Concept", "target_label": "Project"},
+                {"id": 102, "confidence": 0.7, "created_at": "2026-03-18T06:00:00",
+                 "source_label": "Concept", "target_label": "Concept"},
+            ],
+        }[k]
+        self.session.run.return_value = iter([dup_group])
+        result = self.adapter.deduplicate_edges(project_id="test", dry_run=True)
+        self.assertEqual(result["duplicates_found"], 2)
+        self.assertEqual(result["edges_removed"], 0)  # dry run — no deletions
+        self.assertEqual(len(result["groups"]), 1)
+        self.assertEqual(result["groups"][0]["source"], "VSG")
+        self.assertEqual(result["groups"][0]["kept"]["confidence"], 0.8)
+
+    def test_deduplicate_edges_execute(self):
+        """Actual dedup removes duplicate edges and logs operation."""
+        dup_group = MagicMock()
+        dup_group.__getitem__ = lambda s, k: {
+            "src": "VSG", "tgt": "Merkraum", "rtype": "CONTRADICTS",
+            "edges": [
+                {"id": 100, "confidence": 0.8, "created_at": "2026-03-20T06:00:00",
+                 "source_label": "Organization", "target_label": "Project"},
+                {"id": 101, "confidence": 0.5, "created_at": "2026-03-19T06:00:00",
+                 "source_label": "Concept", "target_label": "Project"},
+            ],
+        }[k]
+        # First call: find duplicates; subsequent calls: delete + log
+        self.session.run.return_value = iter([dup_group])
+        tx_mock = MagicMock()
+        self.session.begin_transaction.return_value = tx_mock
+        # _log_operation needs prev_hash lookup (hash chaining)
+        prev_hash_result = MagicMock()
+        prev_hash_result.single.return_value = None
+        tx_mock.run.side_effect = [None, prev_hash_result, None]
+
+        result = self.adapter.deduplicate_edges(
+            project_id="test", dry_run=False, actor="test_user")
+        self.assertEqual(result["duplicates_found"], 1)
+        self.assertEqual(result["edges_removed"], 1)
+        self.assertFalse(result["dry_run"])
+        tx_mock.commit.assert_called_once()
+
+    def test_write_relationships_with_type_constraints(self):
+        """write_relationships uses source_type/target_type from rel dict."""
+        rels = [{
+            "source": "VSG", "target": "Merkraum", "type": "REFERENCES",
+            "source_type": "Organization", "target_type": "Project",
+        }]
+        tx_mock = MagicMock()
+        self.session.begin_transaction.return_value = tx_mock
+        # before-state lookup returns None (new rel)
+        before_result = MagicMock()
+        before_result.single.return_value = None
+        # MERGE result
+        merge_result = MagicMock()
+        merge_summary = MagicMock()
+        merge_summary.counters.relationships_created = 1
+        merge_summary.counters.properties_set = 5
+        merge_result.consume.return_value = merge_summary
+        # _log_history, _log_operation (prev_hash lookup + create)
+        prev_hash_result = MagicMock()
+        prev_hash_result.single.return_value = None
+        tx_mock.run.side_effect = [
+            before_result, merge_result,
+            None, prev_hash_result, None,  # _log_history + _log_operation
+        ]
+        count = self.adapter.write_relationships(rels, "Z_test", project_id="test")
+        self.assertEqual(count, 1)
+        # Verify the MERGE query (second call) includes label constraints
+        merge_call_args = tx_mock.run.call_args_list[1]
+        query = merge_call_args[0][0]
+        self.assertIn(":Organization", query)
+        self.assertIn(":Project", query)
+
+    def test_write_relationships_limit_prevents_cartesian(self):
+        """write_relationships uses LIMIT 1 to prevent Cartesian products."""
+        rels = [{"source": "VSG", "target": "Merkraum", "type": "REFERENCES"}]
+        tx_mock = MagicMock()
+        self.session.begin_transaction.return_value = tx_mock
+        before_result = MagicMock()
+        before_result.single.return_value = None
+        merge_result = MagicMock()
+        merge_summary = MagicMock()
+        merge_summary.counters.relationships_created = 1
+        merge_summary.counters.properties_set = 5
+        merge_result.consume.return_value = merge_summary
+        prev_hash_result = MagicMock()
+        prev_hash_result.single.return_value = None
+        tx_mock.run.side_effect = [
+            before_result, merge_result,
+            None, prev_hash_result, None,
+        ]
+        self.adapter.write_relationships(rels, "Z_test", project_id="test")
+        # The MERGE query should contain LIMIT 1 to prevent Cartesian products
+        merge_call = tx_mock.run.call_args_list[1]
+        merge_query = merge_call[0][0]
+        self.assertIn("LIMIT 1", merge_query)
+
+
 if __name__ == "__main__":
     unittest.main()

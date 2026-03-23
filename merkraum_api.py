@@ -1888,6 +1888,46 @@ def history_verify():
         return _error(str(exc))
 
 
+@app.route("/api/graph/deduplicate", methods=["POST"])
+@require_auth
+@require_scope("write")
+def graph_deduplicate():
+    """Find and remove duplicate edges caused by Cartesian product matching.
+
+    Duplicates arise when the same entity name exists under multiple node
+    labels. For each (source_name, target_name, rel_type) group with >1 edge,
+    keeps the highest-confidence edge and removes the rest.
+
+    JSON body (optional):
+        {"dry_run": true}   (default: true — report only, no deletions)
+
+    Query params:
+        project: project id (default: from auth context)
+    """
+    if adapter is None:
+        return _error("Adapter not initialized", 503)
+    project = _project_id()
+    denied = _deny_if_project_forbidden(project)
+    if denied:
+        return denied
+
+    body = request.get_json(silent=True) or {}
+    dry_run = body.get("dry_run", True)
+
+    try:
+        result = adapter.deduplicate_edges(
+            project_id=project,
+            dry_run=dry_run,
+            actor=getattr(request, "username", None)
+                   or getattr(request, "user_id", None)
+                   or "api",
+        )
+        return jsonify(result)
+    except Exception as exc:
+        logger.exception("deduplicate_edges failed for project=%s", project)
+        return _error(str(exc))
+
+
 @app.route("/api/graph", methods=["GET"])
 @require_auth
 @require_scope("read")

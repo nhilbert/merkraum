@@ -1675,6 +1675,53 @@ async def verify_audit_chain(
 
 
 @mcp.tool()
+async def deduplicate_edges(
+    project: str = None,
+    dry_run: bool = True,
+) -> dict:
+    """Find and remove duplicate edges in the knowledge graph.
+
+    Duplicates arise when the same entity name exists under multiple node
+    labels (e.g. 'VSG' as Concept and Organization). For each
+    (source_name, target_name, rel_type) group with >1 edge, keeps the
+    highest-confidence edge and removes the rest.
+
+    Args:
+        project: Project ID (default: your personal space)
+        dry_run: If true, report only without deleting (default: true)
+    """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("write", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    adapter = _get_adapter()
+    start = time.time()
+    try:
+        result = await _run_sync(
+            adapter.deduplicate_edges,
+            project_id=project,
+            dry_run=dry_run,
+            actor=auth_ctx.get("user_id", "mcp"),
+        )
+        result["duration_ms"] = int((time.time() - start) * 1000)
+        audit_log("deduplicate_edges", "authed",
+                  {"project": project, "dry_run": dry_run},
+                  int((time.time() - start) * 1000), "ok",
+                  f"found={result.get('duplicates_found', 0)}, "
+                  f"removed={result.get('edges_removed', 0)}")
+        return result
+    except Exception as e:
+        audit_log("deduplicate_edges", "authed",
+                  {"project": project},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
 async def health_check() -> dict:
     """Check if the knowledge graph backends are healthy."""
     auth_ctx = _get_auth_context()

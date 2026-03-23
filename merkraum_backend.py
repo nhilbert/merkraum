@@ -313,6 +313,31 @@ class BackendAdapter(ABC):
              "unchained": int}
         """
 
+    @abstractmethod
+    def deduplicate_edges(self, project_id: str = "default",
+                          dry_run: bool = True,
+                          actor: str = "api") -> dict:
+        """Find and remove duplicate edges between same-name node pairs.
+
+        Duplicates arise when nodes with the same name exist under multiple
+        labels (e.g. 'VSG' as Concept and Organization). Unlabeled MATCH
+        creates Cartesian products, producing multiple edges of the same type
+        between different physical nodes with the same name.
+
+        For each (source_name, target_name, rel_type) group with >1 edge,
+        keeps the edge with the highest confidence (ties broken by most
+        recent created_at) and deletes the rest.
+
+        Args:
+            project_id: Project to deduplicate.
+            dry_run: If True, report duplicates without deleting.
+            actor: Actor for audit logging.
+
+        Returns:
+            {"duplicates_found": int, "edges_removed": int,
+             "groups": list of {source, target, type, count, kept, removed}}
+        """
+
     # --- Vector Operations ---
 
     @abstractmethod
@@ -801,15 +826,24 @@ class Neo4jBaseAdapter(BackendAdapter):
                         valid_until=valid_until,
                     )
 
+                    # Use source_type/target_type from relationship dict
+                    # to constrain MATCH and prevent Cartesian products
+                    # when the same name exists as multiple node types
+                    src_type = rel.get("source_type")
+                    tgt_type = rel.get("target_type")
+                    src_label = f":{src_type}" if src_type and src_type in NODE_TYPES else ""
+                    tgt_label = f":{tgt_type}" if tgt_type and tgt_type in NODE_TYPES else ""
+
                     tx = session.begin_transaction()
                     try:
                         # Capture before-state of relationship if it exists
                         before_rec = tx.run(
                             f"""
-                            MATCH (a {{name: $source, project_id: $project_id}})
+                            MATCH (a{src_label} {{name: $source, project_id: $project_id}})
                                   -[r:{rel_type}]->
-                                  (b {{name: $target, project_id: $project_id}})
+                                  (b{tgt_label} {{name: $target, project_id: $project_id}})
                             RETURN properties(r) AS props
+                            LIMIT 1
                             """,
                             source=rel["source"],
                             target=rel["target"],
@@ -818,8 +852,10 @@ class Neo4jBaseAdapter(BackendAdapter):
                         before_state = dict(before_rec["props"]) if before_rec else None
 
                         cypher = f"""
-                        MATCH (a {{name: $source, project_id: $project_id}})
-                        MATCH (b {{name: $target, project_id: $project_id}})
+                        MATCH (a{src_label} {{name: $source, project_id: $project_id}})
+                        WITH a LIMIT 1
+                        MATCH (b{tgt_label} {{name: $target, project_id: $project_id}})
+                        WITH a, b LIMIT 1
                         MERGE (a)-[r:{rel_type}]->(b)
                         ON CREATE SET
                             r.confidence = $confidence, r.reason = $reason,
@@ -868,8 +904,10 @@ class Neo4jBaseAdapter(BackendAdapter):
 
                         if created and rel_type in SYMMETRIC_TYPES:
                             inverse = f"""
-                            MATCH (a {{name: $target, project_id: $project_id}})
-                            MATCH (b {{name: $source, project_id: $project_id}})
+                            MATCH (a{tgt_label} {{name: $target, project_id: $project_id}})
+                            WITH a LIMIT 1
+                            MATCH (b{src_label} {{name: $source, project_id: $project_id}})
+                            WITH a, b LIMIT 1
                             MERGE (a)-[r:{rel_type}]->(b)
                             ON CREATE SET
                                 r.confidence = $confidence, r.reason = $reason,
@@ -3137,6 +3175,122 @@ class Neo4jBaseAdapter(BackendAdapter):
             "first_entry": entries[0]["created_at"] if entries else None,
             "last_entry": entries[-1]["created_at"] if entries else None,
             "unchained": unchained,
+        }
+
+    def deduplicate_edges(self, project_id="default", dry_run=True,
+                          actor="api"):
+        """Find and remove duplicate edges between same-name node pairs.
+
+        Duplicate edges arise when the same entity name exists under multiple
+        Neo4j labels (e.g. 'VSG' as both Concept and Organization).
+        Unlabeled MATCH in write_relationships produces a Cartesian product,
+        creating separate edges between each combination of physical nodes.
+
+        Strategy: For each (source_name, target_name, rel_type) group with >1
+        edge, keep the one with the highest confidence (ties broken by most
+        recent created_at), delete the rest.
+        """
+        groups = []
+        total_removed = 0
+
+        with self._driver.session() as session:
+            # Find all (source_name, target_name, type) groups with >1 edge
+            records = session.run(
+                """
+                MATCH (a {project_id: $pid})-[r]->(b {project_id: $pid})
+                WITH a.name AS src, b.name AS tgt, type(r) AS rtype,
+                     collect({
+                         id: id(r),
+                         confidence: coalesce(r.confidence, 0.0),
+                         created_at: coalesce(r.created_at, ''),
+                         source_label: labels(a)[0],
+                         target_label: labels(b)[0]
+                     }) AS edges
+                WHERE size(edges) > 1
+                RETURN src, tgt, rtype, edges
+                ORDER BY size(edges) DESC
+                """,
+                pid=project_id,
+            )
+            dup_groups = list(records)
+
+        if not dup_groups:
+            return {
+                "duplicates_found": 0,
+                "edges_removed": 0,
+                "groups": [],
+                "dry_run": dry_run,
+            }
+
+        for rec in dup_groups:
+            src = rec["src"]
+            tgt = rec["tgt"]
+            rtype = rec["rtype"]
+            edges = list(rec["edges"])
+
+            # Sort: highest confidence first, then most recent created_at
+            edges.sort(
+                key=lambda e: (e["confidence"], e["created_at"]),
+                reverse=True,
+            )
+
+            keep = edges[0]
+            remove = edges[1:]
+            remove_ids = [e["id"] for e in remove]
+
+            group_info = {
+                "source": src,
+                "target": tgt,
+                "type": rtype,
+                "count": len(edges),
+                "kept": {
+                    "source_label": keep["source_label"],
+                    "target_label": keep["target_label"],
+                    "confidence": keep["confidence"],
+                },
+                "removed": len(remove),
+            }
+
+            if not dry_run and remove_ids:
+                with self._driver.session() as session:
+                    tx = session.begin_transaction()
+                    try:
+                        tx.run(
+                            """
+                            UNWIND $ids AS rid
+                            MATCH ()-[r]->()
+                            WHERE id(r) = rid
+                            DELETE r
+                            """,
+                            ids=remove_ids,
+                        )
+                        # Audit log the dedup operation
+                        op_id = self._operation_id()
+                        payload = {
+                            "source": src,
+                            "target": tgt,
+                            "type": rtype,
+                            "duplicates_removed": len(remove),
+                            "kept_confidence": keep["confidence"],
+                        }
+                        self._log_operation(
+                            tx, op_id, "deduplicate_edges", actor,
+                            project_id, payload=payload,
+                        )
+                        tx.commit()
+                    except Exception:
+                        tx.rollback()
+                        raise
+
+                total_removed += len(remove)
+
+            groups.append(group_info)
+
+        return {
+            "duplicates_found": sum(g["removed"] for g in groups),
+            "edges_removed": total_removed,
+            "groups": groups,
+            "dry_run": dry_run,
         }
 
 
