@@ -117,8 +117,15 @@ def handle_preflight(path=""):
 # ---------------------------------------------------------------------------
 
 def _project_id() -> str:
-    """Extract project_id from query params, defaulting to 'default'."""
-    return request.args.get("project", "default") or "default"
+    """Extract project_id from query params, falling back to user namespace."""
+    project = (request.args.get("project") or "").strip()
+    if project:
+        return project
+    # Fall back to authenticated user's own namespace (Cognito sub)
+    user_id = getattr(request, 'user_id', None)
+    if user_id:
+        return user_id
+    return "default"
 
 
 
