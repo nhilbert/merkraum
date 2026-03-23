@@ -740,11 +740,20 @@ def maintain(
     project_id: str = "default",
     dry_run: bool = False,
 ) -> Generator[dict, None, dict]:
-    """Synaptic pruning — apply confidence decay and surface review needs.
+    """Synaptic pruning — apply confidence decay, expire TTLs, prune
+    orphans, deduplicate edges, and surface review needs.
 
     Biologically inspired: during sleep, synapses are pruned and
-    strengthened based on recent use. This phase decays stale beliefs
-    and surfaces nodes needing human review.
+    strengthened based on recent use. This phase performs active graph
+    maintenance — the knowledge equivalent of garbage collection.
+
+    Steps:
+        1. Confidence decay (existing — stale beliefs lose confidence)
+        2. TTL enforcement (expire_nodes — provisional edges and timed nodes)
+        3. Orphan pruning (prune_orphan_nodes — 0-edge stale nodes)
+        4. Edge deduplication (deduplicate_edges — Cartesian product cleanup)
+        5. Review queue (surface items needing human review)
+        6. Governance statistics summary
 
     Args:
         adapter: Backend adapter (Neo4j + vector store)
@@ -782,7 +791,63 @@ def maintain(
         yield _msg("maintenance", "decay_truncated",
                    f"  ... and {decayed_count - 10} more")
 
-    # Step 2: Surface review queue
+    # Step 2: TTL enforcement — expire nodes past their valid_until
+    yield _msg("maintenance", "expire_start",
+               "Enforcing TTL expirations...")
+    expire_result = adapter.expire_nodes(
+        project_id=project_id, dry_run=dry_run, actor="dreaming-maintenance")
+
+    expired_count = expire_result.get("total", 0)
+    yield _msg("maintenance", "expire_done",
+               f"TTL: {expired_count} node(s) {'would be ' if dry_run else ''}expired",
+               {"expired": expired_count, "dry_run": dry_run})
+
+    for entry in expire_result.get("expired", [])[:5]:
+        yield _msg("maintenance", "expire_item",
+                   f"  {entry['name']} ({entry['type']}) — "
+                   f"valid_until: {entry.get('valid_until', 'unknown')}")
+
+    if expired_count > 5:
+        yield _msg("maintenance", "expire_truncated",
+                   f"  ... and {expired_count - 5} more")
+
+    # Step 3: Orphan pruning — deactivate 0-edge stale nodes
+    yield _msg("maintenance", "prune_start",
+               "Pruning orphan nodes (0 edges, 30+ days stale)...")
+    prune_result = adapter.prune_orphan_nodes(
+        project_id=project_id, stale_days=30,
+        dry_run=dry_run, actor="dreaming-maintenance")
+
+    pruned_count = prune_result.get("total", 0)
+    yield _msg("maintenance", "prune_done",
+               f"Orphans: {pruned_count} node(s) {'would be ' if dry_run else ''}pruned",
+               {"pruned": pruned_count, "dry_run": dry_run})
+
+    for entry in prune_result.get("pruned", [])[:5]:
+        yield _msg("maintenance", "prune_item",
+                   f"  {entry['name']} ({entry['type']}) — "
+                   f"last update: {entry.get('last_update', 'unknown')}")
+
+    if pruned_count > 5:
+        yield _msg("maintenance", "prune_truncated",
+                   f"  ... and {pruned_count - 5} more")
+
+    # Step 4: Edge deduplication — clean up Cartesian product artifacts
+    yield _msg("maintenance", "dedup_start",
+               "Checking for duplicate edges...")
+    dedup_result = adapter.deduplicate_edges(
+        project_id=project_id, dry_run=dry_run,
+        actor="dreaming-maintenance")
+
+    dedup_found = dedup_result.get("duplicates_found", 0)
+    dedup_removed = dedup_result.get("edges_removed", 0)
+    yield _msg("maintenance", "dedup_done",
+               f"Dedup: {dedup_found} duplicate(s) found, "
+               f"{dedup_removed} {'would be ' if dry_run else ''}removed",
+               {"duplicates_found": dedup_found,
+                "edges_removed": dedup_removed, "dry_run": dry_run})
+
+    # Step 5: Surface review queue
     yield _msg("maintenance", "review_start", "Checking certainty review queue...")
     review_result = adapter.get_certainty_review_queue(
         project_id=project_id, limit=20)
@@ -803,7 +868,7 @@ def maintain(
                f"{len(category_summary)} categor{'y' if len(category_summary) == 1 else 'ies'}",
                {"total": total_review, "categories": category_summary})
 
-    # Step 3: Certainty statistics summary
+    # Step 6: Certainty statistics summary
     yield _msg("maintenance", "stats_start", "Computing governance statistics...")
     stats_result = adapter.get_certainty_stats(project_id=project_id)
 
@@ -824,6 +889,18 @@ def maintain(
             "unchanged_count": unchanged_count,
             "items": decay_result.get("decayed", []),
         },
+        "expired": {
+            "count": expired_count,
+            "items": expire_result.get("expired", []),
+        },
+        "pruned": {
+            "count": pruned_count,
+            "items": prune_result.get("pruned", []),
+        },
+        "dedup": {
+            "duplicates_found": dedup_found,
+            "edges_removed": dedup_removed,
+        },
         "review_queue": {
             "total": total_review,
             "categories": category_summary,
@@ -833,9 +910,12 @@ def maintain(
 
     yield _msg("maintenance", "done",
                f"Maintenance complete — {decayed_count} decay(s), "
+               f"{expired_count} expired, {pruned_count} pruned, "
+               f"{dedup_removed} deduped, "
                f"{total_review} review item(s), health: {health_status}",
-               {"decayed": decayed_count, "review_items": total_review,
-                "health": health_status})
+               {"decayed": decayed_count, "expired": expired_count,
+                "pruned": pruned_count, "deduped": dedup_removed,
+                "review_items": total_review, "health": health_status})
 
     return result
 

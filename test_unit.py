@@ -1877,6 +1877,84 @@ class TestExpireNodes(unittest.TestCase):
         self.tx.commit.assert_called_once()
 
 
+class TestPruneOrphanNodes(unittest.TestCase):
+    """Test prune_orphan_nodes active pruning method — Z1841 proposal #2."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.session = MagicMock()
+        self.tx = MagicMock()
+        self.session.begin_transaction.return_value = self.tx
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+
+    def test_dry_run_returns_orphan_list(self):
+        """dry_run=True should return orphan nodes without modifying anything."""
+        orphan_rec = MagicMock()
+        data = {
+            "name": "Disconnected concept", "type": "Concept",
+            "node_id": "id-orphan", "last_update": "2026-01-01T00:00:00",
+            "confidence": None, "active": None, "status": None,
+        }
+        orphan_rec.__getitem__ = lambda s, k: data[k]
+        orphan_rec.get = lambda k, d=None: data.get(k, d)
+        self.session.run.return_value = [orphan_rec]
+
+        result = self.adapter.prune_orphan_nodes(
+            project_id="proj", stale_days=30, dry_run=True)
+        self.assertTrue(result["dry_run"])
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["pruned"][0]["name"], "Disconnected concept")
+        self.session.begin_transaction.assert_not_called()
+
+    def test_prune_belief_sets_status_pruned(self):
+        """Pruning a Belief should set active=false and status='pruned'."""
+        orphan_rec = MagicMock()
+        data = {
+            "name": "Orphan belief", "type": "Belief",
+            "node_id": "id-ob", "last_update": "2026-01-15T00:00:00",
+            "confidence": 0.3, "active": True, "status": "active",
+        }
+        orphan_rec.__getitem__ = lambda s, k: data[k]
+        orphan_rec.get = lambda k, d=None: data.get(k, d)
+        self.session.run.return_value = [orphan_rec]
+        self.tx.run.return_value = MagicMock()
+
+        result = self.adapter.prune_orphan_nodes(
+            project_id="proj", stale_days=30, dry_run=False)
+        self.assertFalse(result["dry_run"])
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["pruned"][0]["name"], "Orphan belief")
+        self.tx.commit.assert_called_once()
+
+    def test_empty_when_no_orphans(self):
+        """No orphan nodes should return empty list."""
+        self.session.run.return_value = []
+        result = self.adapter.prune_orphan_nodes(
+            project_id="proj", stale_days=30, dry_run=False)
+        self.assertEqual(result["total"], 0)
+        self.assertEqual(result["pruned"], [])
+
+    def test_prune_non_belief_sets_expired_at(self):
+        """Non-Belief orphans get expired_at only."""
+        orphan_rec = MagicMock()
+        data = {
+            "name": "Old event", "type": "Event",
+            "node_id": "id-oe", "last_update": "2026-01-01T00:00:00",
+            "confidence": None, "active": None, "status": None,
+        }
+        orphan_rec.__getitem__ = lambda s, k: data[k]
+        orphan_rec.get = lambda k, d=None: data.get(k, d)
+        self.session.run.return_value = [orphan_rec]
+        self.tx.run.return_value = MagicMock()
+
+        result = self.adapter.prune_orphan_nodes(
+            project_id="proj", stale_days=30, dry_run=False)
+        self.assertEqual(result["total"], 1)
+        self.assertEqual(result["pruned"][0]["type"], "Event")
+        self.tx.commit.assert_called_once()
+
+
 class TestRenewNode(unittest.TestCase):
     """Test renew_node managed renewal method."""
 
@@ -2288,11 +2366,22 @@ class TestDreamingMaintenance(unittest.TestCase):
     """Test maintenance phase in dreaming engine — SUP-163 integration."""
 
     def _make_mock_adapter(self, decay_result=None, review_result=None,
-                           stats_result=None):
+                           stats_result=None, expire_result=None,
+                           prune_result=None, dedup_result=None):
         """Create a mock adapter with certainty management methods."""
         adapter = MagicMock(spec=Neo4jBaseAdapter)
         adapter.apply_confidence_decay.return_value = decay_result or {
             "decayed": [], "total": 0, "unchanged": 5, "dry_run": True,
+        }
+        adapter.expire_nodes.return_value = expire_result or {
+            "expired": [], "total": 0, "dry_run": True,
+        }
+        adapter.prune_orphan_nodes.return_value = prune_result or {
+            "pruned": [], "total": 0, "dry_run": True,
+        }
+        adapter.deduplicate_edges.return_value = dedup_result or {
+            "duplicates_found": 0, "edges_removed": 0,
+            "groups": [], "dry_run": True,
         }
         adapter.get_certainty_review_queue.return_value = review_result or {
             "categories": {
@@ -2325,6 +2414,9 @@ class TestDreamingMaintenance(unittest.TestCase):
         self.assertEqual(result["status"], "completed")
         self.assertEqual(result["mode"], "preview")
         self.assertIn("decay", result)
+        self.assertIn("expired", result)
+        self.assertIn("pruned", result)
+        self.assertIn("dedup", result)
         self.assertIn("review_queue", result)
         self.assertIn("governance_health", result)
 
@@ -2335,6 +2427,14 @@ class TestDreamingMaintenance(unittest.TestCase):
         self._run_generator(maintain(adapter, "proj", dry_run=True))
         adapter.apply_confidence_decay.assert_called_once_with(
             project_id="proj", dry_run=True, actor="dreaming-maintenance")
+        adapter.expire_nodes.assert_called_once_with(
+            project_id="proj", dry_run=True, actor="dreaming-maintenance")
+        adapter.prune_orphan_nodes.assert_called_once_with(
+            project_id="proj", stale_days=30,
+            dry_run=True, actor="dreaming-maintenance")
+        adapter.deduplicate_edges.assert_called_once_with(
+            project_id="proj", dry_run=True,
+            actor="dreaming-maintenance")
 
     def test_maintain_apply_mode(self):
         """Apply mode should pass dry_run=False to backend."""
@@ -2344,6 +2444,14 @@ class TestDreamingMaintenance(unittest.TestCase):
             maintain(adapter, "proj", dry_run=False))
         adapter.apply_confidence_decay.assert_called_once_with(
             project_id="proj", dry_run=False, actor="dreaming-maintenance")
+        adapter.expire_nodes.assert_called_once_with(
+            project_id="proj", dry_run=False, actor="dreaming-maintenance")
+        adapter.prune_orphan_nodes.assert_called_once_with(
+            project_id="proj", stale_days=30,
+            dry_run=False, actor="dreaming-maintenance")
+        adapter.deduplicate_edges.assert_called_once_with(
+            project_id="proj", dry_run=False,
+            actor="dreaming-maintenance")
         self.assertEqual(result["mode"], "apply")
 
     def test_maintain_reports_decay_count(self):
@@ -2401,8 +2509,77 @@ class TestDreamingMaintenance(unittest.TestCase):
         steps = [m["step"] for m in messages]
         self.assertIn("start", steps)
         self.assertIn("decay_done", steps)
+        self.assertIn("expire_done", steps)
+        self.assertIn("prune_done", steps)
+        self.assertIn("dedup_done", steps)
         self.assertIn("review_done", steps)
         self.assertIn("done", steps)
+
+    def test_maintain_reports_expire_count(self):
+        """Should report expired nodes from TTL enforcement."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter(expire_result={
+            "expired": [
+                {"name": "old-edge", "type": "Belief",
+                 "valid_until": "2026-03-01T00:00:00"},
+            ],
+            "total": 1, "dry_run": False,
+        })
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=False))
+        self.assertEqual(result["expired"]["count"], 1)
+        self.assertEqual(len(result["expired"]["items"]), 1)
+
+    def test_maintain_reports_prune_count(self):
+        """Should report pruned orphan nodes."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter(prune_result={
+            "pruned": [
+                {"name": "orphan-node", "type": "Concept",
+                 "last_update": "2026-02-01T00:00:00"},
+                {"name": "orphan-belief", "type": "Belief",
+                 "last_update": "2026-01-15T00:00:00"},
+            ],
+            "total": 2, "dry_run": False,
+        })
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=False))
+        self.assertEqual(result["pruned"]["count"], 2)
+
+    def test_maintain_reports_dedup_count(self):
+        """Should report deduplicated edges."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter(dedup_result={
+            "duplicates_found": 5, "edges_removed": 5,
+            "groups": [{"source": "A", "target": "B",
+                        "type": "RELATES_TO", "count": 3,
+                        "kept": {"confidence": 0.8}, "removed": 2}],
+            "dry_run": False,
+        })
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=False))
+        self.assertEqual(result["dedup"]["duplicates_found"], 5)
+        self.assertEqual(result["dedup"]["edges_removed"], 5)
+
+    def test_maintain_done_message_includes_all_counts(self):
+        """Final done message should summarize all maintenance actions."""
+        from merkraum_dreaming import maintain
+        adapter = self._make_mock_adapter(
+            decay_result={"decayed": [], "total": 2, "unchanged": 3,
+                          "dry_run": False},
+            expire_result={"expired": [], "total": 1, "dry_run": False},
+            prune_result={"pruned": [], "total": 3, "dry_run": False},
+            dedup_result={"duplicates_found": 4, "edges_removed": 4,
+                          "groups": [], "dry_run": False},
+        )
+        messages, result = self._run_generator(
+            maintain(adapter, "proj", dry_run=False))
+        done_msgs = [m for m in messages if m["step"] == "done"]
+        self.assertEqual(len(done_msgs), 1)
+        self.assertIn("2 decay", done_msgs[0]["detail"])
+        self.assertIn("1 expired", done_msgs[0]["detail"])
+        self.assertIn("3 pruned", done_msgs[0]["detail"])
+        self.assertIn("4 deduped", done_msgs[0]["detail"])
 
     def test_dream_includes_maintenance_by_default(self):
         """Dream session should include maintenance in default phases."""
@@ -2428,10 +2605,12 @@ class TestDreamingMaintenance(unittest.TestCase):
         # Test directly that maintain respects dry_run
         messages, result = self._run_generator(
             maintain(adapter, "proj", dry_run=True))
-        self.assertTrue(result["decay"]["applied"] is False)
+        self.assertFalse(result["decay"]["applied"])
+        self.assertEqual(result["expired"]["count"], 0)
+        self.assertEqual(result["pruned"]["count"], 0)
         messages, result = self._run_generator(
             maintain(adapter, "proj", dry_run=False))
-        self.assertTrue(result["decay"]["applied"] is True)
+        self.assertTrue(result["decay"]["applied"])
 
 
 # --- Dreaming replay associative edge creation tests (Z1839) ---

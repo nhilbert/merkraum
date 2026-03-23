@@ -340,6 +340,30 @@ class BackendAdapter(ABC):
              "groups": list of {source, target, type, count, kept, removed}}
         """
 
+    @abstractmethod
+    def prune_orphan_nodes(self, project_id: str = "default",
+                           stale_days: int = 30,
+                           dry_run: bool = True,
+                           actor: str = "system") -> dict:
+        """Find and deactivate orphan nodes with zero edges.
+
+        Orphan nodes (no incoming or outgoing relationships) that haven't
+        been updated in stale_days are deactivated. For Beliefs, sets
+        active=false and status='pruned'. For other types, sets
+        expired_at. Non-destructive — nodes remain in the graph.
+
+        Excludes: Project nodes, OperationLog, HistoryLog (infrastructure).
+
+        Args:
+            project_id: Project to prune.
+            stale_days: Minimum days since last update to consider stale.
+            dry_run: If True, report what would be pruned without changing.
+            actor: Actor for audit trail.
+
+        Returns:
+            {"pruned": list, "total": int, "dry_run": bool}
+        """
+
     # --- Vector Operations ---
 
     @abstractmethod
@@ -3302,6 +3326,116 @@ class Neo4jBaseAdapter(BackendAdapter):
             "groups": groups,
             "dry_run": dry_run,
         }
+
+    def prune_orphan_nodes(self, project_id="default", stale_days=30,
+                           dry_run=True, actor="system"):
+        """Find and deactivate orphan nodes with zero edges.
+
+        Targets nodes with no incoming or outgoing relationships that
+        haven't been updated in stale_days. Non-destructive: sets
+        expired_at (and active=false for Beliefs).
+
+        Excludes infrastructure labels (Project, OperationLog, HistoryLog).
+        """
+        now = datetime.now(timezone.utc)
+        cutoff = (now - timedelta(days=stale_days)).isoformat()
+        now_iso = now.isoformat()
+        pruned = []
+
+        # Knowledge node types eligible for pruning (exclude infrastructure)
+        prune_types = [t for t in NODE_TYPES
+                       if t not in ("Project", "OperationLog", "HistoryLog",
+                                    "Interview", "Quote")]
+
+        with self._driver.session() as session:
+            # Find orphan nodes: zero relationships, stale, not already expired
+            records = list(session.run(
+                """
+                MATCH (n {project_id: $pid})
+                WHERE any(lbl IN labels(n) WHERE lbl IN $types)
+                  AND n.expired_at IS NULL
+                  AND coalesce(n.updated_at, n.created_at, '') < $cutoff
+                  AND NOT EXISTS { (n)-[]-() }
+                RETURN n.name AS name, labels(n)[0] AS type,
+                       n.node_id AS node_id,
+                       coalesce(n.updated_at, n.created_at) AS last_update,
+                       n.confidence AS confidence,
+                       n.active AS active, n.status AS status
+                ORDER BY last_update ASC
+                LIMIT 200
+                """,
+                pid=project_id, types=prune_types, cutoff=cutoff,
+            ))
+
+            if dry_run:
+                for rec in records:
+                    pruned.append({
+                        "name": rec["name"],
+                        "type": rec["type"],
+                        "last_update": rec["last_update"],
+                        "confidence": rec.get("confidence"),
+                    })
+                return {"pruned": pruned, "total": len(pruned),
+                        "dry_run": True}
+
+            for rec in records:
+                name = rec["name"]
+                node_type = rec["type"]
+                op_id = self._operation_id()
+                tx = session.begin_transaction()
+                try:
+                    before_state = {
+                        "name": name, "type": node_type,
+                        "active": rec.get("active"),
+                        "status": rec.get("status"),
+                        "last_update": rec["last_update"],
+                    }
+
+                    if node_type == "Belief":
+                        tx.run(
+                            """
+                            MATCH (n:Belief {name: $name, project_id: $pid})
+                            SET n.expired_at = $now,
+                                n.active = false,
+                                n.status = 'pruned',
+                                n.updated_at = $now
+                            """,
+                            name=name, pid=project_id, now=now_iso,
+                        )
+                    else:
+                        tx.run(
+                            f"""
+                            MATCH (n:{node_type} {{name: $name, project_id: $pid}})
+                            SET n.expired_at = $now,
+                                n.updated_at = $now
+                            """,
+                            name=name, pid=project_id, now=now_iso,
+                        )
+
+                    after_state = {
+                        "name": name, "type": node_type,
+                        "expired_at": now_iso,
+                        "active": False if node_type == "Belief" else rec.get("active"),
+                        "status": "pruned" if node_type == "Belief" else rec.get("status"),
+                    }
+
+                    self._log_history(tx, op_id, name, project_id,
+                                      "prune_orphan", before_state, actor)
+                    self._log_operation(tx, op_id, "prune_orphan", actor,
+                                        project_id,
+                                        payload={"name": name, "type": node_type,
+                                                 "reason": "orphan_stale"},
+                                        before_state=before_state,
+                                        after_state=after_state)
+                    tx.commit()
+                    pruned.append({
+                        "name": name, "type": node_type,
+                        "last_update": rec["last_update"],
+                    })
+                except Exception:
+                    tx.rollback()
+
+        return {"pruned": pruned, "total": len(pruned), "dry_run": False}
 
 
 class Neo4jQdrantAdapter(Neo4jBaseAdapter):
