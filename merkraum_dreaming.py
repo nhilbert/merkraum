@@ -1,33 +1,34 @@
 #!/usr/bin/env python3
 """
-Merkraum Dreaming Engine — neuroscience-inspired memory consolidation.
+Merkraum Dreaming Engine v2.0 — neuroscience-inspired memory consolidation.
 
 Universal logic module: no Flask, no hosting dependencies.
 Designed for open-source sharing — all hosting/user logic stays in the API layer.
 
-Six operations inspired by memory consolidation research
-(McClelland et al., O'Reilly & Frank):
+Architecture v2.0 (Norman-directed, 2026-03-23):
+Four phases inspired by biological sleep research (sharp-wave ripples,
+CLS theory, REM pruning, Ebbinghaus spaced repetition):
 
-1. Replay (hippocampal replay): Random walks through the graph surface
-   unexpected connections between distant knowledge clusters.
+1. Walk (hippocampal replay + free association): Unified graph walk with
+   three movement types — 70% graph edges, 20% semantic jumps, 10% random
+   teleportation. Entry at high-activation nodes. Creates provisional edges
+   from dream observations. Replaces separate replay + bridging phases.
 2. Consolidation (hippocampus-to-neocortex transfer): Episodic beliefs
-   are merged into abstract, generalizable beliefs (textual similarity).
-3. Compression (hippocampus-to-neocortex transfer): Entity-based topic
-   clustering — beliefs about the same entity are compressed into
-   higher-level abstractions (structural/semantic grouping).
-4. Bridging (free association): Cross-domain connection discovery between
-   distant belief clusters — picks random belief pairs with high graph
-   distance and evaluates whether a meaningful relationship exists.
-5. Reflection (Default Mode Network): Structural health analysis —
+   merged into abstractions (textual similarity) + entity-based topic
+   compression. S5/S4-aware importance scoring guards near-duplicates.
+3. Reflection (Default Mode Network): Structural health analysis —
    orphan detection, hub over-centralization, schema discipline.
-6. Maintenance (synaptic pruning): Confidence decay on stale beliefs,
-   certainty review queue, governance health assessment.
+4. Maintenance (REM synaptic pruning): Confidence decay, TTL enforcement
+   with linear retention scaling (~10 activations ≈ 1 year), orphan
+   pruning, edge deduplication.
 
 All operations yield progress messages via generators, enabling
 async monitoring and live visualization in the frontend.
 
+v1.0 — Initial replay + consolidation
 v1.1 — Bridging phase added (2026-03-23)
 v1.2 — Compression phase added (2026-03-23)
+v2.0 — Architecture v2.0: Walk-based 4-phase (Norman-directed, 2026-03-23)
 """
 
 import json
@@ -46,21 +47,32 @@ logger = logging.getLogger("merkraum-dreaming")
 
 
 # ---------------------------------------------------------------------------
-# Model configuration — SUP-159: Dream Analysis Model Upgrade
+# Model configuration — SUP-159 + v2.0 architecture
 # ---------------------------------------------------------------------------
-# Replay: lightweight analysis of graph walks → Haiku (cost-efficient, many calls)
-# Consolidation: quality abstraction of episodic beliefs → Sonnet (accuracy matters)
+# Walk: lightweight analysis of graph walks → Haiku (cost-efficient, many calls)
+# Consolidation: quality abstraction + near-duplicate discrimination → Sonnet
 # Reflection: no LLM (pure structural analysis)
+# Maintenance: no LLM (pure Cypher operations)
 
-_DEFAULT_REPLAY_MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
+_DEFAULT_WALK_MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
 _DEFAULT_CONSOLIDATION_MODEL = "eu.anthropic.claude-sonnet-4-6"
-_DEFAULT_BRIDGING_MODEL = "eu.anthropic.claude-haiku-4-5-20251001-v1:0"
-_DEFAULT_COMPRESSION_MODEL = "eu.anthropic.claude-sonnet-4-6"
+
+# Legacy model aliases for backward compatibility
+_DEFAULT_REPLAY_MODEL = _DEFAULT_WALK_MODEL
+_DEFAULT_BRIDGING_MODEL = _DEFAULT_WALK_MODEL
+_DEFAULT_COMPRESSION_MODEL = _DEFAULT_CONSOLIDATION_MODEL
+
+# TTL scaling: linear growth, calibrated so ~10 activations ≈ 1 year (Norman's directive)
+# Formula: TTL_days = base_ttl * (1 + access_count * TTL_SCALE_FACTOR)
+# With base_ttl=30: 30 * (1 + 10 * 1.12) = 366 days ≈ 1 year
+TTL_SCALE_FACTOR = 1.12
 
 
-def _get_replay_model() -> str | None:
-    """Return the model for replay phase (env override or default)."""
-    return os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL") or _DEFAULT_REPLAY_MODEL
+def _get_walk_model() -> str | None:
+    """Return the model for walk phase (env override or default)."""
+    return (os.environ.get("MERKRAUM_DREAMING_WALK_MODEL")
+            or os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL")
+            or _DEFAULT_WALK_MODEL)
 
 
 def _get_consolidation_model() -> str | None:
@@ -68,28 +80,38 @@ def _get_consolidation_model() -> str | None:
     return os.environ.get("MERKRAUM_DREAMING_CONSOLIDATION_MODEL") or _DEFAULT_CONSOLIDATION_MODEL
 
 
+# Legacy accessors for backward compatibility
+def _get_replay_model() -> str | None:
+    return _get_walk_model()
+
+
 def _get_bridging_model() -> str | None:
-    """Return the model for bridging phase (env override or default)."""
-    return os.environ.get("MERKRAUM_DREAMING_BRIDGING_MODEL") or _DEFAULT_BRIDGING_MODEL
+    return _get_walk_model()
 
 
 def _get_compression_model() -> str | None:
-    """Return the model for compression phase (env override or default)."""
-    return os.environ.get("MERKRAUM_DREAMING_COMPRESSION_MODEL") or _DEFAULT_COMPRESSION_MODEL
+    return (os.environ.get("MERKRAUM_DREAMING_COMPRESSION_MODEL")
+            or _get_consolidation_model())
 
 
 def get_dreaming_config() -> dict:
     """Return current dreaming model configuration for diagnostics."""
     return {
-        "replay_model": _get_replay_model(),
+        "walk_model": _get_walk_model(),
         "consolidation_model": _get_consolidation_model(),
-        "bridging_model": _get_bridging_model(),
-        "compression_model": _get_compression_model(),
-        "reflection_model": None,  # No LLM used
-        "replay_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL") else "default",
+        "reflection_model": None,
+        "maintenance_model": None,
+        "walk_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_WALK_MODEL") or os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL") else "default",
         "consolidation_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_CONSOLIDATION_MODEL") else "default",
-        "bridging_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_BRIDGING_MODEL") else "default",
-        "compression_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_COMPRESSION_MODEL") else "default",
+        "ttl_scale_factor": TTL_SCALE_FACTOR,
+        "architecture_version": "2.0",
+        # Legacy keys for backward compat
+        "replay_model": _get_walk_model(),
+        "bridging_model": _get_walk_model(),
+        "compression_model": _get_consolidation_model(),
+        "replay_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_WALK_MODEL") or os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL") else "default",
+        "bridging_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_WALK_MODEL") or os.environ.get("MERKRAUM_DREAMING_REPLAY_MODEL") else "default",
+        "compression_model_source": "env" if os.environ.get("MERKRAUM_DREAMING_CONSOLIDATION_MODEL") else "default",
     }
 
 
@@ -111,7 +133,462 @@ def _msg(phase: str, step: str, detail: str, data: dict | None = None) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Phase 1: Replay — random walks with serendipitous discovery
+# Access Logging — increment access_count on node reads (v2.0 infrastructure)
+# ---------------------------------------------------------------------------
+
+def _log_access(session, project_id: str, node_names: list[str]):
+    """Increment access_count and update last_accessed for visited nodes.
+
+    Called during walk to track activation frequency. This data drives:
+    - Walk entry point selection (high-activation nodes)
+    - TTL extension (more activations = longer retention)
+    - Importance scoring (activation_score component)
+    """
+    if not node_names:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    session.run(
+        "UNWIND $names AS name "
+        "MATCH (n {project_id: $pid, name: name}) "
+        "SET n.access_count = COALESCE(n.access_count, 0) + 1, "
+        "    n.last_accessed = $now",
+        names=node_names, pid=project_id, now=now,
+    )
+
+
+def calculate_ttl_days(base_ttl_days: int, access_count: int,
+                       scale_factor: float = TTL_SCALE_FACTOR) -> int:
+    """Calculate effective TTL using linear scaling.
+
+    Norman's directive: ~10 activations ≈ 1 year (with base_ttl=30 days).
+    Formula: TTL = base_ttl * (1 + access_count * scale_factor)
+
+    Examples (base_ttl=30, scale_factor=1.12):
+      0 activations: 30 days
+      1 activation:  64 days
+      5 activations: 198 days
+      10 activations: 366 days ≈ 1 year
+      20 activations: 702 days ≈ 2 years
+    """
+    return int(base_ttl_days * (1 + access_count * scale_factor))
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 (v2.0): Walk — unified graph walk with 70/20/10 movement
+# ---------------------------------------------------------------------------
+
+def walk(
+    adapter: Neo4jBaseAdapter,
+    project_id: str = "default",
+    steps: int = 20,
+    walks: int = 5,
+    p_graph: float = 0.70,
+    p_semantic: float = 0.20,
+    p_random: float = 0.10,
+    create_edges: bool = True,
+    seed: str | None = None,
+) -> Generator[dict, None, dict]:
+    """Neuroscience-inspired graph walk with three movement types.
+
+    Replaces separate replay + bridging phases (v2.0 architecture).
+
+    Entry: high-activation nodes (access_count * recency_weight).
+    Movement at each step:
+      - p_graph (70%): follow a random edge to a neighbor
+      - p_semantic (20%): semantic jump via vector search
+      - p_random (10%): random teleportation to any node
+
+    At each walk completion, LLM analyzes the path for:
+      - Missing relationships → provisional edges
+      - Surprising connections → provisional edges
+      - Contradictions with existing beliefs
+      - Cross-domain patterns (the bridging function)
+
+    Access logging: every visited node gets access_count incremented.
+
+    Args:
+        adapter: Backend adapter (Neo4j + vector store)
+        project_id: Project to walk
+        steps: Steps per walk (default 20, max 50)
+        walks: Number of walks per session (default 5, max 15)
+        p_graph: Probability of graph walk (default 0.70)
+        p_semantic: Probability of semantic jump (default 0.20)
+        p_random: Probability of random teleportation (default 0.10)
+        create_edges: Write provisional edges from observations (default True)
+        seed: Optional starting entity for first walk
+
+    Yields progress messages. Returns final result dict.
+    """
+    yield _msg("walk", "start",
+               f"Starting {walks} walk(s), {steps} steps each "
+               f"(graph {p_graph:.0%}/semantic {p_semantic:.0%}/random {p_random:.0%})")
+    now = datetime.now(timezone.utc).isoformat()
+    all_walks = []
+
+    for walk_num in range(walks):
+        yield _msg("walk", "walk_start",
+                   f"Walk {walk_num + 1}/{walks}: selecting entry point")
+
+        with adapter._driver.session() as session:
+            # Entry point selection: high-activation nodes (access_count * recency)
+            # Norman's feedback: "steigen wir dort ein, wo haeufig aktiviert wird"
+            if seed and walk_num == 0:
+                seeds = session.run(
+                    "MATCH (n {project_id: $pid}) "
+                    "WHERE toLower(n.name) CONTAINS toLower($q) "
+                    "AND any(lbl IN labels(n) WHERE lbl IN $types) "
+                    "RETURN n.name AS name, labels(n)[0] AS type, "
+                    "COALESCE(n.access_count, 0) AS access_count LIMIT 1",
+                    pid=project_id, q=seed, types=NODE_TYPES,
+                ).data()
+                if not seeds:
+                    yield _msg("walk", "seed_not_found",
+                               f"Entity '{seed}' not found, using activation-based entry")
+                    seeds = None
+                else:
+                    seed_node = seeds[0]
+            else:
+                seeds = None
+
+            if not seeds:
+                # Select entry by activation frequency weighted by recency
+                candidates = session.run(
+                    "MATCH (n {project_id: $pid}) "
+                    "WHERE any(lbl IN labels(n) WHERE lbl IN $types) "
+                    "WITH n, labels(n)[0] AS type, "
+                    "COALESCE(n.access_count, 0) AS ac, "
+                    "CASE WHEN n.last_accessed IS NOT NULL "
+                    "     THEN 1.0 / (duration.inDays(datetime(n.last_accessed), datetime()).days + 1) "
+                    "     ELSE 0.01 END AS recency "
+                    "RETURN n.name AS name, type, ac, recency, "
+                    "(ac + 1) * recency AS activation_score "
+                    "ORDER BY activation_score DESC LIMIT 50",
+                    pid=project_id, types=NODE_TYPES,
+                ).data()
+
+                if not candidates:
+                    yield _msg("walk", "empty_graph",
+                               "No nodes in project — skipping walk")
+                    return {"walks": [], "observations": [], "phase": "walk",
+                            "status": "empty"}
+
+                # Weighted random selection from top candidates
+                weights = [max(c.get("activation_score", 0.01), 0.01)
+                           for c in candidates]
+                seed_node = random.choices(candidates, weights=weights, k=1)[0]
+
+            yield _msg("walk", "entry_selected",
+                       f"Entry: {seed_node['name']} [{seed_node['type']}] "
+                       f"(access_count: {seed_node.get('access_count', 0)})",
+                       {"entry": seed_node})
+
+            # Execute walk with 70/20/10 movement
+            current = seed_node["name"]
+            walk_path = [{"name": current, "type": seed_node["type"],
+                          "hop": "entry"}]
+            visited = {current}
+            subgraph_data = []
+            movement_stats = {"graph": 0, "semantic": 0, "random": 0,
+                              "dead_end": 0}
+
+            for step in range(steps):
+                # Collect neighborhood for LLM context
+                neighbors = session.run(
+                    "MATCH (n {project_id: $pid})-[r]-(neighbor {project_id: $pid}) "
+                    "WHERE n.name = $name "
+                    "AND any(lbl IN labels(neighbor) WHERE lbl IN $types) "
+                    "RETURN neighbor.name AS name, labels(neighbor)[0] AS type, "
+                    "type(r) AS rel, r.confidence AS conf",
+                    pid=project_id, name=current, types=NODE_TYPES,
+                ).data()
+                subgraph_data.append({"node": current, "neighbors": neighbors})
+
+                # Roll for movement type
+                roll = random.random()
+                moved = False
+
+                if roll < p_graph:
+                    # Graph walk: follow a random edge
+                    unvisited = [n for n in neighbors
+                                 if n["name"] not in visited]
+                    pool = unvisited if unvisited else neighbors
+                    if pool:
+                        target = random.choice(pool)
+                        current = target["name"]
+                        visited.add(current)
+                        walk_path.append({
+                            "name": current, "type": target["type"],
+                            "hop": "graph", "rel": target["rel"]})
+                        movement_stats["graph"] += 1
+                        moved = True
+
+                elif roll < p_graph + p_semantic:
+                    # Semantic jump: vector search for similar node
+                    try:
+                        results = adapter.vector_search(
+                            current, top_k=8, project_id=project_id)
+                        if results:
+                            jump_candidates = [
+                                r for r in results
+                                if r.get("name") and r["name"] not in visited
+                            ]
+                            if jump_candidates:
+                                target_name = random.choice(
+                                    jump_candidates[:5])["name"]
+                                target_info = session.run(
+                                    "MATCH (n {project_id: $pid, name: $name}) "
+                                    "RETURN n.name AS name, labels(n)[0] AS type "
+                                    "LIMIT 1",
+                                    pid=project_id, name=target_name,
+                                ).data()
+                                if target_info:
+                                    current = target_info[0]["name"]
+                                    visited.add(current)
+                                    walk_path.append({
+                                        "name": current,
+                                        "type": target_info[0]["type"],
+                                        "hop": "semantic"})
+                                    movement_stats["semantic"] += 1
+                                    moved = True
+                    except Exception:
+                        pass  # Semantic jump is optional — fall through
+
+                else:
+                    # Random teleportation: jump to any random node
+                    random_nodes = session.run(
+                        "MATCH (n {project_id: $pid}) "
+                        "WHERE any(lbl IN labels(n) WHERE lbl IN $types) "
+                        "AND n.name <> $current "
+                        "WITH n, rand() AS r ORDER BY r LIMIT 1 "
+                        "RETURN n.name AS name, labels(n)[0] AS type",
+                        pid=project_id, types=NODE_TYPES, current=current,
+                    ).data()
+                    if random_nodes:
+                        target = random_nodes[0]
+                        current = target["name"]
+                        visited.add(current)
+                        walk_path.append({
+                            "name": current, "type": target["type"],
+                            "hop": "random"})
+                        movement_stats["random"] += 1
+                        moved = True
+
+                if not moved:
+                    # Fallback: try graph walk, then random teleport
+                    unvisited = [n for n in neighbors
+                                 if n["name"] not in visited]
+                    pool = unvisited if unvisited else neighbors
+                    if pool:
+                        target = random.choice(pool)
+                        current = target["name"]
+                        visited.add(current)
+                        walk_path.append({
+                            "name": current, "type": target["type"],
+                            "hop": "fallback", "rel": target["rel"]})
+                        movement_stats["graph"] += 1
+                        moved = True
+                    else:
+                        movement_stats["dead_end"] += 1
+                        yield _msg("walk", "dead_end",
+                                   f"Dead end at '{current}' (step {step + 1})")
+                        break
+
+                if step % 5 == 4:  # Progress every 5 steps
+                    yield _msg("walk", "progress",
+                               f"Walk {walk_num + 1}, step {step + 1}/{steps}: "
+                               f"{walk_path[-1]['name']} [{walk_path[-1]['hop']}]",
+                               {"path_length": len(walk_path)})
+
+            # Log access for all visited nodes
+            _log_access(session, project_id, list(visited))
+
+            # Update last_dreamed
+            for v in visited:
+                session.run(
+                    "MATCH (n {project_id: $pid, name: $name}) "
+                    "SET n.last_dreamed = $now",
+                    pid=project_id, name=v, now=now,
+                )
+
+        # LLM analysis of walk
+        yield _msg("walk", "analyzing",
+                   f"Analyzing walk {walk_num + 1} ({len(walk_path)} nodes, "
+                   f"g:{movement_stats['graph']}/s:{movement_stats['semantic']}/"
+                   f"r:{movement_stats['random']})...")
+
+        walk_text = " → ".join(
+            f"{s['name']}{'*' if s['hop'] == 'semantic' else '†' if s['hop'] == 'random' else ''}"
+            for s in walk_path
+        )
+        subgraph_text = ""
+        for sg in subgraph_data:
+            subgraph_text += f"\nNode: {sg['node']}\n"
+            for n in sg["neighbors"][:10]:
+                subgraph_text += (
+                    f"  --[{n['rel']}]--> {n['name']} [{n['type']}] "
+                    f"(conf: {n['conf']})\n"
+                )
+
+        _walk_schema = {
+            "type": "object",
+            "properties": {
+                "observations": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {"type": "string", "enum": [
+                                "surprising_connection", "missing_relationship",
+                                "cross_domain_bridge", "redundancy", "insight",
+                                "contradiction"]},
+                            "description": {"type": "string"},
+                            "entities_involved": {"type": "array",
+                                                  "items": {"type": "string"},
+                                                  "minItems": 2},
+                            "suggested_relationship": {
+                                "type": "string",
+                                "enum": list(RELATIONSHIP_TYPES),
+                            },
+                            "suggested_action": {"type": "string"},
+                        },
+                        "required": ["type", "description",
+                                     "entities_involved"],
+                    },
+                },
+                "walk_quality": {"type": "string",
+                                 "enum": ["productive", "routine", "dead_end"]},
+                "summary": {"type": "string"},
+            },
+            "required": ["observations", "walk_quality", "summary"],
+        }
+        analysis = llm_call(
+            "You analyze knowledge graph walks to find surprising patterns, "
+            "missing relationships, cross-domain bridges, contradictions, "
+            "and insights. The walk path shows nodes visited with movement "
+            "types: plain=graph edge, *=semantic jump, †=random teleportation. "
+            "For observations of type 'missing_relationship', "
+            "'surprising_connection', or 'cross_domain_bridge', always include "
+            "'suggested_relationship' — a relationship type from the enum.",
+            f"Walk path: {walk_text}\n\nSubgraph:\n{subgraph_text}",
+            temperature=0.4,
+            json_schema=_walk_schema,
+            model=_get_walk_model(),
+        )
+
+        walk_result = {
+            "path": walk_path,
+            "analysis": analysis,
+            "nodes_visited": len(visited),
+            "movement_stats": movement_stats,
+        }
+        all_walks.append(walk_result)
+
+        if analysis:
+            yield _msg("walk", "walk_complete",
+                       f"Walk {walk_num + 1}: {analysis.get('walk_quality', '?')} — "
+                       f"{analysis.get('summary', '')[:120]}",
+                       {"walk_quality": analysis.get("walk_quality"),
+                        "observations_count": len(analysis.get("observations", [])),
+                        "movement_stats": movement_stats})
+        else:
+            yield _msg("walk", "walk_complete",
+                       f"Walk {walk_num + 1}: analysis unavailable",
+                       {"walk_quality": "unknown",
+                        "movement_stats": movement_stats})
+
+    observations = []
+    for w in all_walks:
+        if w.get("analysis"):
+            observations.extend(w["analysis"].get("observations", []))
+
+    # --- Provisional Edge Creation ---
+    edges_created = 0
+    edge_details = []
+
+    if create_edges:
+        from datetime import timedelta
+        ttl_days = 7
+        valid_until = (datetime.now(timezone.utc)
+                       + timedelta(days=ttl_days)).isoformat()
+
+        actionable_types = ("missing_relationship", "surprising_connection",
+                            "cross_domain_bridge")
+        actionable = [
+            obs for obs in observations
+            if obs.get("type") in actionable_types
+            and len(obs.get("entities_involved", [])) >= 2
+        ]
+
+        if actionable:
+            yield _msg("walk", "edge_creation_start",
+                       f"Creating {len(actionable)} provisional edge(s)")
+
+            for obs in actionable:
+                entities = obs["entities_involved"]
+                rel_type = obs.get("suggested_relationship", "RELATES_TO")
+                if rel_type not in RELATIONSHIP_TYPES:
+                    rel_type = "RELATES_TO"
+
+                rel = {
+                    "source": entities[0],
+                    "target": entities[1],
+                    "type": rel_type,
+                    "confidence": 0.3,
+                    "reason": f"Dream walk: {obs.get('description', '')[:200]}",
+                    "valid_until": valid_until,
+                }
+
+                try:
+                    count = adapter.write_relationships(
+                        [rel],
+                        source_cycle="dream",
+                        source_type="dream",
+                        project_id=project_id,
+                        actor="dreaming-walk",
+                    )
+                    if count > 0:
+                        edges_created += 1
+                        detail = {
+                            "source": entities[0],
+                            "target": entities[1],
+                            "rel_type": rel_type,
+                            "observation_type": obs["type"],
+                            "valid_until": valid_until,
+                        }
+                        edge_details.append(detail)
+                        yield _msg("walk", "edge_created",
+                                   f"  {entities[0]} --[{rel_type}]--> "
+                                   f"{entities[1]} (conf: 0.3, TTL: {ttl_days}d)",
+                                   detail)
+                except Exception as e:
+                    logger.warning("Walk edge creation failed: %s -> %s: %s",
+                                   entities[0], entities[1], e)
+                    yield _msg("walk", "edge_failed",
+                               f"  Failed: {entities[0]} -> {entities[1]}: {e}")
+
+    total_movement = sum(v for k, v in movement_stats.items()
+                         if k != "dead_end")
+    edge_summary = f", {edges_created} edge(s) created" if edges_created else ""
+    yield _msg("walk", "done",
+               f"Walk complete: {walks} walk(s), {len(observations)} "
+               f"observation(s){edge_summary}",
+               {"walks": walks, "total_steps": total_movement,
+                "observations": len(observations),
+                "edges_created": edges_created})
+
+    return {
+        "phase": "walk",
+        "status": "completed",
+        "walks": all_walks,
+        "observations": observations,
+        "total_observations": len(observations),
+        "edges_created": edges_created,
+        "edge_details": edge_details,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Legacy Phase 1: Replay — kept for backward compatibility
 # ---------------------------------------------------------------------------
 
 def replay(
@@ -1334,6 +1811,83 @@ def maintain(
     yield _msg("maintenance", "start",
                f"Knowledge maintenance ({mode} mode)...")
 
+    # Step 0 (v2.0): TTL extension based on access_count
+    # Nodes with access_count > 0 get their valid_until extended using
+    # linear scaling: TTL_days = base_ttl * (1 + access_count * TTL_SCALE_FACTOR)
+    # Norman's directive: ~10 activations ≈ 1 year
+    yield _msg("maintenance", "ttl_extend_start",
+               "Extending TTLs based on access frequency...")
+    ttl_extended = 0
+    try:
+        with adapter._driver.session() as session:
+            # Find nodes with access_count > 0 AND a valid_until that could expire
+            candidates = session.run(
+                "MATCH (n {project_id: $pid}) "
+                "WHERE n.access_count IS NOT NULL AND n.access_count > 0 "
+                "AND n.valid_until IS NOT NULL "
+                "AND (n.expired_at IS NULL) "
+                "AND any(lbl IN labels(n) WHERE lbl IN $types) "
+                "RETURN n.name AS name, labels(n)[0] AS type, "
+                "n.access_count AS access_count, "
+                "n.valid_until AS valid_until, "
+                "n.created_at AS created_at, "
+                "COALESCE(n.vsm_level, 'S1') AS vsm_level",
+                pid=project_id, types=NODE_TYPES,
+            ).data()
+
+            from merkraum_backend import VSM_DEFAULT_TTL_DAYS
+
+            for c in candidates:
+                ac = c["access_count"]
+                vsm = c.get("vsm_level", "S1")
+                base_ttl = VSM_DEFAULT_TTL_DAYS.get(vsm) or 30
+
+                # S5 nodes are never expired (importance shield)
+                if vsm == "S5":
+                    continue
+
+                new_ttl_days = calculate_ttl_days(base_ttl, ac)
+
+                # Calculate new valid_until from created_at + extended TTL
+                created_at = c.get("created_at")
+                if not created_at:
+                    continue
+
+                try:
+                    from datetime import timedelta
+                    created_dt = datetime.fromisoformat(
+                        created_at.replace("Z", "+00:00"))
+                    new_valid = (created_dt
+                                + timedelta(days=new_ttl_days)).isoformat()
+
+                    # Only extend, never shorten
+                    current_valid = c.get("valid_until", "")
+                    if new_valid > current_valid and not dry_run:
+                        session.run(
+                            "MATCH (n {project_id: $pid, name: $name}) "
+                            "SET n.valid_until = $new_valid, "
+                            "    n.ttl_extended_at = $now, "
+                            "    n.ttl_effective_days = $ttl_days",
+                            pid=project_id, name=c["name"],
+                            new_valid=new_valid,
+                            now=datetime.now(timezone.utc).isoformat(),
+                            ttl_days=new_ttl_days,
+                        )
+                        ttl_extended += 1
+                    elif new_valid > current_valid:
+                        ttl_extended += 1  # Count for dry_run
+                except (ValueError, TypeError):
+                    continue
+
+    except Exception as e:
+        logger.warning("TTL extension failed: %s", e)
+        yield _msg("maintenance", "ttl_extend_error", f"TTL extension error: {e}")
+
+    yield _msg("maintenance", "ttl_extend_done",
+               f"TTL: {ttl_extended} node(s) {'would be ' if dry_run else ''}"
+               f"extended based on access frequency",
+               {"extended": ttl_extended, "scale_factor": TTL_SCALE_FACTOR})
+
     # Step 1: Apply confidence decay
     yield _msg("maintenance", "decay_start", "Applying confidence decay...")
     decay_result = adapter.apply_confidence_decay(
@@ -1451,6 +2005,10 @@ def maintain(
         "phase": "maintenance",
         "status": "completed",
         "mode": mode,
+        "ttl_extended": {
+            "count": ttl_extended,
+            "scale_factor": TTL_SCALE_FACTOR,
+        },
         "decay": {
             "applied": not dry_run,
             "decayed_count": decayed_count,
@@ -1477,11 +2035,13 @@ def maintain(
     }
 
     yield _msg("maintenance", "done",
-               f"Maintenance complete — {decayed_count} decay(s), "
+               f"Maintenance complete — {ttl_extended} TTL extended, "
+               f"{decayed_count} decay(s), "
                f"{expired_count} expired, {pruned_count} pruned, "
                f"{dedup_removed} deduped, "
                f"{total_review} review item(s), health: {health_status}",
-               {"decayed": decayed_count, "expired": expired_count,
+               {"ttl_extended": ttl_extended,
+                "decayed": decayed_count, "expired": expired_count,
                 "pruned": pruned_count, "deduped": dedup_removed,
                 "review_items": total_review, "health": health_status})
 
@@ -1489,73 +2049,135 @@ def maintain(
 
 
 # ---------------------------------------------------------------------------
-# Full Dream Session — orchestrates all four phases
+# Full Dream Session v2.0 — 4-phase orchestrator
 # ---------------------------------------------------------------------------
+
+def _run_phase(gen):
+    """Helper: consume a generator, yielding progress, returning result."""
+    result = None
+    try:
+        while True:
+            yield next(gen)
+    except StopIteration as e:
+        result = e.value
+    return result
+
 
 def dream(
     adapter: Neo4jBaseAdapter,
     project_id: str = "default",
     phases: list[str] | None = None,
-    replay_hops: int = 5,
-    replay_walks: int = 3,
+    # Walk parameters (v2.0)
+    walk_steps: int = 20,
+    walk_count: int = 5,
+    walk_p_graph: float = 0.70,
+    walk_p_semantic: float = 0.20,
+    walk_p_random: float = 0.10,
+    walk_create_edges: bool = True,
+    seed: str | None = None,
+    # Consolidation parameters
     consolidation_threshold: float = 0.75,
     consolidation_dry_run: bool = False,
-    seed: str | None = None,
-    maintenance_dry_run: bool = False,
-    replay_create_edges: bool = True,
-    bridging_pairs: int = 15,
-    bridging_create_edges: bool = True,
     compression_min_cluster: int = 3,
     compression_max_clusters: int = 10,
     compression_dry_run: bool = False,
+    # Maintenance parameters
+    maintenance_dry_run: bool = False,
+    # Legacy parameters (mapped to v2.0 equivalents)
+    replay_hops: int | None = None,
+    replay_walks: int | None = None,
+    replay_create_edges: bool | None = None,
+    bridging_pairs: int = 15,
+    bridging_create_edges: bool = True,
 ) -> Generator[dict, None, dict]:
-    """Run a full dreaming session (replay → consolidation → compression → bridging → reflection → maintenance).
+    """Run a full dreaming session.
+
+    v2.0 architecture: Walk → Consolidate → Reflect → Maintain
+
+    Legacy phase names ('replay', 'bridging', 'compression') are accepted
+    and mapped to v2.0 equivalents for backward compatibility.
 
     Args:
         adapter: Backend adapter (Neo4j + vector store)
         project_id: Project to dream about
-        phases: Which phases to run (default: all six)
-        replay_hops: Steps per random walk
-        replay_walks: Number of random walks
+        phases: Which phases to run (default: all four v2.0 phases)
+        walk_steps: Steps per walk (default 20)
+        walk_count: Number of walks (default 5)
+        walk_p_graph/walk_p_semantic/walk_p_random: Movement probabilities
+        walk_create_edges: Create provisional edges from walk observations
+        seed: Optional starting entity for first walk
         consolidation_threshold: Similarity threshold for belief clustering
-        consolidation_dry_run: If True, preview consolidation without applying
-        seed: Optional starting entity for replay
-        maintenance_dry_run: If True, preview confidence decay without applying
-        replay_create_edges: If True, create provisional edges from dream observations
-        bridging_pairs: Number of distant belief pairs to evaluate (default 15)
-        bridging_create_edges: If True, create provisional edges from bridge discoveries
-        compression_min_cluster: Minimum beliefs per entity for compression (default 3)
-        compression_max_clusters: Maximum clusters to compress per session (default 10)
-        compression_dry_run: If True, preview compressions without applying
+        consolidation_dry_run: Preview consolidation without applying
+        compression_min_cluster: Min beliefs per entity for compression
+        compression_max_clusters: Max clusters to compress
+        compression_dry_run: Preview compression without applying
+        maintenance_dry_run: Preview maintenance without applying
+        replay_hops/replay_walks/replay_create_edges: Legacy aliases
+        bridging_pairs/bridging_create_edges: Legacy (bridging in Walk now)
 
     Yields progress messages. Returns combined result dict.
     """
-    active_phases = phases or ["replay", "consolidation", "compression", "bridging", "reflection", "maintenance"]
+    # Map legacy parameters
+    if replay_hops is not None:
+        walk_steps = replay_hops
+    if replay_walks is not None:
+        walk_count = replay_walks
+    if replay_create_edges is not None:
+        walk_create_edges = replay_create_edges
+
+    # Map legacy phase names to v2.0
+    v2_default = ["walk", "consolidation", "reflection", "maintenance"]
+    if phases is None:
+        active_phases = v2_default
+    else:
+        active_phases = []
+        for p in phases:
+            if p in ("replay", "bridging"):
+                if "walk" not in active_phases:
+                    active_phases.append("walk")
+            elif p == "compression":
+                if "consolidation" not in active_phases:
+                    active_phases.append("consolidation")
+            elif p in ("walk", "consolidation", "reflection", "maintenance"):
+                if p not in active_phases:
+                    active_phases.append(p)
+
     session_id = str(uuid.uuid4())[:8]
     start_time = time.time()
 
     yield _msg("dream", "session_start",
-               f"Dream session {session_id} — phases: {', '.join(active_phases)}",
-               {"session_id": session_id, "phases": active_phases})
+               f"Dream session {session_id} (v2.0) — "
+               f"phases: {', '.join(active_phases)}",
+               {"session_id": session_id, "phases": active_phases,
+                "architecture": "v2.0"})
 
-    results = {"session_id": session_id, "phases": {}}
+    results = {"session_id": session_id, "phases": {},
+               "architecture": "v2.0"}
 
-    if "replay" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 1: Replay (hippocampal)")
-        gen = replay(adapter, project_id, hops=replay_hops,
-                     walks=replay_walks, seed=seed,
-                     create_edges=replay_create_edges)
-        replay_result = None
+    # Phase 1: Walk (replaces replay + bridging)
+    if "walk" in active_phases:
+        yield _msg("dream", "phase_start",
+                   "Phase 1: Walk (hippocampal replay + free association)")
+        gen = walk(adapter, project_id,
+                   steps=walk_steps, walks=walk_count,
+                   p_graph=walk_p_graph, p_semantic=walk_p_semantic,
+                   p_random=walk_p_random,
+                   create_edges=walk_create_edges, seed=seed)
+        walk_result = None
         try:
             while True:
                 progress = next(gen)
                 yield progress
         except StopIteration as e:
-            replay_result = e.value
-        results["phases"]["replay"] = replay_result or {}
+            walk_result = e.value
+        results["phases"]["walk"] = walk_result or {}
 
+    # Phase 2: Consolidation (merging + compression)
     if "consolidation" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 2: Consolidation (memory transfer)")
+        yield _msg("dream", "phase_start",
+                   "Phase 2: Consolidation (memory transfer + compression)")
+
+        # 2a: Textual similarity consolidation
         gen = consolidate(adapter, project_id,
                           similarity_threshold=consolidation_threshold,
                           dry_run=consolidation_dry_run)
@@ -1568,8 +2190,7 @@ def dream(
             consolidation_result = e.value
         results["phases"]["consolidation"] = consolidation_result or {}
 
-    if "compression" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 3: Compression (topic abstraction)")
+        # 2b: Entity-based compression
         gen = compress(adapter, project_id,
                        min_cluster_size=compression_min_cluster,
                        max_clusters=compression_max_clusters,
@@ -1583,21 +2204,10 @@ def dream(
             compression_result = e.value
         results["phases"]["compression"] = compression_result or {}
 
-    if "bridging" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 4: Bridging (cross-domain free association)")
-        gen = bridge(adapter, project_id, pairs=bridging_pairs,
-                     create_edges=bridging_create_edges)
-        bridging_result = None
-        try:
-            while True:
-                progress = next(gen)
-                yield progress
-        except StopIteration as e:
-            bridging_result = e.value
-        results["phases"]["bridging"] = bridging_result or {}
-
+    # Phase 3: Reflection (structural health)
     if "reflection" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 5: Reflection (structural health)")
+        yield _msg("dream", "phase_start",
+                   "Phase 3: Reflection (structural health)")
         gen = reflect(adapter, project_id)
         reflection_result = None
         try:
@@ -1608,8 +2218,10 @@ def dream(
             reflection_result = e.value
         results["phases"]["reflection"] = reflection_result or {}
 
+    # Phase 4: Maintenance (synaptic pruning)
     if "maintenance" in active_phases:
-        yield _msg("dream", "phase_start", "Phase 6: Maintenance (synaptic pruning)")
+        yield _msg("dream", "phase_start",
+                   "Phase 4: Maintenance (synaptic pruning)")
         gen = maintain(adapter, project_id, dry_run=maintenance_dry_run)
         maintenance_result = None
         try:

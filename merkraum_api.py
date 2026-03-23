@@ -1275,9 +1275,13 @@ def get_dreaming_config(project_id):
             "dreaming_enabled": project.get("dreaming_enabled", False),
             "dreaming_schedule": project.get("dreaming_schedule", "manual"),
             "dreaming_config": dreaming_config_raw or {
-                "replay_walks": 3,
-                "replay_hops": 5,
+                "walk_steps": 20,
+                "walk_count": 5,
+                "walk_p_graph": 0.70,
+                "walk_p_semantic": 0.20,
+                "walk_p_random": 0.10,
                 "consolidation_threshold": 0.75,
+                "architecture": "v2.0",
             },
             "models": _get_dreaming_model_config(),
         })
@@ -2962,18 +2966,28 @@ def _run_dream_job(job_id: str):
             adp,
             project_id=job["project_id"],
             phases=job.get("phases"),
-            replay_hops=job.get("replay_hops", 5),
-            replay_walks=job.get("replay_walks", 3),
+            # v2.0 Walk parameters
+            walk_steps=job.get("walk_steps", 20),
+            walk_count=job.get("walk_count", 5),
+            walk_p_graph=job.get("walk_p_graph", 0.70),
+            walk_p_semantic=job.get("walk_p_semantic", 0.20),
+            walk_p_random=job.get("walk_p_random", 0.10),
+            walk_create_edges=job.get("walk_create_edges", True),
+            seed=job.get("seed"),
+            # Consolidation
             consolidation_threshold=job.get("consolidation_threshold", 0.75),
             consolidation_dry_run=job.get("consolidation_dry_run", False),
-            seed=job.get("seed"),
-            maintenance_dry_run=job.get("maintenance_dry_run", False),
-            replay_create_edges=job.get("replay_create_edges", True),
-            bridging_pairs=job.get("bridging_pairs", 15),
-            bridging_create_edges=job.get("bridging_create_edges", True),
             compression_min_cluster=job.get("compression_min_cluster", 3),
             compression_max_clusters=job.get("compression_max_clusters", 10),
             compression_dry_run=job.get("compression_dry_run", False),
+            # Maintenance
+            maintenance_dry_run=job.get("maintenance_dry_run", False),
+            # Legacy (for backward compat within dream())
+            replay_hops=job.get("replay_hops"),
+            replay_walks=job.get("replay_walks"),
+            replay_create_edges=job.get("replay_create_edges"),
+            bridging_pairs=job.get("bridging_pairs", 15),
+            bridging_create_edges=job.get("bridging_create_edges", True),
         )
         result = None
         try:
@@ -3002,20 +3016,31 @@ def _run_dream_job(job_id: str):
 def dream_trigger():
     """Trigger a dream session (async). Returns job_id for status polling / SSE.
 
+    Architecture v2.0: 4 phases (Walk → Consolidate → Reflect → Maintain).
+    Legacy phase names accepted for backward compatibility.
+
     Request body (all optional):
-        phases: ["replay", "consolidation", "compression", "bridging", "reflection", "maintenance"]
-        replay_hops: int (default 5)
-        replay_walks: int (default 3)
-        replay_create_edges: bool (default true) — create provisional edges from dream observations
+        phases: ["walk", "consolidation", "reflection", "maintenance"]
+            Legacy names also accepted: "replay"→walk, "bridging"→walk, "compression"→consolidation
+        walk_steps: int (default 20, max 50) — steps per walk
+        walk_count: int (default 5, max 15) — number of walks
+        walk_p_graph: float (default 0.70) — probability of graph walk
+        walk_p_semantic: float (default 0.20) — probability of semantic jump
+        walk_p_random: float (default 0.10) — probability of random teleportation
+        walk_create_edges: bool (default true) — create provisional edges from walk
         consolidation_threshold: float (default 0.75)
         consolidation_dry_run: bool (default false)
-        compression_min_cluster: int (default 3) — minimum beliefs per entity for topic compression
-        compression_max_clusters: int (default 10, max 20) — max entity clusters to compress
+        compression_min_cluster: int (default 3) — minimum beliefs per entity
+        compression_max_clusters: int (default 10, max 20) — max clusters
         compression_dry_run: bool (default false)
-        bridging_pairs: int (default 15, max 30) — number of distant belief pairs to evaluate
-        bridging_create_edges: bool (default true) — create provisional edges from bridge discoveries
         maintenance_dry_run: bool (default false)
-        seed: str (optional starting entity for replay)
+        seed: str (optional starting entity for first walk)
+        # Legacy parameters (mapped to v2.0):
+        replay_hops: int → walk_steps
+        replay_walks: int → walk_count
+        replay_create_edges: bool → walk_create_edges
+        bridging_pairs: int (legacy, bridging now in walk)
+        bridging_create_edges: bool (legacy)
     """
     project = _project_id()
     denied = _deny_if_project_forbidden(project)
@@ -3049,17 +3074,27 @@ def dream_trigger():
             "created_at": time.time(),
             "messages": [],
             "phases": body.get("phases"),
-            "replay_hops": min(body.get("replay_hops", 5), 10),
-            "replay_walks": min(body.get("replay_walks", 3), 5),
+            # v2.0 Walk parameters
+            "walk_steps": min(body.get("walk_steps", body.get("replay_hops", 20)), 50),
+            "walk_count": min(body.get("walk_count", body.get("replay_walks", 5)), 15),
+            "walk_p_graph": body.get("walk_p_graph", 0.70),
+            "walk_p_semantic": body.get("walk_p_semantic", 0.20),
+            "walk_p_random": body.get("walk_p_random", 0.10),
+            "walk_create_edges": body.get("walk_create_edges", body.get("replay_create_edges", True)),
+            # Consolidation parameters
             "consolidation_threshold": body.get("consolidation_threshold", 0.75),
             "consolidation_dry_run": body.get("consolidation_dry_run", False),
-            "bridging_pairs": min(body.get("bridging_pairs", 15), 30),
-            "bridging_create_edges": body.get("bridging_create_edges", True),
             "compression_min_cluster": max(2, min(body.get("compression_min_cluster", 3), 10)),
             "compression_max_clusters": min(body.get("compression_max_clusters", 10), 20),
             "compression_dry_run": body.get("compression_dry_run", False),
+            # Maintenance parameters
             "maintenance_dry_run": body.get("maintenance_dry_run", False),
+            # Legacy parameters (for backward compat in _run_dream_job)
+            "replay_hops": min(body.get("replay_hops", 20), 50),
+            "replay_walks": min(body.get("replay_walks", 5), 15),
             "replay_create_edges": body.get("replay_create_edges", True),
+            "bridging_pairs": min(body.get("bridging_pairs", 15), 30),
+            "bridging_create_edges": body.get("bridging_create_edges", True),
             "seed": body.get("seed"),
         }
 

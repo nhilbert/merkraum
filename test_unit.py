@@ -3148,8 +3148,8 @@ class TestDreamingBridging(unittest.TestCase):
         self.assertEqual(result["edges_created"], 1)
 
     @patch("merkraum_dreaming.llm_call")
-    def test_dream_includes_bridging_by_default(self, mock_llm):
-        """The dream() orchestrator should include bridging phase by default."""
+    def test_dream_includes_walk_by_default(self, mock_llm):
+        """v2.0: dream() includes walk phase (replaces replay + bridging)."""
         from merkraum_dreaming import dream
 
         mock_llm.return_value = None
@@ -3170,11 +3170,12 @@ class TestDreamingBridging(unittest.TestCase):
 
         messages, result = self._run_generator(dream(adapter, "test-proj"))
 
-        # Bridging phase should be present in results
-        self.assertIn("bridging", result["phases"])
-        # Check that bridging phase start message exists
-        bridging_msgs = [m for m in messages if m.get("phase") == "bridging"]
-        self.assertGreater(len(bridging_msgs), 0)
+        # v2.0: walk phase replaces replay + bridging
+        self.assertIn("walk", result["phases"])
+        self.assertEqual(result.get("architecture"), "v2.0")
+        # Walk phase messages should exist
+        walk_msgs = [m for m in messages if m.get("phase") == "walk"]
+        self.assertGreater(len(walk_msgs), 0)
 
 
 class TestReconstructAt(unittest.TestCase):
@@ -3953,6 +3954,246 @@ class TestDreamingCompression(unittest.TestCase):
         from merkraum_dreaming import _get_compression_model
         with patch.dict(os.environ, {"MERKRAUM_DREAMING_COMPRESSION_MODEL": "custom-model"}):
             self.assertEqual(_get_compression_model(), "custom-model")
+
+
+# ---------------------------------------------------------------------------
+# v2.0 Walk + TTL tests
+# ---------------------------------------------------------------------------
+
+
+class TestDreamingWalk(unittest.TestCase):
+    """Test the v2.0 walk() function."""
+
+    def _run_generator(self, gen):
+        messages = []
+        result = None
+        try:
+            while True:
+                messages.append(next(gen))
+        except StopIteration as e:
+            result = e.value
+        return messages, result
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_walk_empty_graph(self, mock_llm):
+        """Walk on empty graph returns empty status."""
+        from merkraum_dreaming import walk
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(data=lambda: [])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+
+        messages, result = self._run_generator(
+            walk(adapter, "test-proj", steps=5, walks=1))
+
+        self.assertEqual(result["phase"], "walk")
+        self.assertEqual(result["status"], "empty")
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_walk_creates_edges_from_cross_domain_bridge(self, mock_llm):
+        """Walk should create edges for cross_domain_bridge observations."""
+        from merkraum_dreaming import walk
+
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+
+        # First call: entry point candidates
+        # Second+: neighbors
+        call_count = {"n": 0}
+        def mock_run(*args, **kwargs):
+            call_count["n"] += 1
+            query = args[0] if args else kwargs.get("query", "")
+            mock_result = MagicMock()
+            if "activation_score" in query:
+                mock_result.data = lambda: [{"name": "NodeA", "type": "Concept",
+                                              "ac": 5, "recency": 0.5,
+                                              "activation_score": 3.0,
+                                              "access_count": 5}]
+            elif "neighbor" in query:
+                mock_result.data = lambda: []
+            else:
+                mock_result.data = lambda: []
+            return mock_result
+
+        mock_session.run = mock_run
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+
+        mock_llm.return_value = {
+            "observations": [{
+                "type": "cross_domain_bridge",
+                "description": "Found bridge between concepts",
+                "entities_involved": ["NodeA", "NodeB"],
+                "suggested_relationship": "COMPLEMENTS",
+            }],
+            "walk_quality": "productive",
+            "summary": "Good walk",
+        }
+        adapter.write_relationships.return_value = 1
+
+        messages, result = self._run_generator(
+            walk(adapter, "test-proj", steps=2, walks=1))
+
+        self.assertEqual(result["phase"], "walk")
+        self.assertEqual(result["edges_created"], 1)
+        self.assertEqual(result["edge_details"][0]["observation_type"],
+                         "cross_domain_bridge")
+
+    def test_walk_default_probabilities(self):
+        """Walk default probabilities should be 70/20/10."""
+        import inspect
+        from merkraum_dreaming import walk
+        sig = inspect.signature(walk)
+        self.assertAlmostEqual(sig.parameters["p_graph"].default, 0.70)
+        self.assertAlmostEqual(sig.parameters["p_semantic"].default, 0.20)
+        self.assertAlmostEqual(sig.parameters["p_random"].default, 0.10)
+
+
+class TestTTLScaling(unittest.TestCase):
+    """Test the v2.0 TTL scaling formula."""
+
+    def test_zero_activations(self):
+        from merkraum_dreaming import calculate_ttl_days
+        self.assertEqual(calculate_ttl_days(30, 0), 30)
+
+    def test_ten_activations_approx_one_year(self):
+        from merkraum_dreaming import calculate_ttl_days
+        result = calculate_ttl_days(30, 10)
+        # ~10 activations should be ~365 days (Norman's directive)
+        self.assertGreater(result, 350)
+        self.assertLess(result, 400)
+
+    def test_never_shrinks(self):
+        """TTL should grow monotonically with access_count."""
+        from merkraum_dreaming import calculate_ttl_days
+        prev = 0
+        for ac in range(20):
+            current = calculate_ttl_days(30, ac)
+            self.assertGreaterEqual(current, prev)
+            prev = current
+
+    def test_custom_scale_factor(self):
+        from merkraum_dreaming import calculate_ttl_days
+        result = calculate_ttl_days(30, 5, scale_factor=2.0)
+        self.assertEqual(result, 30 * (1 + 5 * 2))
+
+
+class TestAccessLogging(unittest.TestCase):
+    """Test access logging infrastructure."""
+
+    def test_log_access_increments_count(self):
+        from merkraum_dreaming import _log_access
+        mock_session = MagicMock()
+        _log_access(mock_session, "test-proj", ["Node1", "Node2"])
+        mock_session.run.assert_called_once()
+        call_args = mock_session.run.call_args
+        self.assertIn("access_count", call_args[0][0])
+        self.assertIn("last_accessed", call_args[0][0])
+
+    def test_log_access_empty_names(self):
+        from merkraum_dreaming import _log_access
+        mock_session = MagicMock()
+        _log_access(mock_session, "test-proj", [])
+        mock_session.run.assert_not_called()
+
+
+class TestDreamV2Legacy(unittest.TestCase):
+    """Test backward compatibility of dream() v2.0."""
+
+    def _run_generator(self, gen):
+        messages = []
+        result = None
+        try:
+            while True:
+                messages.append(next(gen))
+        except StopIteration as e:
+            result = e.value
+        return messages, result
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_legacy_replay_phase_maps_to_walk(self, mock_llm):
+        """Passing phases=['replay'] should run walk phase."""
+        from merkraum_dreaming import dream
+
+        mock_llm.return_value = None
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(data=lambda: [])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+
+        messages, result = self._run_generator(
+            dream(adapter, "test-proj", phases=["replay"]))
+
+        self.assertIn("walk", result["phases"])
+        self.assertNotIn("replay", result["phases"])
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_legacy_bridging_phase_maps_to_walk(self, mock_llm):
+        """Passing phases=['bridging'] should run walk phase."""
+        from merkraum_dreaming import dream
+
+        mock_llm.return_value = None
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(data=lambda: [])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+
+        messages, result = self._run_generator(
+            dream(adapter, "test-proj", phases=["bridging"]))
+
+        self.assertIn("walk", result["phases"])
+
+    @patch("merkraum_dreaming.llm_call")
+    def test_dream_v2_architecture_field(self, mock_llm):
+        """dream() result should include architecture='v2.0'."""
+        from merkraum_dreaming import dream
+
+        mock_llm.return_value = None
+        adapter = MagicMock(spec=Neo4jBaseAdapter)
+        mock_session = MagicMock()
+        mock_session.run.return_value = MagicMock(data=lambda: [])
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        adapter._driver.session.return_value = mock_session
+        adapter.apply_confidence_decay.return_value = {"total": 0, "unchanged": 0, "decayed": []}
+        adapter.expire_nodes.return_value = {"total": 0, "expired": []}
+        adapter.prune_orphan_nodes.return_value = {"total": 0, "pruned": []}
+        adapter.deduplicate_edges.return_value = {"duplicates_found": 0, "edges_removed": 0}
+        adapter.get_certainty_review_queue.return_value = {"categories": {}}
+        adapter.get_certainty_stats.return_value = {"governance": {"status": "healthy"}}
+
+        messages, result = self._run_generator(dream(adapter, "test-proj"))
+
+        self.assertEqual(result["architecture"], "v2.0")
+        self.assertIn("walk", result["phases"])
+        self.assertIn("consolidation", result["phases"])
+        self.assertIn("reflection", result["phases"])
+        self.assertIn("maintenance", result["phases"])
+
+    def test_walk_model_defaults_to_haiku(self):
+        """Walk model should default to Haiku (cost-efficient)."""
+        from merkraum_dreaming import _get_walk_model
+        with patch.dict(os.environ, {}, clear=False):
+            for key in ["MERKRAUM_DREAMING_WALK_MODEL", "MERKRAUM_DREAMING_REPLAY_MODEL"]:
+                os.environ.pop(key, None)
+            self.assertIn("haiku", _get_walk_model().lower())
+
+    def test_dreaming_config_has_v2_fields(self):
+        """get_dreaming_config() should include v2.0 fields."""
+        from merkraum_dreaming import get_dreaming_config
+        config = get_dreaming_config()
+        self.assertIn("walk_model", config)
+        self.assertIn("architecture_version", config)
+        self.assertEqual(config["architecture_version"], "2.0")
+        self.assertIn("ttl_scale_factor", config)
 
 
 if __name__ == "__main__":
