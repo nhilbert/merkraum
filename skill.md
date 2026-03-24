@@ -1,95 +1,359 @@
-# Merkraum — Structured Knowledge Graph Memory for AI Agents
+---
+name: merkraum
+version: 1.2.0
+description: |
+  Merkraum is a structured knowledge graph memory layer for AI agents.
+  It provides persistent, queryable memory with belief tracking, contradiction
+  detection, and provenance — accessible via MCP tools directly inside Claude Code.
+  Use Merkraum when you need memory that persists across sessions, tracks confidence,
+  or models relationships between entities.
+license: BSL 1.1
+metadata:
+  author: Supervision Rheinland (Dr. Norman Hilbert)
+  homepage: https://merkraum.de
+  documentation: https://www.merkraum.de/docs
+  mcp_endpoint: https://agent.nhilbert.de/mcp/merkraum/
+  rest_base: https://agent.nhilbert.de/api/merkraum
+  discovery: https://agent.nhilbert.de/api/merkraum/api/discover
+  well_known: https://agent.nhilbert.de/.well-known/skill.md
+  agent_spec: https://agent.nhilbert.de/api/merkraum/AGENT_SPEC.json
+---
 
-> Machine-addressable memory with belief tracking, contradiction detection, and provenance.
+# Merkraum — Knowledge Graph Memory for Claude Code
 
-## What Merkraum Does
+Merkraum gives Claude Code agents persistent, structured memory. Unlike flat
+key-value stores, Merkraum treats knowledge as propositions: entities with
+typed relationships, beliefs with confidence scores, and explicit contradiction
+tracking. Memory persists across sessions, decays with time when appropriate,
+and is queryable by semantic similarity or graph structure.
 
-Merkraum provides persistent, structured memory for AI agents via a knowledge graph (Neo4j) and semantic/vector search (Qdrant or Pinecone, depending on deployment). Unlike flat key-value memory stores, Merkraum tracks **beliefs** — propositions with confidence scores, provenance, and explicit contradiction relationships.
+## When to Use
 
-### Core Capabilities
+Use Merkraum when:
 
-- **Semantic Search**: Vector-based retrieval across your knowledge graph
-- **Hybrid Query Strategy**: Semantic-first retrieval with deterministic text-search fallback for recall-critical use cases
-- **Knowledge Ingestion**: Extract entities and relationships from text via LLM pipeline
-- **Graph Traversal**: Multi-hop exploration of entity relationships
-- **Belief Tracking**: Store beliefs with confidence, status (active/uncertain/contradicted/superseded), and provenance
-- **Contradiction Detection**: Automatic identification of conflicting beliefs
-- **Multi-Project Isolation**: Separate knowledge spaces per project
+- You need to remember facts, decisions, or context across Claude Code sessions
+- You want to track beliefs with confidence and see when they contradict
+- You need to model relationships between people, projects, concepts, or events
+- You are building an agent that should accumulate knowledge over time
+- You want to recall what you knew at a prior point in time (audit trail)
 
-### Supported Operations
+Do not use Merkraum for:
+- Temporary session state (use local variables or CLAUDE.md instead)
+- Large binary blobs or raw file storage
+- Bulk operational logs or telemetry (only ingest knowledge worth remembering)
 
-| Operation | Method | Endpoint | Description |
-|-----------|--------|----------|-------------|
-| Search | GET | `/api/search?q=<query>` | Semantic vector search |
-| Graph Search | GET | `/api/graph?q=<query>&search_mode=semantic|text` | Query-centered subgraph retrieval (supports `hops` and `top`) |
-| Ingest (structured) | POST | `/api/ingest` | Write entities and relationships |
-| Ingest (text) | POST | `/api/ingest/text` | LLM extraction + graph write |
-| Traverse | GET | `/api/traverse/<entity>` | Multi-hop graph walk |
-| Beliefs | GET | `/api/beliefs` | List beliefs by status |
-| Stats | GET | `/api/stats` | Graph statistics |
-| Graph | GET | `/api/graph` | Full graph for visualization |
-| Nodes | GET | `/api/nodes` | Query nodes by type |
-| Health | GET | `/api/health` | Service health check |
-| Discover | GET | `/api/discover` | Machine-readable capabilities |
-| Vector Reindex | POST | `/api/projects/<id>/vectors/reindex` | Rebuild vector index for existing project nodes |
+## MCP Setup (Claude Code)
 
-## Vector Freshness
+Add to your MCP client configuration (`~/.claude/mcp_settings.json` or project-level):
 
-- New nodes are vector-indexed during entity writes (`write_entities`) to keep semantic retrieval up to date.
-- Existing/legacy nodes can be reindexed per project via `POST /api/projects/<id>/vectors/reindex`.
-- Reindex response includes: `upserted`, `failed`, `total_nodes`, `truncated`, and `limit`.
+```json
+{
+  "mcpServers": {
+    "merkraum": {
+      "url": "https://agent.nhilbert.de/mcp/merkraum/",
+      "auth": {
+        "type": "oauth2",
+        "provider": "cognito",
+        "domain": "merkraum.auth.eu-central-1.amazoncognito.com"
+      }
+    }
+  }
+}
+```
 
-## Schema
+Alternatively, use a Personal Access Token (PAT) for non-interactive environments:
+
+```json
+{
+  "mcpServers": {
+    "merkraum": {
+      "url": "https://agent.nhilbert.de/mcp/merkraum/",
+      "headers": {
+        "Authorization": "Bearer mk_pat_<your_token>"
+      }
+    }
+  }
+}
+```
+
+Create a PAT at https://merkraum.de → Settings → Access Tokens. Scopes: `read`, `search`, `ingest`, `projects`.
+
+## Core Concepts
+
+### Projects
+Each user has a default project (auto-provisioned on first connection, keyed to
+your Cognito identity). You can create additional projects for topic isolation.
+All knowledge is scoped to a project — agents cannot read across project
+boundaries without explicit grants.
 
 ### Node Types
-Person, Organization, Project, Concept, Regulation, Event, Belief, Artifact, Interview, Quote
+`Person`, `Organization`, `Project`, `Concept`, `Regulation`, `Event`,
+`Belief`, `Artifact`, `Interview`, `Quote`
 
 ### Relationship Types
-SUPPORTS, CONTRADICTS, COMPLEMENTS, SUPERSEDES, EXTENDS, REFINES, CREATED_BY, AFFILIATED_WITH, APPLIES, IMPLEMENTS, PARTICIPATED_IN, PRODUCES, REFERENCES, TEMPORAL, MENTIONS, PART_OF
+`SUPPORTS`, `CONTRADICTS`, `COMPLEMENTS`, `SUPERSEDES`, `EXTENDS`, `REFINES`,
+`CREATED_BY`, `AFFILIATED_WITH`, `APPLIES`, `IMPLEMENTS`, `PARTICIPATED_IN`,
+`PRODUCES`, `REFERENCES`, `TEMPORAL`, `MENTIONS`, `PART_OF`
 
-## Authentication
+### Beliefs
+A `Belief` node is a proposition with:
+- `confidence` (0.0–1.0) — how certain the agent is
+- `status` — `active`, `uncertain`, `contradicted`, or `superseded`
+- `provenance` — source label for traceability
+- `knowledge_type` — `fact` (permanent), `state` (temporary), `rule` (policy),
+  `belief` (subjective), `memory` (episodic)
+- `valid_until` — optional expiry date for temporal knowledge
 
-All endpoints require a valid JWT token from AWS Cognito.
+## MCP Tool Reference
 
-- **Header**: `Authorization: Bearer <jwt_token>`
-- **Provider**: AWS Cognito (eu-central-1)
-- **Flow**: OAuth 2.0 Authorization Code with PKCE
+All tools use your default project unless `project` is specified.
+
+### Memory Retrieval
+
+**`search_knowledge`** — Semantic search across the knowledge graph.
+```
+query: str           # natural language query
+top_k: int = 5       # results to return (max 20)
+project: str = None  # project ID (default: personal space)
+```
+Use first — retrieve before producing. Score ≥ 0.35 indicates a strong match.
+
+**`traverse_graph`** — Walk graph from an entity, following relationships.
+```
+entity: str          # entity name to start from
+depth: int = 2       # hops to traverse (max 4)
+project: str = None
+```
+Use after search to explore the neighborhood of a matched entity.
+
+**`list_beliefs`** — List beliefs filtered by status.
+```
+status: str = "active"   # active | uncertain | contradicted | superseded
+knowledge_type: str = None  # fact | state | rule | belief | memory
+project: str = None
+```
+Use to surface active knowledge or review contradictions before acting.
+
+**`query_nodes`** — Query entities by type.
+```
+node_type: str = None   # Person | Concept | Event | ... (None = all)
+limit: int = 50         # max 200
+project: str = None
+```
+Use to enumerate all entities of a given type.
+
+### Memory Writing
+
+**`add_knowledge`** — Add a single entity to the graph.
+```
+name: str             # unique entity name
+summary: str          # what this entity is or means
+node_type: str = "Concept"   # see node types above
+confidence: float = 0.7      # for Belief nodes only
+project: str = None
+```
+Use for atomic facts, entities, or beliefs worth remembering.
+
+**`add_relationship`** — Link two entities with a typed relationship.
+```
+entity_a: str
+entity_b: str
+relationship_type: str   # see relationship types above
+reason: str = None       # why this relationship holds
+project: str = None
+```
+Use after add_knowledge to model how entities relate.
+
+**`update_belief`** — Update confidence, status, or summary of an existing belief.
+```
+name: str
+confidence: float = None   # new confidence (0.0–1.0)
+status: str = None         # active | superseded
+summary: str = None        # new summary text
+project: str = None
+```
+Use when evidence changes your assessment of a proposition.
+
+**`ingest_knowledge`** — Free-text ingestion via LLM extraction (async).
+```
+text: str       # raw text to extract knowledge from (max 10,240 chars)
+project: str = None
+```
+Returns a `job_id`. Use `check_ingestion_status` to poll for completion.
+Use for longer texts where structured entity extraction is needed.
+
+**`check_ingestion_status`** — Poll an async ingestion job.
+```
+job_id: str     # returned by ingest_knowledge
+```
+
+### Belief Maintenance
+
+**`consolidate_beliefs`** — Resolve a contradiction between two beliefs.
+```
+belief_a: str    # name of first belief
+belief_b: str    # name of second belief
+resolution: str  # free-text explanation of how to resolve
+project: str = None
+```
+Use to close contradictions surfaced by `list_beliefs(status="contradicted")`.
+
+**`expire_nodes`** — Apply managed forgetting: mark nodes past `valid_until`.
+```
+project: str = None
+dry_run: bool = False   # preview without mutating
+```
+Use periodically to keep knowledge fresh. Respects `valid_until` dates.
+
+**`renew_node`** — Extend the validity of a node that would otherwise expire.
+```
+name: str
+days: int = 90    # extend by N days from today
+project: str = None
+```
+
+### Certainty Governance
+
+**`certainty_decay`** — Apply time-based confidence decay to active beliefs.
+```
+project: str = None
+dry_run: bool = False
+```
+Use in periodic maintenance cycles to reduce confidence of aging beliefs.
+
+**`certainty_review`** — Surface beliefs whose confidence has decayed below threshold.
+```
+threshold: float = 0.4
+project: str = None
+```
+Use to find beliefs that need human review or reconfirmation.
+
+**`certainty_stats`** — Confidence distribution statistics.
+```
+project: str = None
+```
+
+### Audit Trail
+
+**`get_history`** — Retrieve the change history of an entity.
+```
+entity: str
+limit: int = 20
+project: str = None
+```
+
+**`reconstruct_entity`** — Reconstruct entity state at a past point in time.
+```
+entity: str
+timestamp: str    # ISO 8601 datetime
+project: str = None
+```
+
+**`verify_audit_chain`** — Verify the hash-chain integrity of the audit log.
+```
+project: str = None
+limit: int = 100
+```
+
+### Maintenance
+
+**`deduplicate_edges`** — Remove duplicate relationships in the graph.
+```
+project: str = None
+dry_run: bool = False
+```
+
+**`get_graph_stats`** — Graph statistics: node counts by type, edge totals.
+```
+project: str = None
+```
+
+**`get_usage`** — Current usage vs. tier limits.
+```
+project: str = None
+```
+
+**`health_check`** — Verify backends (Neo4j, Qdrant) are healthy.
+
+## Recommended Workflows
+
+### Session Start: Retrieve Before Producing
+```
+1. search_knowledge("<current topic>", top_k=5)
+2. If score ≥ 0.35: traverse_graph("<matched entity>", depth=2)
+3. list_beliefs(status="active") — review active beliefs on topic
+4. list_beliefs(status="contradicted") — check for open contradictions
+5. Now produce output informed by existing memory
+```
+
+### Recording a Decision or Finding
+```
+1. add_knowledge(name="<decision>", summary="<what was decided and why>",
+                 node_type="Belief", confidence=0.85)
+2. add_relationship(entity_a="<decision>", entity_b="<context entity>",
+                    relationship_type="REFERENCES", reason="<why linked>")
+3. If this supersedes a prior belief:
+   update_belief(name="<old belief>", status="superseded")
+   add_relationship(entity_a="<new>", entity_b="<old>",
+                    relationship_type="SUPERSEDES")
+```
+
+### Ingesting a Document or Long Text
+```
+1. ingest_knowledge(text="<content>") → returns job_id
+2. check_ingestion_status(job_id=<id>) — poll until status="completed"
+3. search_knowledge("<topic>") to verify extraction
+```
+
+### Periodic Maintenance
+```
+1. certainty_decay() — reduce confidence of aging beliefs
+2. certainty_review(threshold=0.4) — surface beliefs needing attention
+3. expire_nodes(dry_run=True) — preview what would be forgotten
+4. expire_nodes() — apply managed forgetting
+5. deduplicate_edges() — clean up graph
+```
+
+## What Not to Ingest
+
+Following the principle that memory is for knowledge worth keeping (not operational telemetry):
+
+- **YES**: Decisions, new findings, beliefs, entity relationships, contradictions resolved, novel insights
+- **NO**: Routine status updates, timer values, cycle counters, acknowledgements, raw logs, temporary context
+
+## Safety
+
+- All data is project-isolated. Agents cannot access other projects without grants.
+- Authentication is mandatory in production (OAuth 2.0 PKCE or PAT).
+- Node limits are enforced server-side per pricing tier.
+- All data stored in EU (eu-central-1 Frankfurt). No data leaves EU.
+- Every tool call is audit-logged with timestamp, user ID, and parameters.
 
 ## Pricing Tiers
 
-| Tier | Node Limit | Description |
-|------|-----------|-------------|
-| Free | 100 nodes | Evaluation and personal projects |
-| Pro | 1,000 nodes | Individual professionals |
-| Team | 5,000 nodes | Small teams |
-| Enterprise | 50,000 nodes | Organizations |
+| Tier       | Node Limit | Price         |
+|------------|-----------|---------------|
+| Free       | 100       | EUR 0/month   |
+| Pro        | 1,000     | EUR 19/month  |
+| Team       | 5,000     | EUR 49/month  |
+| Enterprise | 50,000    | Custom        |
 
-## MCP Server
+Free tier is sufficient for personal agent memory experiments. Check your
+current usage with `get_usage()`.
 
-Merkraum also exposes tools via the Model Context Protocol (MCP) for direct integration with Claude, Cursor, and other MCP-compatible clients.
+## Discovery
 
-- **Endpoint**: `https://agent.nhilbert.de/mcp/merkraum/`
-- **Auth**: OAuth 2.0 PKCE (Cognito)
-- **Tools**: search, ingest, traverse, beliefs, stats
+An MCP-compatible agent can discover Merkraum's full capabilities at runtime:
 
-## Getting Started
+```
+GET https://agent.nhilbert.de/api/merkraum/api/discover
+```
 
-1. **Discover**: `GET https://agent.nhilbert.de/api/merkraum/api/discover` — inspect available capabilities
-2. **Authenticate**: Obtain a JWT token via Cognito OAuth flow
-3. **Search**: `GET /api/search?q=your+query` — find existing knowledge
-4. **Ingest**: `POST /api/ingest/text` — add knowledge from text
-5. **Traverse**: `GET /api/traverse/entity_name` — explore graph connections
-
-All API paths are relative to the base URL: `https://agent.nhilbert.de/api/merkraum`
-
-## Safety Rules
-
-- All data is project-isolated. Agents cannot access other projects without explicit grants.
-- Node limits are enforced server-side per pricing tier.
-- Authentication is mandatory in production.
-- Rate limits apply to prevent abuse.
+This returns the live capability manifest including available tools, schema,
+authentication requirements, and pricing tiers — without requiring authentication.
 
 ## Contact
 
-- **Website**: https://merkraum.de
-- **Operator**: Supervision Rheinland, Bonn (Dr. Norman Hilbert)
+- Website: https://merkraum.de
+- Operator: Supervision Rheinland, Bonn (Dr. Norman Hilbert)
+- Support: info@merkraum.de
