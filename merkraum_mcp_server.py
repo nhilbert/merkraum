@@ -47,6 +47,7 @@ from merkraum_backend import (
     create_adapter, BackendAdapter, NODE_TYPES, RELATIONSHIP_TYPES, TIER_LIMITS,
     VSM_LEVELS, KNOWLEDGE_TYPES,
 )
+from merkraum_pii import PIIDetected
 from merkraum_llm import llm_extract, get_provider_info
 
 # --- Configuration ---
@@ -953,6 +954,10 @@ async def add_knowledge(
         return {"created": written > 0, "name": name, "node_type": node_type,
                 "knowledge_type": knowledge_type,
                 "duration_ms": int((time.time() - start) * 1000)}
+    except PIIDetected as e:
+        audit_log("add_knowledge", "authed",
+                  {"name": name}, int((time.time() - start) * 1000), "pii_blocked", str(e))
+        return {"error": "pii_detected", "message": str(e), "findings": e.findings}
     except Exception as e:
         audit_log("add_knowledge", "authed",
                   {"name": name}, int((time.time() - start) * 1000), "error", str(e))

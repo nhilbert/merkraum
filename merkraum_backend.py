@@ -653,6 +653,28 @@ class Neo4jBaseAdapter(BackendAdapter):
                     limit=node_limit,
                     attempted=len(entities),
                 )
+        # --- PII Gateway (SUP-182) ---
+        if entities:
+            from merkraum_pii import gate_entities, get_pii_settings
+            try:
+                project_meta = self.get_project(project_id)
+            except Exception:
+                project_meta = None
+            pii_settings = get_pii_settings(project_meta)
+            if pii_settings["mode"] != "off":
+                pii_result = gate_entities(
+                    entities,
+                    mode=pii_settings["mode"],
+                    language=pii_settings["language"],
+                )
+                entities = pii_result["entities"]
+                if pii_result["findings"]:
+                    logger.info(
+                        "PII Gateway [%s]: %d finding(s) in %d entities for project %s",
+                        pii_settings["mode"], len(pii_result["findings"]),
+                        len(pii_result["blocked"]) + len(pii_result["entities"]),
+                        project_id,
+                    )
         now = datetime.now(timezone.utc).isoformat()
         written = 0
         with self._driver.session() as session:
@@ -1473,12 +1495,19 @@ class Neo4jBaseAdapter(BackendAdapter):
 
     def update_project(self, project_id, name=None, description=None,
                        tier=None, dreaming_enabled=None,
-                       dreaming_schedule=None, dreaming_config=None):
+                       dreaming_schedule=None, dreaming_config=None,
+                       pii_mode=None, pii_language=None):
         VALID_SCHEDULES = {"manual", "daily", "weekly"}
+        VALID_PII_MODES = {"block", "warn", "log", "off"}
+        VALID_PII_LANGUAGES = {"en", "de", "auto"}
         if tier is not None and tier not in TIER_LIMITS:
             raise ValueError(f"Invalid tier: {tier}. Valid: {list(TIER_LIMITS.keys())}")
         if dreaming_schedule is not None and dreaming_schedule not in VALID_SCHEDULES:
             raise ValueError(f"Invalid dreaming_schedule: {dreaming_schedule}. Valid: {sorted(VALID_SCHEDULES)}")
+        if pii_mode is not None and pii_mode not in VALID_PII_MODES:
+            raise ValueError(f"Invalid pii_mode: {pii_mode}. Valid: {sorted(VALID_PII_MODES)}")
+        if pii_language is not None and pii_language not in VALID_PII_LANGUAGES:
+            raise ValueError(f"Invalid pii_language: {pii_language}. Valid: {sorted(VALID_PII_LANGUAGES)}")
         now = datetime.now(timezone.utc).isoformat()
         set_clauses = ["pm.updated_at = $now"]
         params: dict = {"pid": project_id, "now": now}
@@ -1501,6 +1530,12 @@ class Neo4jBaseAdapter(BackendAdapter):
             import json as _json
             set_clauses.append("pm.dreaming_config = $dreaming_config")
             params["dreaming_config"] = _json.dumps(dreaming_config)
+        if pii_mode is not None:
+            set_clauses.append("pm.pii_mode = $pii_mode")
+            params["pii_mode"] = pii_mode
+        if pii_language is not None:
+            set_clauses.append("pm.pii_language = $pii_language")
+            params["pii_language"] = pii_language
 
         with self._driver.session() as session:
             result = session.run(

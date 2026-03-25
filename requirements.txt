@@ -13,3 +13,9 @@ requests>=2.31.0
 
 # AWS Bedrock (EU-compliant LLM extraction via Converse API)
 boto3>=1.34.0
+
+# PII Gateway (SUP-182) — optional, degrades gracefully if not installed
+# presidio-analyzer>=2.2.0
+# spacy>=3.7.0
+# en_core_web_lg (python -m spacy download en_core_web_lg)
+# de_core_news_lg (python -m spacy download de_core_news_lg)

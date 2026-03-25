@@ -41,6 +41,7 @@ from merkraum_backend import (
     create_adapter, NODE_TYPES, RELATIONSHIP_TYPES, KNOWLEDGE_TYPES,
     Neo4jBaseAdapter, NodeLimitExceeded, TIER_LIMITS,
 )
+from merkraum_pii import PIIDetected
 from jwt_auth import get_cognito_validator, require_auth, require_scope, PATValidator
 
 # ---------------------------------------------------------------------------
@@ -1191,6 +1192,8 @@ def update_project(project_id):
         dreaming_enabled: bool (optional)
         dreaming_schedule: "manual" | "daily" | "weekly" (optional)
         dreaming_config: dict with replay_walks, replay_hops, consolidation_threshold (optional)
+        pii_mode: "block" | "warn" | "log" | "off" (optional, default: "warn")
+        pii_language: "en" | "de" | "auto" (optional, default: "auto")
     """
     adp = adapter
     if adp is None:
@@ -1208,6 +1211,8 @@ def update_project(project_id):
             dreaming_enabled=body.get("dreaming_enabled"),
             dreaming_schedule=body.get("dreaming_schedule"),
             dreaming_config=body.get("dreaming_config"),
+            pii_mode=body.get("pii_mode"),
+            pii_language=body.get("pii_language"),
         )
         if not result.get("updated"):
             return _error(result.get("error", "Update failed"), 404)
@@ -2446,6 +2451,12 @@ def ingest():
             "limit": exc.limit,
             "attempted": exc.attempted,
         }), 429
+    except PIIDetected as exc:
+        return jsonify({
+            "error": "pii_detected",
+            "message": str(exc),
+            "findings": exc.findings,
+        }), 422
     except Exception as exc:
         logger.exception("ingest failed for project=%s", project)
         return _error(str(exc))
@@ -2746,6 +2757,18 @@ def ingest_text():
             "current": exc.current,
             "limit": exc.limit,
         }), 429
+    except PIIDetected as exc:
+        return jsonify({
+            "extracted": {
+                "entities": entities,
+                "relationships": relationships,
+            },
+            "ingested": {"entities_written": 0, "relationships_written": 0},
+            "project": project,
+            "error": "pii_detected",
+            "message": str(exc),
+            "findings": exc.findings,
+        }), 422
     except Exception as exc:
         logger.exception("Ingestion failed after extraction for project=%s", project)
         return jsonify({
