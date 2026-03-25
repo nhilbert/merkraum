@@ -429,26 +429,90 @@ TOKEN_ALLOWED_PARAMS = {
     "grant_type", "code", "redirect_uri", "client_id",
     "code_verifier", "refresh_token", "scope",
 }
+TOKEN_ALLOWED_GRANTS = {"authorization_code", "refresh_token"}
+TOKEN_REQUIRED_PARAMS_BY_GRANT = {
+    "authorization_code": {"code", "redirect_uri", "client_id"},
+    "refresh_token": {"refresh_token", "client_id"},
+}
+TOKEN_MAX_BODY_BYTES = int(os.environ.get("MCP_TOKEN_MAX_BODY_BYTES", "16384"))
+TOKEN_RATE_LIMIT_WINDOW_SECONDS = int(os.environ.get("MCP_TOKEN_RATE_LIMIT_WINDOW_SECONDS", "60"))
+TOKEN_RATE_LIMIT_MAX_REQUESTS = int(os.environ.get("MCP_TOKEN_RATE_LIMIT_MAX_REQUESTS", "30"))
+_token_rate_buckets: dict[str, list[float]] = {}
+_token_rate_lock = threading.Lock()
+
+
+def _token_rate_limit_key(request: Request, params: dict) -> str:
+    client_host = "unknown"
+    if getattr(request, "client", None) and getattr(request.client, "host", None):
+        client_host = request.client.host
+    client_id = (params.get("client_id") or "unknown").strip() or "unknown"
+    return f"{client_host}:{client_id}"
+
+
+def _is_token_rate_limited(key: str) -> bool:
+    if TOKEN_RATE_LIMIT_MAX_REQUESTS <= 0:
+        return True
+    now = time.time()
+    cutoff = now - max(TOKEN_RATE_LIMIT_WINDOW_SECONDS, 1)
+    with _token_rate_lock:
+        bucket = [ts for ts in _token_rate_buckets.get(key, []) if ts >= cutoff]
+        if len(bucket) >= TOKEN_RATE_LIMIT_MAX_REQUESTS:
+            _token_rate_buckets[key] = bucket
+            return True
+        bucket.append(now)
+        _token_rate_buckets[key] = bucket
+        return False
 
 
 @mcp.custom_route("/token", methods=["POST"])
 async def token_proxy(request: Request) -> Response:
     """Proxy token request to Cognito's token endpoint."""
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > TOKEN_MAX_BODY_BYTES:
+                return JSONResponse({"error": "invalid_request"}, status_code=413)
+        except ValueError:
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
+
     body = await request.body()
+    if len(body) > TOKEN_MAX_BODY_BYTES:
+        return JSONResponse({"error": "invalid_request"}, status_code=413)
+
     content_type = request.headers.get("content-type", "")
 
     # Parse form body
     if "application/x-www-form-urlencoded" in content_type:
         from urllib.parse import parse_qs
-        parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+        try:
+            parsed = parse_qs(body.decode("utf-8"), keep_blank_values=True)
+        except Exception:
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
         params = {k: v[0] for k, v in parsed.items()}
     else:
         try:
             params = json.loads(body)
         except Exception:
-            params = {}
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
+        if not isinstance(params, dict):
+            return JSONResponse({"error": "invalid_request"}, status_code=400)
 
-    logger.info("AUDIT /token grant_type=%s", params.get("grant_type", "unknown"))
+    grant_type = (params.get("grant_type") or "").strip()
+    if grant_type not in TOKEN_ALLOWED_GRANTS:
+        return JSONResponse({"error": "unsupported_grant_type"}, status_code=400)
+
+    missing_params = sorted(
+        p for p in TOKEN_REQUIRED_PARAMS_BY_GRANT[grant_type]
+        if not (params.get(p) or "").strip()
+    )
+    if missing_params:
+        return JSONResponse({"error": "invalid_request"}, status_code=400)
+
+    rate_key = _token_rate_limit_key(request, params)
+    if _is_token_rate_limited(rate_key):
+        return JSONResponse({"error": "temporarily_unavailable"}, status_code=429)
+
+    logger.info("AUDIT /token grant_type=%s", grant_type)
 
     # Filter to only Cognito-supported params
     filtered = {k: v for k, v in params.items() if k in TOKEN_ALLOWED_PARAMS}
@@ -481,13 +545,11 @@ async def token_proxy(request: Request) -> Response:
             resp_status = resp.status
             resp_headers = dict(resp.headers)
     except urllib.error.HTTPError as e:
-        resp_body = e.read()
-        resp_status = e.code
-        resp_headers = dict(e.headers)
-        logger.warning("AUDIT /token Cognito returned %d: %s", resp_status, resp_body[:200])
+        logger.warning("AUDIT /token upstream returned HTTP %d", e.code)
+        return JSONResponse({"error": "upstream_token_error"}, status_code=502)
     except Exception as e:
         logger.error("AUDIT /token proxy error: %s", e)
-        return JSONResponse({"error": "token_proxy_error", "detail": "token proxy failed"}, status_code=502)
+        return JSONResponse({"error": "upstream_token_error"}, status_code=502)
 
     return Response(
         content=resp_body,

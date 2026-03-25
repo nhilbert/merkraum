@@ -65,3 +65,35 @@ Browser (app.merkraum.de)
 - `POST /api/chat` — chat over graph context (PAT scope: `search`)
 - `POST /api/feedback` — feedback ticket submission (PAT scope: `write`)
 - `GET /api/projects` — list projects
+
+## Required reverse-proxy / WAF controls for OAuth token proxy
+
+When exposing MCP OAuth endpoints (`/authorize`, `/token`, `/register`) behind nginx, CloudFront, or another edge gateway, enforce the controls below in the edge layer **in addition to** application-level checks:
+
+1. **Body size limit on `/token`**: cap request body to `16k` (or stricter), and reject larger requests before they reach the app.
+2. **Rate limit on `/token` and `/register`**:
+   - Per client IP and path (example: burst 10, sustained 30/min).
+   - Return HTTP `429` on exceed.
+3. **Method and content-type allowlist**:
+   - `/token` must be `POST`.
+   - Allow only `application/x-www-form-urlencoded` and `application/json`.
+4. **Forwarded client IP integrity**:
+   - Ensure only trusted proxies can set `X-Forwarded-For`.
+   - Strip user-supplied forwarding headers at the edge.
+5. **TLS + host allowlist**:
+   - Require HTTPS at the edge.
+   - Restrict Host headers to expected deployment hostnames.
+
+Example nginx controls:
+
+```nginx
+client_max_body_size 16k;
+
+limit_req_zone $binary_remote_addr zone=oauth_token_ip:10m rate=30r/m;
+
+location = /token {
+    limit_req zone=oauth_token_ip burst=10 nodelay;
+    if ($request_method != POST) { return 405; }
+    proxy_pass http://127.0.0.1:8090/token;
+}
+```
