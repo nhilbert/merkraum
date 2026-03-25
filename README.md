@@ -25,6 +25,7 @@ Merkraum gives your AI agent a structured, inspectable knowledge graph where eve
 - **EU-hosted** — AWS Frankfurt (eu-central-1). Data never leaves the EU. GDPR Art. 17 (right to deletion) built in. No CLOUD Act exposure.
 - **Self-hosted option** — everything runs locally via Docker Compose. Own your knowledge infrastructure.
 - **MCP compatible** — works with Claude, Cursor, ChatGPT, and any MCP-compatible client.
+- **PII Gateway** — configurable privacy filter scans entities at ingestion for personally identifiable information (names, emails, phone numbers, IBANs). Supports English and German with automatic language detection. Four modes: block, warn, log, off. GDPR Art. 5 data minimization built in.
 - **Graph dreaming** — periodic consolidation discovers patterns and strengthens connections while your agent is idle.
 
 ## Search and Vector Indexing (Update 2026-03-14)
@@ -148,6 +149,8 @@ Example prompts:
 | `list_beliefs` | View beliefs by status (active, uncertain, contradicted) |
 | `query_nodes` | List entities, optionally filtered by type |
 | `get_graph_stats` | Node and edge counts by type |
+| `get_pii_config` | View PII Gateway settings (mode, language) |
+| `set_pii_mode` | Configure PII detection (block/warn/log/off) |
 | `health_check` | Verify Neo4j and Qdrant connectivity |
 
 ## Schema

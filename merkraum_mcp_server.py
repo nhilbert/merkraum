@@ -47,7 +47,7 @@ from merkraum_backend import (
     create_adapter, BackendAdapter, NODE_TYPES, RELATIONSHIP_TYPES, TIER_LIMITS,
     VSM_LEVELS, KNOWLEDGE_TYPES,
 )
-from merkraum_pii import PIIDetected
+from merkraum_pii import PIIDetected, get_pii_settings, scan_text, PII_MODES, SUPPORTED_LANGUAGES
 from merkraum_llm import llm_extract, get_provider_info
 
 # --- Configuration ---
@@ -1382,6 +1382,13 @@ def _run_ingestion_job(job_id: str, text: str, project: str):
             _jobs[job_id]["status"] = "completed"
             _jobs[job_id]["result"] = result
             _jobs[job_id]["duration_ms"] = int((time.time() - start) * 1000)
+    except PIIDetected as e:
+        with _jobs_lock:
+            _jobs[job_id]["status"] = "failed"
+            _jobs[job_id]["error"] = f"pii_detected: {e}"
+            _jobs[job_id]["result"] = {"error": "pii_detected", "message": str(e),
+                                       "findings": e.findings}
+            _jobs[job_id]["duration_ms"] = int((time.time() - start) * 1000)
     except Exception as e:
         with _jobs_lock:
             _jobs[job_id]["status"] = "failed"
@@ -1721,6 +1728,113 @@ async def deduplicate_edges(
         return result
     except Exception as e:
         audit_log("deduplicate_edges", "authed",
+                  {"project": project},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def get_pii_config(
+    project: str = None,
+) -> dict:
+    """Get the PII Gateway configuration for a project.
+
+    Returns the current PII detection mode and language setting.
+    The PII Gateway scans entities during ingestion for personally
+    identifiable information (names, emails, phone numbers, etc.).
+
+    Args:
+        project: Project ID (default: your personal space)
+    """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    adapter = _get_adapter()
+    start = time.time()
+    try:
+        project_meta = await _run_sync(adapter.get_project, project)
+        settings = get_pii_settings(project_meta)
+        audit_log("get_pii_config", "authed",
+                  {"project": project},
+                  int((time.time() - start) * 1000), "ok")
+        return {
+            "pii_mode": settings["mode"],
+            "pii_language": settings["language"],
+            "available_modes": sorted(PII_MODES),
+            "available_languages": ["auto"] + sorted(SUPPORTED_LANGUAGES),
+            "description": {
+                "block": "Reject entities containing PII (422 error)",
+                "warn": "Allow entities but return PII findings in response",
+                "log": "Allow entities, log PII findings silently",
+                "off": "No PII detection",
+            },
+            "duration_ms": int((time.time() - start) * 1000),
+        }
+    except Exception as e:
+        audit_log("get_pii_config", "authed",
+                  {"project": project},
+                  int((time.time() - start) * 1000), "error", str(e))
+        return {"error": str(e)}
+
+
+@mcp.tool()
+async def set_pii_mode(
+    pii_mode: str,
+    pii_language: str = None,
+    project: str = None,
+) -> dict:
+    """Configure the PII Gateway for a project.
+
+    Controls how personally identifiable information is handled during
+    entity ingestion. Affects add_knowledge and ingest_knowledge tools.
+
+    Args:
+        pii_mode: Detection mode — "block" (reject PII), "warn" (allow + report),
+            "log" (allow + silent log), "off" (disabled)
+        pii_language: Detection language — "auto" (detect from content),
+            "en" (English), "de" (German). Default: unchanged.
+        project: Project ID (default: your personal space)
+    """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("write", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    if pii_mode not in PII_MODES:
+        return {"error": f"Invalid pii_mode: {pii_mode}. Valid: {sorted(PII_MODES)}"}
+    if pii_language is not None and pii_language not in SUPPORTED_LANGUAGES and pii_language != "auto":
+        return {"error": f"Invalid pii_language: {pii_language}. Valid: auto, {', '.join(sorted(SUPPORTED_LANGUAGES))}"}
+    adapter = _get_adapter()
+    start = time.time()
+    try:
+        kwargs = {"pii_mode": pii_mode}
+        if pii_language is not None:
+            kwargs["pii_language"] = pii_language
+        result = await _run_sync(
+            adapter.update_project, project, **kwargs
+        )
+        audit_log("set_pii_mode", "authed",
+                  {"project": project, "pii_mode": pii_mode,
+                   "pii_language": pii_language},
+                  int((time.time() - start) * 1000), "ok")
+        return {
+            "updated": result.get("updated", False),
+            "pii_mode": pii_mode,
+            "pii_language": pii_language or result.get("pii_language", "auto"),
+            "duration_ms": int((time.time() - start) * 1000),
+        }
+    except ValueError as e:
+        return {"error": str(e)}
+    except Exception as e:
+        audit_log("set_pii_mode", "authed",
                   {"project": project},
                   int((time.time() - start) * 1000), "error", str(e))
         return {"error": str(e)}

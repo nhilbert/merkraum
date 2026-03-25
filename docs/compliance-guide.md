@@ -69,6 +69,7 @@ traverse_graph(entity="Jane Doe")
 
 **Data Minimization (Article 5):**
 
+- **PII Gateway**: Configurable per-project ingestion filter that scans entities for personally identifiable information (names, email addresses, phone numbers, IBANs, credit cards, IP addresses, locations, etc.) before they enter the knowledge graph. Four modes: `block` (reject PII-containing entities), `warn` (store but flag), `log` (store and silently audit), `off`. Supports English and German with automatic language detection. Uses Microsoft Presidio with spaCy NER models. All PII scan results are logged to the audit trail as `pii_scan` operations for compliance review. Configure via MCP tools (`get_pii_config`, `set_pii_mode`) or REST API.
 - Fixed schema (10 node types) constrains what is stored — the system cannot accumulate arbitrary personal data categories
 - Graph dreaming consolidation reduces episodic detail to abstract patterns, naturally minimizing retained personal information
 - TTL-based invalidation (for news/events) removes time-sensitive data automatically

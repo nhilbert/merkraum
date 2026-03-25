@@ -153,6 +153,9 @@ confidence: float = 0.7      # for Belief nodes only
 project: str = None
 ```
 Use for atomic facts, entities, or beliefs worth remembering.
+If the project's PII Gateway is active (mode ≠ off), entities are scanned for
+personally identifiable information. In block mode, a `pii_detected` error is
+returned. In warn mode, `pii_findings` are included in the response.
 
 **`add_relationship`** — Link two entities with a typed relationship.
 ```
@@ -181,6 +184,8 @@ project: str = None
 ```
 Returns a `job_id`. Use `check_ingestion_status` to poll for completion.
 Use for longer texts where structured entity extraction is needed.
+PII Gateway applies to extracted entities — if mode is "block" and PII is
+found, the job fails with a `pii_detected` error in the job result.
 
 **`check_ingestion_status`** — Poll an async ingestion job.
 ```
@@ -255,6 +260,34 @@ project: str = None
 limit: int = 100
 ```
 
+### PII Gateway
+
+**`get_pii_config`** — Get the current PII Gateway configuration for a project.
+```
+project: str = None
+```
+Returns the active PII mode, language, and descriptions of available modes.
+Use to check what PII protection is active before ingesting sensitive data.
+
+**`set_pii_mode`** — Configure PII detection mode and language for a project.
+```
+pii_mode: str        # "block" | "warn" | "log" | "off"
+pii_language: str = None   # "auto" | "en" | "de" (default: unchanged)
+project: str = None
+```
+Controls how PII is handled during `add_knowledge` and `ingest_knowledge`:
+- **block**: Entities containing PII are rejected (error returned)
+- **warn**: Entities are stored but PII findings are returned in the response
+- **log**: Entities are stored, PII findings logged silently to the audit trail
+- **off**: No PII detection
+
+Detected PII types (GDPR-critical): person names, email addresses, phone numbers,
+IBAN codes, credit cards, IP addresses, locations, dates of birth, medical license
+numbers, and German tax IDs.
+
+Language detection is automatic by default. Set explicitly for projects with
+known single-language content.
+
 ### Maintenance
 
 **`deduplicate_edges`** — Remove duplicate relationships in the graph.
@@ -305,6 +338,14 @@ project: str = None
 3. search_knowledge("<topic>") to verify extraction
 ```
 
+### Setting Up PII Protection
+```
+1. get_pii_config() — check current PII mode
+2. set_pii_mode(pii_mode="warn") — enable PII detection in warn mode
+3. add_knowledge(...) — PII findings returned in response if detected
+4. Review findings, then optionally: set_pii_mode(pii_mode="block")
+```
+
 ### Periodic Maintenance
 ```
 1. certainty_decay() — reduce confidence of aging beliefs
@@ -328,6 +369,10 @@ Following the principle that memory is for knowledge worth keeping (not operatio
 - Node limits are enforced server-side per pricing tier.
 - All data stored in EU (eu-central-1 Frankfurt). No data leaves EU.
 - Every tool call is audit-logged with timestamp, user ID, and parameters.
+- **PII Gateway**: Configurable per project — scans entities at ingestion time for
+  personally identifiable information (GDPR Art. 5 data minimization). Supports
+  English and German with automatic language detection. See `get_pii_config` and
+  `set_pii_mode` tools.
 
 ## Pricing Tiers
 
