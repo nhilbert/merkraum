@@ -153,6 +153,17 @@ Example prompts:
 | `set_pii_mode` | Configure PII detection (block/warn/log/off) |
 | `health_check` | Verify Neo4j and Qdrant connectivity |
 
+## API/PAT scope requirements
+
+When using Personal Access Tokens (`mk_pat_...`), endpoint access is restricted by scopes.
+Cognito JWT users keep existing behavior and are not PAT-scope constrained.
+
+| Endpoint | Required PAT scope |
+|---|---|
+| `GET /api/search` | `search` |
+| `POST /api/chat` | `search` |
+| `POST /api/feedback` | `write` |
+
 ## Schema
 
 **Node types**: Person, Organization, Project, Concept, Regulation, Event, Belief, Artifact, Interview, Quote
