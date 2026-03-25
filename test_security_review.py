@@ -233,5 +233,109 @@ class TestReindexApiHardening(unittest.TestCase):
             finally:
                 merkraum_api.adapter = previous_adapter
 
+
+class TestMcpCertaintyToolAuthorization(unittest.TestCase):
+    """PAT scope + ACL checks for certainty/expiry MCP tools."""
+
+    def _make_token(self, scopes, projects=None, all_projects=False):
+        return SimpleNamespace(
+            claims={
+                "sub": "user-123",
+                "token_type": "pat",
+                "projects": projects if projects is not None else ["user-123"],
+                "all_projects": all_projects,
+            },
+            scopes=scopes,
+        )
+
+    def test_pat_no_scope_rejected(self):
+        import merkraum_mcp_server
+
+        adapter = MagicMock()
+        token = self._make_token(scopes=[])
+        cases = [
+            (merkraum_mcp_server.expire_nodes, {"dry_run": True, "project": "user-123"}),
+            (merkraum_mcp_server.renew_node, {"name": "belief-1", "extend_days": 30, "project": "user-123"}),
+            (merkraum_mcp_server.certainty_decay, {"dry_run": True, "project": "user-123"}),
+            (merkraum_mcp_server.certainty_review, {"limit": 10, "project": "user-123"}),
+            (merkraum_mcp_server.certainty_stats, {"project": "user-123"}),
+        ]
+
+        with patch.object(merkraum_mcp_server, "get_access_token", return_value=token), \
+                patch.object(merkraum_mcp_server, "_get_adapter", return_value=adapter):
+            for tool_fn, kwargs in cases:
+                with self.subTest(tool=tool_fn.__name__):
+                    result = asyncio.run(tool_fn(**kwargs))
+                    self.assertIn("error", result)
+                    self.assertIn("Token lacks required scope", result["error"])
+
+        adapter.expire_nodes.assert_not_called()
+        adapter.renew_node.assert_not_called()
+        adapter.apply_confidence_decay.assert_not_called()
+        adapter.get_certainty_review_queue.assert_not_called()
+        adapter.get_certainty_stats.assert_not_called()
+
+    def test_pat_correct_scope_succeeds(self):
+        import merkraum_mcp_server
+
+        adapter = MagicMock()
+        adapter.expire_nodes.return_value = {"total": 0, "expired": [], "dry_run": True}
+        adapter.renew_node.return_value = {"renewed": True, "name": "belief-1"}
+        adapter.apply_confidence_decay.return_value = {"total": 0, "decayed": [], "dry_run": True}
+        adapter.get_certainty_review_queue.return_value = {"categories": {}}
+        adapter.get_certainty_stats.return_value = {"governance": {"status": "healthy"}}
+
+        write_token = self._make_token(scopes=["write"], projects=["user-123"])
+        read_token = self._make_token(scopes=["read"], projects=["user-123"])
+
+        with patch.object(merkraum_mcp_server, "_get_adapter", return_value=adapter):
+            with patch.object(merkraum_mcp_server, "get_access_token", return_value=write_token):
+                expire_result = asyncio.run(merkraum_mcp_server.expire_nodes(project="user-123"))
+                renew_result = asyncio.run(merkraum_mcp_server.renew_node(
+                    name="belief-1", extend_days=30, project="user-123"))
+                decay_result = asyncio.run(merkraum_mcp_server.certainty_decay(project="user-123"))
+
+            with patch.object(merkraum_mcp_server, "get_access_token", return_value=read_token):
+                review_result = asyncio.run(merkraum_mcp_server.certainty_review(project="user-123"))
+                stats_result = asyncio.run(merkraum_mcp_server.certainty_stats(project="user-123"))
+
+        self.assertNotIn("error", expire_result)
+        self.assertNotIn("error", renew_result)
+        self.assertNotIn("error", decay_result)
+        self.assertNotIn("error", review_result)
+        self.assertNotIn("error", stats_result)
+        adapter.expire_nodes.assert_called_once()
+        adapter.renew_node.assert_called_once()
+        adapter.apply_confidence_decay.assert_called_once()
+        adapter.get_certainty_review_queue.assert_called_once()
+        adapter.get_certainty_stats.assert_called_once()
+
+    def test_project_acl_denial(self):
+        import merkraum_mcp_server
+
+        adapter = MagicMock()
+        write_token = self._make_token(scopes=["write"], projects=[], all_projects=True)
+        read_token = self._make_token(scopes=["read"], projects=[], all_projects=True)
+
+        with patch.object(merkraum_mcp_server, "_get_adapter", return_value=adapter):
+            with patch.object(merkraum_mcp_server, "get_access_token", return_value=write_token):
+                expire_result = asyncio.run(merkraum_mcp_server.expire_nodes(project="project-b"))
+                renew_result = asyncio.run(merkraum_mcp_server.renew_node(
+                    name="belief-1", extend_days=30, project="project-b"))
+                decay_result = asyncio.run(merkraum_mcp_server.certainty_decay(project="project-b"))
+
+            with patch.object(merkraum_mcp_server, "get_access_token", return_value=read_token):
+                review_result = asyncio.run(merkraum_mcp_server.certainty_review(project="project-b"))
+                stats_result = asyncio.run(merkraum_mcp_server.certainty_stats(project="project-b"))
+
+        for result in [expire_result, renew_result, decay_result, review_result, stats_result]:
+            self.assertEqual(result.get("error"), "Forbidden: no access to project 'project-b'")
+
+        adapter.expire_nodes.assert_not_called()
+        adapter.renew_node.assert_not_called()
+        adapter.apply_confidence_decay.assert_not_called()
+        adapter.get_certainty_review_queue.assert_not_called()
+        adapter.get_certainty_stats.assert_not_called()
+
 if __name__ == "__main__":
     unittest.main()

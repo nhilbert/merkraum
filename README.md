@@ -145,22 +145,29 @@ Example prompts:
 
 ## MCP Tools
 
-| Tool | Description |
-|------|-------------|
-| `search_knowledge` | Semantic search across your knowledge graph |
-| `traverse_graph` | Walk relationships from any entity |
-| `add_knowledge` | Add a structured entity (no LLM needed) |
-| `add_relationship` | Link two entities with a typed relationship |
-| `update_belief` | Update a belief's confidence, status, or summary — human-auditable correction |
-| `get_usage` | Usage metrics and tier limits (nodes, edges, quota percentage) |
-| `ingest_knowledge` | Extract entities from free text (requires OpenAI API key) |
-| `check_ingestion_status` | Poll async ingestion jobs |
-| `list_beliefs` | View beliefs by status (active, uncertain, contradicted) |
-| `query_nodes` | List entities, optionally filtered by type |
-| `get_graph_stats` | Node and edge counts by type |
-| `get_pii_config` | View PII Gateway settings (mode, language) |
-| `set_pii_mode` | Configure PII detection (block/warn/log/off) |
-| `health_check` | Verify Neo4j and Qdrant connectivity |
+All tools enforce project-level ACL checks. With PAT auth, read tools require `read` scope and mutating tools require `write` scope (or `admin`).
+
+| Tool | PAT Scope | Description |
+|------|-----------|-------------|
+| `search_knowledge` | `search` | Semantic search across your knowledge graph |
+| `traverse_graph` | `read` | Walk relationships from any entity |
+| `add_knowledge` | `write` | Add a structured entity (no LLM needed) |
+| `add_relationship` | `write` | Link two entities with a typed relationship |
+| `update_belief` | `write` | Update a belief's confidence, status, or summary — human-auditable correction |
+| `expire_nodes` | `write` | Expire nodes that passed `valid_until` (managed forgetting) |
+| `renew_node` | `write` | Extend or reset node validity windows |
+| `certainty_decay` | `write` | Apply time-based certainty decay to beliefs |
+| `certainty_review` | `read` | Show beliefs that need certainty review |
+| `certainty_stats` | `read` | Certainty/governance summary metrics |
+| `get_usage` | `read` | Usage metrics and tier limits (nodes, edges, quota percentage) |
+| `ingest_knowledge` | `write` | Extract entities from free text (requires OpenAI API key) |
+| `check_ingestion_status` | `read` | Poll async ingestion jobs |
+| `list_beliefs` | `read` | View beliefs by status (active, uncertain, contradicted) |
+| `query_nodes` | `read` | List entities, optionally filtered by type |
+| `get_graph_stats` | `read` | Node and edge counts by type |
+| `get_pii_config` | `read` | View PII Gateway settings (mode, language) |
+| `set_pii_mode` | `write` | Configure PII detection (block/warn/log/off) |
+| `health_check` | `read` | Verify Neo4j and Qdrant connectivity |
 
 ## Schema
 

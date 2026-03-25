@@ -47,7 +47,7 @@ from merkraum_backend import (
     create_adapter, BackendAdapter, NODE_TYPES, RELATIONSHIP_TYPES, TIER_LIMITS,
     VSM_LEVELS, KNOWLEDGE_TYPES,
 )
-from merkraum_pii import PIIDetected, get_pii_settings, scan_text, PII_MODES, SUPPORTED_LANGUAGES
+from merkraum_pii import PIIDetected, get_pii_settings, PII_MODES, SUPPORTED_LANGUAGES
 from merkraum_llm import llm_extract, get_provider_info
 
 # --- Configuration ---
@@ -1137,15 +1137,21 @@ async def expire_nodes(
         dry_run: If True, only show what would be expired without changing anything.
         project: Project ID (uses authenticated user's default if omitted).
     """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("write", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    adapter = _get_adapter()
     start = time.time()
-    auth = await _require_auth()
-    if isinstance(auth, dict) and "error" in auth:
-        return auth
-    project = project or auth.get("project_id", "default")
     try:
-        result = adapter.expire_nodes(
+        result = await _run_sync(
+            adapter.expire_nodes,
             project_id=project, dry_run=dry_run,
-            actor=auth.get("sub", "mcp"),
+            actor=_uid or "mcp",
         )
         audit_log("expire_nodes", "authed",
                   {"project": project, "dry_run": dry_run},
@@ -1180,16 +1186,22 @@ async def renew_node(
         node_type: Optional node type to narrow the match (e.g. 'Concept', 'Belief').
         project: Project ID (uses authenticated user's default if omitted).
     """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("write", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    adapter = _get_adapter()
     start = time.time()
-    auth = await _require_auth()
-    if isinstance(auth, dict) and "error" in auth:
-        return auth
-    project = project or auth.get("project_id", "default")
     try:
-        result = adapter.renew_node(
+        result = await _run_sync(
+            adapter.renew_node,
             name=name, project_id=project, extend_days=extend_days,
             new_valid_until=new_valid_until, node_type=node_type,
-            actor=auth.get("sub", "mcp"),
+            actor=_uid or "mcp",
         )
         audit_log("renew_node", "authed",
                   {"name": name, "project": project, "extend_days": extend_days},
@@ -1220,15 +1232,21 @@ async def certainty_decay(
         dry_run: If True, only show what would change without applying. Default True.
         project: Project ID (uses authenticated user's default if omitted).
     """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("write", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    adapter = _get_adapter()
     start = time.time()
-    auth = await _require_auth()
-    if isinstance(auth, dict) and "error" in auth:
-        return auth
-    project = project or auth.get("project_id", "default")
     try:
-        result = adapter.apply_confidence_decay(
+        result = await _run_sync(
+            adapter.apply_confidence_decay,
             project_id=project, dry_run=dry_run,
-            actor=auth.get("sub", "mcp"),
+            actor=_uid or "mcp",
         )
         audit_log("certainty_decay", "authed",
                   {"project": project, "dry_run": dry_run},
@@ -1258,14 +1276,20 @@ async def certainty_review(
         limit: Maximum items per category (1-200). Default 50.
         project: Project ID (uses authenticated user's default if omitted).
     """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
     start = time.time()
-    auth = await _require_auth()
-    if isinstance(auth, dict) and "error" in auth:
-        return auth
-    project = project or auth.get("project_id", "default")
     limit = max(1, min(limit, 200))
+    adapter = _get_adapter()
     try:
-        result = adapter.get_certainty_review_queue(
+        result = await _run_sync(
+            adapter.get_certainty_review_queue,
             project_id=project, limit=limit,
         )
         audit_log("certainty_review", "authed",
@@ -1293,13 +1317,18 @@ async def certainty_stats(
     Args:
         project: Project ID (uses authenticated user's default if omitted).
     """
+    auth_ctx = _get_auth_context()
+    scope_err = _require_pat_scope("read", auth_ctx)
+    if scope_err:
+        return {"error": scope_err}
+    project = _resolve_project(project, auth_ctx)
+    _uid, _grp, _err = _check_project_access(project, auth_ctx)
+    if _err:
+        return {"error": _err}
+    adapter = _get_adapter()
     start = time.time()
-    auth = await _require_auth()
-    if isinstance(auth, dict) and "error" in auth:
-        return auth
-    project = project or auth.get("project_id", "default")
     try:
-        result = adapter.get_certainty_stats(project_id=project)
+        result = await _run_sync(adapter.get_certainty_stats, project_id=project)
         audit_log("certainty_stats", "authed",
                   {"project": project},
                   int((time.time() - start) * 1000), "ok")
