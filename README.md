@@ -44,8 +44,17 @@ Merkraum gives your AI agent a structured, inspectable knowledge graph where eve
 ```bash
 git clone https://github.com/nhilbert/merkraum.git
 cd merkraum
+cp .env.example .env
 docker compose up -d
 ```
+
+Verify the server is reachable:
+
+```bash
+curl -sS http://localhost:8090/health | jq .
+```
+
+If `docker` or `docker compose` is missing, install Docker Desktop (macOS/Windows) or Docker Engine + Compose plugin (Linux) first.
 
 Then configure your MCP client:
 
