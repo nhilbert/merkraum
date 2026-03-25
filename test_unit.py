@@ -1671,6 +1671,124 @@ class TestPATValidator(unittest.TestCase):
         self.assertIn("Invalid scopes", str(ctx.exception))
 
 
+class TestCreateTokenTierResolution(unittest.TestCase):
+    """Token endpoint must derive tier server-side and ignore forged payload tier."""
+
+    def setUp(self):
+        import merkraum_api
+        self.api = merkraum_api
+        self.previous_adapter = self.api.adapter
+        self.mock_adapter = MagicMock()
+        self.api.adapter = self.mock_adapter
+
+    def tearDown(self):
+        self.api.adapter = self.previous_adapter
+
+    def test_payload_enterprise_from_free_user_enforces_free(self):
+        mock_pat_validator = MagicMock()
+        mock_pat_validator.create_token.return_value = {
+            "token": "mk_pat_mock",
+            "token_prefix": "mk_pat_mock",
+            "name": "Test",
+            "scopes": ["read"],
+            "projects": ["proj-free"],
+            "all_projects": False,
+            "expires_at": None,
+            "created_at": "2026-03-25T00:00:00+00:00",
+        }
+        self.mock_adapter.get_project.return_value = {"project_id": "proj-free", "tier": "free"}
+
+        with self.api.app.app_context():
+            self.api.current_app._pat_validator = mock_pat_validator
+            with self.api.app.test_request_context(
+                "/api/tokens",
+                method="POST",
+                json={
+                    "name": "Test",
+                    "scopes": ["read"],
+                    "projects": ["proj-free"],
+                    "tier": "enterprise",
+                },
+            ):
+                self.api.request.user_id = "user-free"
+                self.api.request.pat_scopes = None
+                response, status = self.api.create_token.__wrapped__()
+
+        self.assertEqual(status, 400)
+        self.assertIn("tier", response.get_json()["error"])
+        mock_pat_validator.create_token.assert_not_called()
+
+    def test_unknown_forged_tier_does_not_affect_limits(self):
+        mock_pat_validator = MagicMock()
+        mock_pat_validator.create_token.return_value = {
+            "token": "mk_pat_mock",
+            "token_prefix": "mk_pat_mock",
+            "name": "Test",
+            "scopes": ["read"],
+            "projects": ["proj-free"],
+            "all_projects": False,
+            "expires_at": None,
+            "created_at": "2026-03-25T00:00:00+00:00",
+        }
+        self.mock_adapter.get_project.return_value = {"project_id": "proj-free", "tier": "free"}
+
+        with self.api.app.app_context():
+            self.api.current_app._pat_validator = mock_pat_validator
+            with self.api.app.test_request_context(
+                "/api/tokens",
+                method="POST",
+                json={
+                    "name": "Test",
+                    "scopes": ["read"],
+                    "projects": ["proj-free"],
+                    "tier": "totally-forged",
+                },
+            ):
+                self.api.request.user_id = "user-free"
+                self.api.request.pat_scopes = None
+                response, status = self.api.create_token.__wrapped__()
+
+        self.assertEqual(status, 400)
+        self.assertIn("tier", response.get_json()["error"])
+        mock_pat_validator.create_token.assert_not_called()
+
+    def test_multiple_project_tiers_use_strictest_server_side_tier(self):
+        mock_pat_validator = MagicMock()
+        mock_pat_validator.create_token.return_value = {
+            "token": "mk_pat_mock",
+            "token_prefix": "mk_pat_mock",
+            "name": "Test",
+            "scopes": ["read"],
+            "projects": ["proj-free", "proj-enterprise"],
+            "all_projects": False,
+            "expires_at": None,
+            "created_at": "2026-03-25T00:00:00+00:00",
+        }
+        self.mock_adapter.get_project.side_effect = [
+            {"project_id": "proj-free", "tier": "free"},
+            {"project_id": "proj-enterprise", "tier": "enterprise"},
+        ]
+
+        with self.api.app.app_context():
+            self.api.current_app._pat_validator = mock_pat_validator
+            with self.api.app.test_request_context(
+                "/api/tokens",
+                method="POST",
+                json={
+                    "name": "Test",
+                    "scopes": ["read"],
+                    "projects": ["proj-free", "proj-enterprise"],
+                },
+            ):
+                self.api.request.user_id = "user-free"
+                self.api.request.pat_scopes = None
+                response, status = self.api.create_token.__wrapped__()
+
+        self.assertEqual(status, 201)
+        self.assertEqual(response.get_json()["token_prefix"], "mk_pat_mock")
+        self.assertEqual(mock_pat_validator.create_token.call_args.kwargs["tier"], "free")
+
+
 class TestPATConstants(unittest.TestCase):
     """Test PAT-related constants."""
 
