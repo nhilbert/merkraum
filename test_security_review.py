@@ -136,6 +136,173 @@ class TestGraphQueryHardening(unittest.TestCase):
                 merkraum_api.adapter = previous_adapter
 
 
+class TestChatAndFeedbackScopes(unittest.TestCase):
+    def test_chat_pat_without_search_scope_gets_403(self):
+        with patch.dict(os.environ, {"AUTH_REQUIRED": "false"}, clear=True):
+            import merkraum_api
+
+            previous_adapter = merkraum_api.adapter
+            try:
+                merkraum_api.adapter = MagicMock()
+                with merkraum_api.app.test_request_context(
+                    "/api/chat?project=user-123",
+                    method="POST",
+                    json={"query": "What do we know about X?"},
+                ):
+                    from flask import request
+
+                    request.user_id = "user-123"
+                    request.username = "pat-user"
+                    request.groups = []
+                    request.pat_scopes = ["read"]
+                    request.pat_projects = ["user-123"]
+                    request.pat_all_projects = False
+
+                    response, status = merkraum_api.chat()
+                    self.assertEqual(status, 403)
+                    self.assertEqual(
+                        response.get_json().get("error"),
+                        "Token lacks required scope: search",
+                    )
+            finally:
+                merkraum_api.adapter = previous_adapter
+
+    def test_chat_pat_with_search_scope_succeeds(self):
+        with patch.dict(os.environ, {"AUTH_REQUIRED": "false"}, clear=True):
+            import merkraum_api
+
+            previous_adapter = merkraum_api.adapter
+            try:
+                mock_adapter = MagicMock()
+                mock_adapter.vector_search.return_value = [
+                    {
+                        "metadata": {
+                            "name": "Entity A",
+                            "node_type": "Concept",
+                            "summary": "Known fact",
+                        },
+                        "score": 0.9,
+                        "content": "Known fact",
+                    }
+                ]
+                merkraum_api.adapter = mock_adapter
+
+                with patch.object(merkraum_api, "llm_text_call", return_value="Answer"):
+                    with merkraum_api.app.test_request_context(
+                        "/api/chat?project=user-123",
+                        method="POST",
+                        json={"query": "What do we know about X?"},
+                    ):
+                        from flask import request
+
+                        request.user_id = "user-123"
+                        request.username = "pat-user"
+                        request.groups = []
+                        request.pat_scopes = ["search"]
+                        request.pat_projects = ["user-123"]
+                        request.pat_all_projects = False
+
+                        response = merkraum_api.chat()
+                        self.assertEqual(response.status_code, 200)
+                        payload = response.get_json()
+                        self.assertEqual(payload.get("answer"), "Answer")
+                        self.assertEqual(len(payload.get("sources", [])), 1)
+            finally:
+                merkraum_api.adapter = previous_adapter
+
+    def test_feedback_pat_without_write_scope_gets_403(self):
+        with patch.dict(os.environ, {"AUTH_REQUIRED": "false"}, clear=True):
+            import merkraum_api
+
+            with merkraum_api.app.test_request_context(
+                "/api/feedback",
+                method="POST",
+                json={"feedback": "Please improve onboarding."},
+            ):
+                from flask import request
+
+                request.user_id = "user-123"
+                request.username = "pat-user"
+                request.groups = []
+                request.pat_scopes = ["read"]
+                request.pat_projects = ["user-123"]
+                request.pat_all_projects = False
+
+                response, status = merkraum_api.submit_feedback()
+                self.assertEqual(status, 403)
+                self.assertEqual(
+                    response.get_json().get("error"),
+                    "Token lacks required scope: write",
+                )
+
+    def test_feedback_pat_with_write_scope_succeeds(self):
+        with patch.dict(os.environ, {"AUTH_REQUIRED": "false"}, clear=True):
+            import merkraum_api
+
+            with patch.object(
+                merkraum_api,
+                "llm_call",
+                return_value={
+                    "category": "feature_request",
+                    "summary": "Please add keyboard shortcuts",
+                    "severity": "medium",
+                    "language": "en",
+                },
+            ), patch.object(
+                merkraum_api,
+                "_create_linear_ticket",
+                return_value={"identifier": "MER-123", "url": "https://linear.app/t/MER-123"},
+            ):
+                with merkraum_api.app.test_request_context(
+                    "/api/feedback",
+                    method="POST",
+                    json={"feedback": "Please add keyboard shortcuts."},
+                ):
+                    from flask import request
+
+                    request.user_id = "user-123"
+                    request.username = "pat-user"
+                    request.groups = []
+                    request.pat_scopes = ["write"]
+                    request.pat_projects = ["user-123"]
+                    request.pat_all_projects = False
+
+                    response, status = merkraum_api.submit_feedback()
+                    self.assertEqual(status, 201)
+                    payload = response.get_json()
+                    self.assertEqual(payload.get("status"), "ok")
+                    self.assertEqual(payload.get("ticket", {}).get("identifier"), "MER-123")
+
+    def test_chat_cognito_scope_behavior_unchanged(self):
+        with patch.dict(os.environ, {"AUTH_REQUIRED": "false"}, clear=True):
+            import merkraum_api
+
+            previous_adapter = merkraum_api.adapter
+            try:
+                mock_adapter = MagicMock()
+                mock_adapter.vector_search.return_value = []
+                merkraum_api.adapter = mock_adapter
+
+                with patch.object(merkraum_api, "llm_text_call", return_value="Fallback-safe"):
+                    with merkraum_api.app.test_request_context(
+                        "/api/chat?project=user-123",
+                        method="POST",
+                        json={"query": "status?"},
+                    ):
+                        from flask import request
+
+                        request.user_id = "user-123"
+                        request.username = "cognito-user"
+                        request.groups = []
+                        request.pat_scopes = None  # Cognito path: no PAT scope enforcement
+                        request.pat_projects = None
+                        request.pat_all_projects = None
+
+                        response = merkraum_api.chat()
+                        self.assertEqual(response.status_code, 200)
+            finally:
+                merkraum_api.adapter = previous_adapter
+
 class TestMcpTenantHardening(unittest.TestCase):
     @patch.dict(os.environ, {"AUTH_REQUIRED": "true"})
     def test_mcp_check_project_access_honors_pat_project_restrictions(self):

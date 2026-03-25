@@ -2548,6 +2548,7 @@ def search():
 
 @app.route("/api/chat", methods=["POST"])
 @require_auth
+@require_scope("search")
 def chat():
     """Conversational chat over the knowledge graph.
 
@@ -3580,6 +3581,7 @@ def _create_linear_ticket(title: str, description: str) -> dict | None:
 
 @app.route("/api/feedback", methods=["POST"])
 @require_auth
+@require_scope("write")
 def submit_feedback():
     """Submit user feedback — classifies via LLM and creates a Linear ticket.
 

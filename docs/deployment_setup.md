@@ -61,5 +61,7 @@ Browser (app.merkraum.de)
 - `GET /api/beliefs` — list beliefs
 - `GET /api/graph` — graph data (nodes + edges)
 - `POST /api/ingest/text` — LLM-based text ingestion (requires OpenAI key)
-- `GET /api/search?q=...` — semantic search
+- `GET /api/search?q=...` — semantic search (PAT scope: `search`)
+- `POST /api/chat` — chat over graph context (PAT scope: `search`)
+- `POST /api/feedback` — feedback ticket submission (PAT scope: `write`)
 - `GET /api/projects` — list projects

@@ -169,6 +169,17 @@ All tools enforce project-level ACL checks. With PAT auth, read tools require `r
 | `set_pii_mode` | `write` | Configure PII detection (block/warn/log/off) |
 | `health_check` | `read` | Verify Neo4j and Qdrant connectivity |
 
+## API/PAT scope requirements
+
+When using Personal Access Tokens (`mk_pat_...`), endpoint access is restricted by scopes.
+Cognito JWT users keep existing behavior and are not PAT-scope constrained.
+
+| Endpoint | Required PAT scope |
+|---|---|
+| `GET /api/search` | `search` |
+| `POST /api/chat` | `search` |
+| `POST /api/feedback` | `write` |
+
 ## Schema
 
 **Node types**: Person, Organization, Project, Concept, Regulation, Event, Belief, Artifact, Interview, Quote
