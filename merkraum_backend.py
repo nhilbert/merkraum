@@ -654,6 +654,7 @@ class Neo4jBaseAdapter(BackendAdapter):
                     attempted=len(entities),
                 )
         # --- PII Gateway (SUP-182) ---
+        self._last_pii_result = None
         if entities:
             from merkraum_pii import gate_entities, get_pii_settings
             try:
@@ -669,12 +670,37 @@ class Neo4jBaseAdapter(BackendAdapter):
                 )
                 entities = pii_result["entities"]
                 if pii_result["findings"]:
+                    self._last_pii_result = pii_result
                     logger.info(
                         "PII Gateway [%s]: %d finding(s) in %d entities for project %s",
                         pii_settings["mode"], len(pii_result["findings"]),
                         len(pii_result["blocked"]) + len(pii_result["entities"]),
                         project_id,
                     )
+                    # Log PII findings as audit trail entry
+                    try:
+                        with self._driver.session() as pii_session:
+                            pii_tx = pii_session.begin_transaction()
+                            try:
+                                op_id = self._operation_id()
+                                pii_payload = {
+                                    "mode": pii_settings["mode"],
+                                    "language": pii_settings["language"],
+                                    "findings": pii_result["findings"],
+                                    "blocked": pii_result["blocked"],
+                                    "entities_scanned": len(pii_result["entities"]) + len(pii_result["blocked"]),
+                                    "source_type": source_type,
+                                    "source_cycle": source_cycle,
+                                }
+                                self._log_operation(
+                                    pii_tx, op_id, "pii_scan", actor,
+                                    project_id, payload=pii_payload,
+                                )
+                                pii_tx.commit()
+                            except Exception:
+                                pii_tx.rollback()
+                    except Exception as pii_log_err:
+                        logger.warning("Failed to log PII scan: %s", pii_log_err)
         now = datetime.now(timezone.utc).isoformat()
         written = 0
         with self._driver.session() as session:

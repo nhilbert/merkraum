@@ -379,6 +379,127 @@ class TestWriteEntitiesPIIIntegration(unittest.TestCase):
         self.assertEqual(call_kwargs["mode"], "warn")
 
 
+class TestWriteEntitiesPIIAuditLogging(unittest.TestCase):
+    """Test PII gateway audit trail logging in write_entities."""
+
+    def setUp(self):
+        from merkraum_backend import Neo4jQdrantAdapter
+        self.adapter = Neo4jQdrantAdapter.__new__(Neo4jQdrantAdapter)
+        self.adapter._driver = MagicMock()
+        self.adapter._qdrant = None
+        self.adapter._embedder = None
+        self.adapter._neo4j_uri = "bolt://mock:7687"
+        self.adapter._neo4j_user = "neo4j"
+        self.adapter._neo4j_password = "test"
+        self.adapter._qdrant_url = "http://mock:6333"
+        self.adapter._qdrant_api_key = None
+        self.adapter._embed_model_name = "BAAI/bge-small-en-v1.5"
+        # Mock session/tx for entity writes
+        self.session = MagicMock()
+        self.tx = MagicMock()
+        after_result = MagicMock()
+        after_result.single.return_value = {"props": {"name": "mock", "node_type": "Concept"}}
+        self.tx.run.return_value = after_result
+        self.session.begin_transaction.return_value = self.tx
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        self.adapter.vector_upsert = MagicMock(return_value=True)
+        self.adapter.get_project = MagicMock(return_value=None)
+
+    @patch("merkraum_pii.gate_entities")
+    def test_last_pii_result_set_on_findings(self, mock_gate):
+        """Verify _last_pii_result is set when PII findings exist."""
+        self.adapter.get_project.return_value = {"pii_mode": "warn"}
+        findings = [{"entity_type": "PERSON", "text": "John", "score": 0.9, "field": "name", "start": 0, "end": 4}]
+        entities = [{"name": "Test", "node_type": "Concept"}]
+        mock_gate.return_value = {
+            "entities": entities, "findings": findings, "blocked": [], "mode": "warn"
+        }
+        self.adapter.write_entities(entities, "Z1936", project_id="test")
+        self.assertIsNotNone(self.adapter._last_pii_result)
+        self.assertEqual(len(self.adapter._last_pii_result["findings"]), 1)
+        self.assertEqual(self.adapter._last_pii_result["mode"], "warn")
+
+    @patch("merkraum_pii.gate_entities")
+    def test_last_pii_result_none_when_no_findings(self, mock_gate):
+        """Verify _last_pii_result is None when no PII found."""
+        self.adapter.get_project.return_value = {"pii_mode": "warn"}
+        entities = [{"name": "Test", "node_type": "Concept"}]
+        mock_gate.return_value = {
+            "entities": entities, "findings": [], "blocked": [], "mode": "warn"
+        }
+        self.adapter.write_entities(entities, "Z1936", project_id="test")
+        self.assertIsNone(self.adapter._last_pii_result)
+
+    @patch("merkraum_pii.gate_entities")
+    def test_last_pii_result_none_when_off(self, mock_gate):
+        """Verify _last_pii_result is None when mode is off."""
+        self.adapter.get_project.return_value = {"pii_mode": "off"}
+        entities = [{"name": "Test", "node_type": "Concept"}]
+        self.adapter.write_entities(entities, "Z1936", project_id="test")
+        self.assertIsNone(self.adapter._last_pii_result)
+        mock_gate.assert_not_called()
+
+    @patch("merkraum_pii.gate_entities")
+    def test_pii_audit_log_created_on_findings(self, mock_gate):
+        """Verify pii_scan OperationLog entry is created when findings exist."""
+        self.adapter.get_project.return_value = {"pii_mode": "warn"}
+        findings = [{"entity_type": "PERSON", "text": "John", "score": 0.9, "field": "name", "start": 0, "end": 4}]
+        entities = [{"name": "Test", "node_type": "Concept"}]
+        mock_gate.return_value = {
+            "entities": entities, "findings": findings, "blocked": [], "mode": "warn"
+        }
+        # Track _log_operation calls
+        self.adapter._log_operation = MagicMock()
+        self.adapter._operation_id = MagicMock(return_value="test-op-id")
+        self.adapter.write_entities(entities, "Z1936", project_id="test")
+        # _log_operation should be called at least once for pii_scan
+        pii_calls = [
+            c for c in self.adapter._log_operation.call_args_list
+            if len(c[0]) >= 3 and c[0][2] == "pii_scan"
+        ]
+        self.assertEqual(len(pii_calls), 1)
+        # Verify payload structure
+        payload = pii_calls[0][1].get("payload") if pii_calls[0][1] else pii_calls[0][0][5]
+        self.assertIn("findings", payload)
+        self.assertIn("mode", payload)
+        self.assertEqual(payload["mode"], "warn")
+
+    @patch("merkraum_pii.gate_entities")
+    def test_pii_audit_log_not_created_when_no_findings(self, mock_gate):
+        """Verify no pii_scan entry when no findings."""
+        self.adapter.get_project.return_value = {"pii_mode": "warn"}
+        entities = [{"name": "Test", "node_type": "Concept"}]
+        mock_gate.return_value = {
+            "entities": entities, "findings": [], "blocked": [], "mode": "warn"
+        }
+        self.adapter._log_operation = MagicMock()
+        self.adapter.write_entities(entities, "Z1936", project_id="test")
+        pii_calls = [
+            c for c in self.adapter._log_operation.call_args_list
+            if len(c[0]) >= 3 and c[0][2] == "pii_scan"
+        ]
+        self.assertEqual(len(pii_calls), 0)
+
+    @patch("merkraum_pii.gate_entities")
+    def test_log_mode_records_findings(self, mock_gate):
+        """Verify log mode also records PII findings in audit trail."""
+        self.adapter.get_project.return_value = {"pii_mode": "log"}
+        findings = [{"entity_type": "EMAIL_ADDRESS", "text": "test@...", "score": 0.85, "field": "summary", "start": 0, "end": 7}]
+        entities = [{"name": "Test", "node_type": "Concept"}]
+        mock_gate.return_value = {
+            "entities": entities, "findings": findings, "blocked": [], "mode": "log"
+        }
+        self.adapter._log_operation = MagicMock()
+        self.adapter._operation_id = MagicMock(return_value="test-op-id")
+        self.adapter.write_entities(entities, "Z1936", project_id="test")
+        pii_calls = [
+            c for c in self.adapter._log_operation.call_args_list
+            if len(c[0]) >= 3 and c[0][2] == "pii_scan"
+        ]
+        self.assertEqual(len(pii_calls), 1)
+
+
 class TestPIIModes(unittest.TestCase):
     """Verify mode constants."""
 

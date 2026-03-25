@@ -2436,13 +2436,17 @@ def ingest():
                 actor=actor,
             )
 
-        return jsonify(
-            {
+        result = {
                 "entities_written": entities_written,
                 "relationships_written": relationships_written,
                 "project": project,
             }
-        )
+        # Include PII findings in response for warn/log modes
+        pii = getattr(adapter, "_last_pii_result", None)
+        if pii and pii.get("findings"):
+            result["pii_findings"] = pii["findings"]
+            result["pii_mode"] = pii["mode"]
+        return jsonify(result)
     except NodeLimitExceeded as exc:
         return jsonify({
             "error": "node_limit_exceeded",
@@ -2733,7 +2737,7 @@ def ingest_text():
                 actor=actor,
             )
 
-        return jsonify({
+        result = {
             "extracted": {
                 "entities": entities,
                 "relationships": relationships,
@@ -2743,7 +2747,13 @@ def ingest_text():
                 "relationships_written": relationships_written,
             },
             "project": project,
-        })
+        }
+        # Include PII findings in response for warn/log modes
+        pii = getattr(adapter, "_last_pii_result", None)
+        if pii and pii.get("findings"):
+            result["pii_findings"] = pii["findings"]
+            result["pii_mode"] = pii["mode"]
+        return jsonify(result)
     except NodeLimitExceeded as exc:
         return jsonify({
             "extracted": {
