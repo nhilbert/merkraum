@@ -80,6 +80,14 @@ MCP_BASE_URL = os.environ.get("MCP_BASE_URL", "")
 MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION = os.environ.get(
     "MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION", "false"
 ).lower() in ("true", "1", "yes")
+MCP_REGISTRATION_ADMIN_SECRET = os.environ.get("MCP_REGISTRATION_ADMIN_SECRET", "")
+MCP_REGISTRATION_TOKEN_SIGNING_KEY = os.environ.get("MCP_REGISTRATION_TOKEN_SIGNING_KEY", "")
+MCP_REGISTRATION_TOKEN_AUDIENCE = os.environ.get("MCP_REGISTRATION_TOKEN_AUDIENCE", "mcp-register")
+MCP_REGISTRATION_CLIENT_NAME = os.environ.get("MCP_REGISTRATION_CLIENT_NAME", "merkraum-mcp-client")
+MCP_ALLOWED_REDIRECT_URIS = {
+    x.strip() for x in os.environ.get("MCP_ALLOWED_REDIRECT_URIS", "").split(",") if x.strip()
+}
+MCP_REGISTER_RATE_LIMIT_PER_MINUTE = int(os.environ.get("MCP_REGISTER_RATE_LIMIT_PER_MINUTE", "10"))
 
 DEFAULT_BACKEND = os.environ.get("MERKRAUM_BACKEND", "neo4j_qdrant")
 DEFAULT_PROJECT = os.environ.get("MERKRAUM_PROJECT", "default")
@@ -133,13 +141,30 @@ def _validate_auth_config():
     if not MCP_ALLOWED_CLIENT_IDS and not DEV_MODE:
         raise RuntimeError("MCP_ALLOWED_CLIENT_IDS (or MCP_COGNITO_CLIENT_ID) is required in non-dev mode")
 
+    registration_strict_controls = (
+        bool(MCP_ALLOWED_REDIRECT_URIS)
+        and MCP_REGISTER_RATE_LIMIT_PER_MINUTE > 0
+        and (bool(MCP_REGISTRATION_ADMIN_SECRET) or bool(MCP_REGISTRATION_TOKEN_SIGNING_KEY))
+    )
+    if MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION and not registration_strict_controls:
+        detail = (
+            "MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION=true requires strict controls: "
+            "MCP_ALLOWED_REDIRECT_URIS, MCP_REGISTER_RATE_LIMIT_PER_MINUTE>0, and either "
+            "MCP_REGISTRATION_ADMIN_SECRET or MCP_REGISTRATION_TOKEN_SIGNING_KEY."
+        )
+        if DEV_MODE:
+            logger.warning(detail)
+        else:
+            raise RuntimeError(detail)
+
     logger.info(
-        "Auth config loaded: issuer=%s auth_domain=%s base_url=%s allowed_clients=%d dev_mode=%s",
+        "Auth config loaded: issuer=%s auth_domain=%s base_url=%s allowed_clients=%d dev_mode=%s dcr_enabled=%s",
         COGNITO_ISSUER,
         COGNITO_AUTH_DOMAIN,
         MCP_BASE_URL,
         len(MCP_ALLOWED_CLIENT_IDS),
         DEV_MODE,
+        MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION,
     )
 
 
@@ -560,23 +585,94 @@ async def token_proxy(request: Request) -> Response:
 
 # --- Dynamic Client Registration Stub ---
 
+_register_rate_limit_lock = threading.Lock()
+_register_rate_limit_state: dict[str, list[float]] = {}
+
+
+def _verify_registration_token(token: str) -> bool:
+    if not token or not MCP_REGISTRATION_TOKEN_SIGNING_KEY:
+        return False
+    try:
+        import jwt as pyjwt
+
+        pyjwt.decode(
+            token,
+            MCP_REGISTRATION_TOKEN_SIGNING_KEY,
+            algorithms=["HS256"],
+            audience=MCP_REGISTRATION_TOKEN_AUDIENCE,
+            options={"require": ["exp", "aud"]},
+        )
+        return True
+    except Exception:
+        return False
+
+
+def _is_register_rate_limited(client_ip: str) -> bool:
+    if MCP_REGISTER_RATE_LIMIT_PER_MINUTE <= 0:
+        return False
+    now = time.time()
+    window_start = now - 60
+    with _register_rate_limit_lock:
+        entries = _register_rate_limit_state.get(client_ip, [])
+        entries = [ts for ts in entries if ts >= window_start]
+        if len(entries) >= MCP_REGISTER_RATE_LIMIT_PER_MINUTE:
+            _register_rate_limit_state[client_ip] = entries
+            return True
+        entries.append(now)
+        _register_rate_limit_state[client_ip] = entries
+        return False
+
+
+def _validate_redirect_uris(redirect_uris: list[str]) -> list[str]:
+    if not isinstance(redirect_uris, list) or not redirect_uris:
+        raise ValueError("redirect_uris must be a non-empty list")
+    if not MCP_ALLOWED_REDIRECT_URIS:
+        raise ValueError("redirect_uris are not configured")
+    normalized = [str(u).strip() for u in redirect_uris if str(u).strip()]
+    if len(normalized) != len(redirect_uris):
+        raise ValueError("redirect_uris contains invalid entries")
+    disallowed = [u for u in normalized if u not in MCP_ALLOWED_REDIRECT_URIS]
+    if disallowed:
+        raise ValueError("redirect_uris contains values not on allowlist")
+    return normalized
+
 @mcp.custom_route("/register", methods=["POST"])
 async def register_client(request: Request) -> JSONResponse:
     """Return pre-created Cognito app client for MCP OAuth bootstrap."""
     if not MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION:
         return JSONResponse({"error": "registration_disabled"}, status_code=404)
 
+    client_ip = request.client.host if request.client else "unknown"
+    if _is_register_rate_limited(client_ip):
+        return JSONResponse({"error": "rate_limited"}, status_code=429)
+
     try:
         body = await request.json()
     except Exception:
         body = {}
 
+    if not isinstance(body, dict):
+        body = {}
+
+    if not DEV_MODE:
+        header_secret = request.headers.get("x-mcp-admin-secret", "")
+        registration_token = str(body.get("registration_token", "") or "")
+        has_admin_secret = bool(MCP_REGISTRATION_ADMIN_SECRET) and header_secret == MCP_REGISTRATION_ADMIN_SECRET
+        has_signed_token = _verify_registration_token(registration_token)
+        if not (has_admin_secret or has_signed_token):
+            return JSONResponse({"error": "unauthorized_registration"}, status_code=403)
+
+    try:
+        approved_redirect_uris = _validate_redirect_uris(body.get("redirect_uris", []))
+    except ValueError as exc:
+        return JSONResponse({"error": "invalid_redirect_uri", "detail": str(exc)}, status_code=400)
+
     logger.info("AUDIT register client_name=%s", body.get("client_name", "unknown"))
 
     return JSONResponse({
         "client_id": COGNITO_APP_CLIENT_ID,
-        "client_name": body.get("client_name", "mcp-client"),
-        "redirect_uris": body.get("redirect_uris", []),
+        "client_name": MCP_REGISTRATION_CLIENT_NAME,
+        "redirect_uris": approved_redirect_uris,
         "grant_types": ["authorization_code", "refresh_token"],
         "response_types": ["code"],
         "token_endpoint_auth_method": "none",
