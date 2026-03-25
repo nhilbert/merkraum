@@ -504,5 +504,83 @@ class TestMcpCertaintyToolAuthorization(unittest.TestCase):
         adapter.get_certainty_review_queue.assert_not_called()
         adapter.get_certainty_stats.assert_not_called()
 
+
+class _FakeTokenRequest:
+    def __init__(self, body: bytes, headers: dict | None = None, client_host: str = "127.0.0.1"):
+        self._body = body
+        self.headers = headers or {}
+        self.client = SimpleNamespace(host=client_host)
+
+    async def body(self):
+        return self._body
+
+
+class TestTokenProxyHardening(unittest.TestCase):
+    def setUp(self):
+        import merkraum_mcp_server
+        self.server = merkraum_mcp_server
+        with self.server._token_rate_lock:
+            self.server._token_rate_buckets.clear()
+
+    def test_token_proxy_rejects_malformed_json_payload(self):
+        req = _FakeTokenRequest(
+            body=b"{not-json",
+            headers={"content-type": "application/json"},
+        )
+        resp = asyncio.run(self.server.token_proxy(req))
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.body, b'{"error":"invalid_request"}')
+
+    def test_token_proxy_rejects_oversized_body(self):
+        body = b"x" * (self.server.TOKEN_MAX_BODY_BYTES + 1)
+        req = _FakeTokenRequest(
+            body=body,
+            headers={
+                "content-type": "application/json",
+                "content-length": str(len(body)),
+            },
+        )
+        resp = asyncio.run(self.server.token_proxy(req))
+        self.assertEqual(resp.status_code, 413)
+        self.assertEqual(resp.body, b'{"error":"invalid_request"}')
+
+    def test_token_proxy_rejects_unsupported_grant_type(self):
+        req = _FakeTokenRequest(
+            body=b'{"grant_type":"password","client_id":"cid"}',
+            headers={"content-type": "application/json"},
+        )
+        resp = asyncio.run(self.server.token_proxy(req))
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.body, b'{"error":"unsupported_grant_type"}')
+
+    def test_token_proxy_rate_limits_per_ip_and_client(self):
+        old_limit = self.server.TOKEN_RATE_LIMIT_MAX_REQUESTS
+        old_token_url = self.server.COGNITO_TOKEN_URL
+        self.server.TOKEN_RATE_LIMIT_MAX_REQUESTS = 1
+        self.server.COGNITO_TOKEN_URL = "https://example.com/oauth2/token"
+        try:
+            body = b'{"grant_type":"refresh_token","refresh_token":"rt1","client_id":"cid"}'
+            req1 = _FakeTokenRequest(body=body, headers={"content-type": "application/json"})
+            req2 = _FakeTokenRequest(body=body, headers={"content-type": "application/json"})
+
+            with patch("urllib.request.urlopen") as mock_urlopen:
+                mock_resp = MagicMock()
+                mock_resp.read.return_value = b'{"access_token":"ok"}'
+                mock_resp.status = 200
+                mock_resp.headers = {"Content-Type": "application/json"}
+                mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+                first = asyncio.run(self.server.token_proxy(req1))
+                second = asyncio.run(self.server.token_proxy(req2))
+
+            self.assertEqual(first.status_code, 200)
+            self.assertEqual(second.status_code, 429)
+            self.assertEqual(second.body, b'{"error":"temporarily_unavailable"}')
+        finally:
+            self.server.TOKEN_RATE_LIMIT_MAX_REQUESTS = old_limit
+            self.server.COGNITO_TOKEN_URL = old_token_url
+            with self.server._token_rate_lock:
+                self.server._token_rate_buckets.clear()
+
 if __name__ == "__main__":
     unittest.main()
