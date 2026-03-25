@@ -196,6 +196,18 @@ Copy `.env.example` to `.env` to customize:
 - MCP OAuth config is fail-closed in non-dev mode: set `COGNITO_AWS_REGION`, `COGNITO_USER_POOL_ID`, `COGNITO_AUTH_DOMAIN`, `MCP_BASE_URL`, and `MCP_ALLOWED_CLIENT_IDS` (or `MCP_COGNITO_CLIENT_ID`).
 - Dynamic OAuth client registration (`/register`) is disabled by default; explicitly set `MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION=true` only when protected by additional controls.
 
+### PAT token endpoint contract (`POST /api/tokens`)
+
+Public request fields:
+
+- `name` (required)
+- `scopes` (optional array, defaults to `["read","search"]`)
+- `projects` (optional array)
+- `all_projects` (optional boolean)
+- `expires_in_days` (optional integer, 1..365)
+
+`tier` is **not** part of the public request contract. Token tier limits are resolved server-side from stored project/user metadata.
+
 ## System requirements
 
 - Docker and Docker Compose

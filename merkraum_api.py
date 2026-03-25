@@ -42,7 +42,13 @@ from merkraum_backend import (
     Neo4jBaseAdapter, NodeLimitExceeded, TIER_LIMITS,
 )
 from merkraum_pii import PIIDetected
-from jwt_auth import get_cognito_validator, require_auth, require_scope, PATValidator
+from jwt_auth import (
+    get_cognito_validator,
+    require_auth,
+    require_scope,
+    PATValidator,
+    PAT_TIER_LIMITS,
+)
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -174,6 +180,42 @@ def _actor() -> str:
 
 def _error(message: str, status: int = 500):
     return jsonify({'error': message}), status
+
+
+def _strictest_tier(tiers: list[str]) -> str:
+    """Resolve strictest tier by PAT token limit (lowest numeric limit is strictest)."""
+    resolved = [t for t in tiers if t in PAT_TIER_LIMITS]
+    if not resolved:
+        return "free"
+
+    def _limit_for_sort(tier_name: str) -> float:
+        limit = PAT_TIER_LIMITS[tier_name]
+        return float("inf") if limit is None else float(limit)
+
+    return min(resolved, key=_limit_for_sort)
+
+
+def _resolve_effective_pat_tier(
+    requested_projects: list[str],
+    all_projects: bool,
+) -> tuple[str, dict[str, str]]:
+    """Resolve PAT tier exclusively from server-side project/user metadata."""
+    if all_projects:
+        project_ids = [getattr(request, "user_id", None) or "default"]
+    elif requested_projects:
+        project_ids = requested_projects
+    else:
+        project_ids = [getattr(request, "user_id", None) or "default"]
+
+    project_tiers: dict[str, str] = {}
+    for project_id in project_ids:
+        proj_meta = adapter.get_project(project_id) if adapter else None
+        tier = (proj_meta or {}).get("tier", "free")
+        if tier not in PAT_TIER_LIMITS:
+            tier = "free"
+        project_tiers[project_id] = tier
+
+    return _strictest_tier(list(project_tiers.values())), project_tiers
 
 
 def _token_has_scope(scope: str) -> bool:
@@ -2985,6 +3027,10 @@ def create_token():
             "all_projects": false,
             "expires_in_days": 90
         }
+
+    Notes:
+        - Request payload tier is ignored/rejected.
+        - Effective tier is derived server-side from stored project/user metadata.
     """
     # PATs cannot create other PATs (only Cognito users can)
     if getattr(request, "pat_scopes", None) is not None:
@@ -3024,7 +3070,19 @@ def create_token():
         except (TypeError, ValueError):
             return _error("'expires_in_days' must be an integer", 400)
 
-    tier = body.get("tier") or "free"
+    if "tier" in body:
+        return _error("'tier' is not accepted in token requests; tier is derived server-side", 400)
+
+    effective_tier, project_tiers = _resolve_effective_pat_tier(
+        requested_projects=projects,
+        all_projects=all_projects,
+    )
+    if len(set(project_tiers.values())) > 1:
+        logger.info(
+            "PAT create request spans mixed project tiers; using strictest tier '%s': %s",
+            effective_tier,
+            project_tiers,
+        )
 
     try:
         result = pat_validator.create_token(
@@ -3034,7 +3092,7 @@ def create_token():
             projects=projects,
             all_projects=all_projects,
             expires_at=expires_at,
-            tier=tier,
+            tier=effective_tier,
         )
         logger.info(
             "PAT created: prefix=%s owner=%s scopes=%s",
