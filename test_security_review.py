@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import asyncio
+import json
 import os
 import unittest
 from types import SimpleNamespace
@@ -581,6 +582,146 @@ class TestTokenProxyHardening(unittest.TestCase):
             self.server.COGNITO_TOKEN_URL = old_token_url
             with self.server._token_rate_lock:
                 self.server._token_rate_buckets.clear()
+
+
+class TestMcpDynamicClientRegistrationHardening(unittest.TestCase):
+    def _make_request(self, body, headers=None, ip="127.0.0.1"):
+        if headers is None:
+            headers = {}
+        async def _json():
+            return body
+        return SimpleNamespace(
+            headers=headers,
+            client=SimpleNamespace(host=ip),
+            json=_json,
+        )
+
+    def test_register_requires_non_dev_second_gate(self):
+        import merkraum_mcp_server
+
+        old_state = (
+            merkraum_mcp_server.MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION,
+            merkraum_mcp_server.DEV_MODE,
+            merkraum_mcp_server.MCP_REGISTRATION_ADMIN_SECRET,
+            merkraum_mcp_server.MCP_REGISTRATION_TOKEN_SIGNING_KEY,
+            set(merkraum_mcp_server.MCP_ALLOWED_REDIRECT_URIS),
+            merkraum_mcp_server.MCP_REGISTER_RATE_LIMIT_PER_MINUTE,
+        )
+        try:
+            merkraum_mcp_server.MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION = True
+            merkraum_mcp_server.DEV_MODE = False
+            merkraum_mcp_server.MCP_REGISTRATION_ADMIN_SECRET = "top-secret"
+            merkraum_mcp_server.MCP_REGISTRATION_TOKEN_SIGNING_KEY = ""
+            merkraum_mcp_server.MCP_ALLOWED_REDIRECT_URIS = {"https://example.com/callback"}
+            merkraum_mcp_server.MCP_REGISTER_RATE_LIMIT_PER_MINUTE = 100
+            with merkraum_mcp_server._register_rate_limit_lock:
+                merkraum_mcp_server._register_rate_limit_state.clear()
+
+            req = self._make_request({"redirect_uris": ["https://example.com/callback"]})
+            resp = asyncio.run(merkraum_mcp_server.register_client(req))
+            self.assertEqual(resp.status_code, 403)
+        finally:
+            (
+                merkraum_mcp_server.MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION,
+                merkraum_mcp_server.DEV_MODE,
+                merkraum_mcp_server.MCP_REGISTRATION_ADMIN_SECRET,
+                merkraum_mcp_server.MCP_REGISTRATION_TOKEN_SIGNING_KEY,
+                merkraum_mcp_server.MCP_ALLOWED_REDIRECT_URIS,
+                merkraum_mcp_server.MCP_REGISTER_RATE_LIMIT_PER_MINUTE,
+            ) = old_state
+
+    def test_register_validates_redirect_uris_and_returns_only_approved_metadata(self):
+        import merkraum_mcp_server
+
+        old_state = (
+            merkraum_mcp_server.MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION,
+            merkraum_mcp_server.DEV_MODE,
+            merkraum_mcp_server.MCP_REGISTRATION_ADMIN_SECRET,
+            merkraum_mcp_server.MCP_ALLOWED_REDIRECT_URIS,
+            merkraum_mcp_server.MCP_REGISTRATION_CLIENT_NAME,
+            merkraum_mcp_server.MCP_REGISTER_RATE_LIMIT_PER_MINUTE,
+        )
+        try:
+            merkraum_mcp_server.MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION = True
+            merkraum_mcp_server.DEV_MODE = False
+            merkraum_mcp_server.MCP_REGISTRATION_ADMIN_SECRET = "top-secret"
+            merkraum_mcp_server.MCP_ALLOWED_REDIRECT_URIS = {"https://example.com/callback"}
+            merkraum_mcp_server.MCP_REGISTRATION_CLIENT_NAME = "approved-client-name"
+            merkraum_mcp_server.MCP_REGISTER_RATE_LIMIT_PER_MINUTE = 100
+            with merkraum_mcp_server._register_rate_limit_lock:
+                merkraum_mcp_server._register_rate_limit_state.clear()
+
+            req = self._make_request(
+                {
+                    "client_name": "attacker-name",
+                    "redirect_uris": ["https://example.com/callback"],
+                    "token_endpoint_auth_method": "client_secret_post",
+                },
+                headers={"x-mcp-admin-secret": "top-secret"},
+            )
+            resp = asyncio.run(merkraum_mcp_server.register_client(req))
+            self.assertEqual(resp.status_code, 201)
+            payload = json.loads(resp.body)
+            self.assertEqual(payload["client_name"], "approved-client-name")
+            self.assertEqual(payload["redirect_uris"], ["https://example.com/callback"])
+            self.assertEqual(payload["token_endpoint_auth_method"], "none")
+
+            bad_req = self._make_request(
+                {"redirect_uris": ["https://evil.example/callback"]},
+                headers={"x-mcp-admin-secret": "top-secret"},
+                ip="127.0.0.2",
+            )
+            bad_resp = asyncio.run(merkraum_mcp_server.register_client(bad_req))
+            self.assertEqual(bad_resp.status_code, 400)
+        finally:
+            (
+                merkraum_mcp_server.MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION,
+                merkraum_mcp_server.DEV_MODE,
+                merkraum_mcp_server.MCP_REGISTRATION_ADMIN_SECRET,
+                merkraum_mcp_server.MCP_ALLOWED_REDIRECT_URIS,
+                merkraum_mcp_server.MCP_REGISTRATION_CLIENT_NAME,
+                merkraum_mcp_server.MCP_REGISTER_RATE_LIMIT_PER_MINUTE,
+            ) = old_state
+
+    def test_register_rate_limited(self):
+        import merkraum_mcp_server
+
+        old_state = (
+            merkraum_mcp_server.MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION,
+            merkraum_mcp_server.DEV_MODE,
+            merkraum_mcp_server.MCP_REGISTRATION_ADMIN_SECRET,
+            merkraum_mcp_server.MCP_ALLOWED_REDIRECT_URIS,
+            merkraum_mcp_server.MCP_REGISTER_RATE_LIMIT_PER_MINUTE,
+        )
+        try:
+            merkraum_mcp_server.MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION = True
+            merkraum_mcp_server.DEV_MODE = False
+            merkraum_mcp_server.MCP_REGISTRATION_ADMIN_SECRET = "top-secret"
+            merkraum_mcp_server.MCP_ALLOWED_REDIRECT_URIS = {"https://example.com/callback"}
+            merkraum_mcp_server.MCP_REGISTER_RATE_LIMIT_PER_MINUTE = 1
+            with merkraum_mcp_server._register_rate_limit_lock:
+                merkraum_mcp_server._register_rate_limit_state.clear()
+
+            req1 = self._make_request(
+                {"redirect_uris": ["https://example.com/callback"]},
+                headers={"x-mcp-admin-secret": "top-secret"},
+            )
+            req2 = self._make_request(
+                {"redirect_uris": ["https://example.com/callback"]},
+                headers={"x-mcp-admin-secret": "top-secret"},
+            )
+            first = asyncio.run(merkraum_mcp_server.register_client(req1))
+            second = asyncio.run(merkraum_mcp_server.register_client(req2))
+            self.assertEqual(first.status_code, 201)
+            self.assertEqual(second.status_code, 429)
+        finally:
+            (
+                merkraum_mcp_server.MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION,
+                merkraum_mcp_server.DEV_MODE,
+                merkraum_mcp_server.MCP_REGISTRATION_ADMIN_SECRET,
+                merkraum_mcp_server.MCP_ALLOWED_REDIRECT_URIS,
+                merkraum_mcp_server.MCP_REGISTER_RATE_LIMIT_PER_MINUTE,
+            ) = old_state
 
 if __name__ == "__main__":
     unittest.main()

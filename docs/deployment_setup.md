@@ -97,3 +97,58 @@ location = /token {
     proxy_pass http://127.0.0.1:8090/token;
 }
 ```
+
+## Safe enablement: MCP dynamic client registration (`/register`)
+
+Dynamic client registration is **disabled by default** (`MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION=false`).  
+Only enable it when all controls below are configured.
+
+### Required environment variables
+
+```bash
+# Explicit opt-in
+MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION=true
+
+# Redirect allowlist (comma-separated exact URIs)
+MCP_ALLOWED_REDIRECT_URIS=https://claude.ai/oauth/callback,https://example.com/mcp/callback
+
+# App-level throttle (requests per IP per minute)
+MCP_REGISTER_RATE_LIMIT_PER_MINUTE=10
+
+# At least ONE non-dev registration gate:
+# Option A: shared admin bootstrap secret header (X-MCP-Admin-Secret)
+MCP_REGISTRATION_ADMIN_SECRET=<long-random-secret>
+
+# Option B: signed registration token validation (HS256)
+MCP_REGISTRATION_TOKEN_SIGNING_KEY=<long-random-hmac-key>
+MCP_REGISTRATION_TOKEN_AUDIENCE=mcp-register
+```
+
+### Startup behavior
+
+- If `MCP_ENABLE_DYNAMIC_CLIENT_REGISTRATION=true` **without strict controls**:
+  - **non-dev**: server startup fails fast with an explicit error.
+  - **dev**: server startup logs an explicit warning.
+
+### Gateway-level rate limiting (nginx)
+
+In addition to app-level throttling, configure edge/gateway limits:
+
+```nginx
+limit_req_zone $binary_remote_addr zone=mcp_register_limit:10m rate=10r/m;
+
+location = /register {
+    limit_req zone=mcp_register_limit burst=5 nodelay;
+    proxy_pass http://127.0.0.1:8090/register;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+}
+```
+
+### Operational notes
+
+- Response metadata from `/register` is server-approved only (no arbitrary echo of request fields).
+- `redirect_uris` are accepted only when every value is exactly allowlisted.
+- In non-dev, registration requires either `X-MCP-Admin-Secret` or a valid signed `registration_token`.

@@ -206,12 +206,14 @@ Implemented in code:
 4. API auth default is now secure-by-default (`AUTH_REQUIRED=true` unless explicitly disabled or `DEV_MODE=true`).
 5. Token proxy no longer returns raw exception text to clients.
 6. Dynamic client registration (`/register`) is now disabled by default and must be explicitly enabled.
-7. API default bind host is now loopback (`127.0.0.1`) and startup blocks non-loopback binds when auth is disabled.
+7. `/register` now has non-dev hard gates (admin secret header or signed registration token), strict redirect URI allowlisting, approved-only response metadata, and in-process rate limiting.
+8. MCP startup now emits an explicit warning (dev) or startup error (non-dev) when dynamic registration is enabled without strict controls configured.
+9. API default bind host is now loopback (`127.0.0.1`) and startup blocks non-loopback binds when auth is disabled.
 
 Partially addressed / deferred:
 
 1. URL egress hardening remains partial (basic HTTPS URL validation for configured auth endpoints added; full host allowlisting across all adapters still pending).
-2. Registration endpoint still lacks built-in application-layer rate limiting when enabled.
+2. Gateway rate-limiting policy for `/register` still must be configured per deployment (nginx/CloudFront/WAF), even though app-level throttling now exists.
 
 ### Immediate (0–7 days)
 
