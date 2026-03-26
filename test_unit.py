@@ -644,6 +644,51 @@ class TestDeleteProjectData(unittest.TestCase):
         self.assertEqual(counts["nodes_deleted"], 5)
 
 
+class TestDeleteProjectDataQdrantCleanup(unittest.TestCase):
+    """Test that Neo4jQdrantAdapter.delete_project_data also clears Qdrant."""
+
+    def setUp(self):
+        self.adapter = _make_mock_adapter()
+        self.adapter._qdrant = MagicMock()
+        self.session = MagicMock()
+        self.adapter._driver.session.return_value.__enter__ = lambda s: self.session
+        self.adapter._driver.session.return_value.__exit__ = MagicMock(return_value=False)
+        mock_result = MagicMock()
+        mock_result.single.return_value = {"c": 3}
+        self.session.run.return_value = mock_result
+
+    def test_deletes_qdrant_collection(self):
+        counts = self.adapter.delete_project_data("test_project")
+        self.adapter._qdrant.delete_collection.assert_called_once_with(
+            collection_name="test_project"
+        )
+        self.assertEqual(counts["nodes_deleted"], 3)
+        self.assertTrue(counts["vectors_deleted"])
+
+    def test_qdrant_collection_name_sanitized(self):
+        counts = self.adapter.delete_project_data("user:project")
+        self.adapter._qdrant.delete_collection.assert_called_once_with(
+            collection_name="user_project"
+        )
+        self.assertTrue(counts["vectors_deleted"])
+
+    def test_qdrant_failure_does_not_block_neo4j_delete(self):
+        self.adapter._qdrant.delete_collection.side_effect = Exception("Qdrant down")
+        counts = self.adapter.delete_project_data("test_project")
+        self.assertEqual(counts["nodes_deleted"], 3)
+        self.assertFalse(counts["vectors_deleted"])
+
+    def test_no_qdrant_client_skips_vector_cleanup(self):
+        self.adapter._qdrant = None
+        counts = self.adapter.delete_project_data("test_project")
+        self.assertEqual(counts["nodes_deleted"], 3)
+        self.assertNotIn("vectors_deleted", counts)
+
+    def test_cannot_delete_default_still_raises(self):
+        with self.assertRaises(ValueError):
+            self.adapter.delete_project_data("default")
+
+
 # --- Adapter-specific tests ---
 
 class TestNeo4jBaseAdapterCredentials(unittest.TestCase):

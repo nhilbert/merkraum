@@ -3705,6 +3705,23 @@ class Neo4jQdrantAdapter(Neo4jBaseAdapter):
             logger.warning("Qdrant delete failed: %s", e)
             return False
 
+    def delete_project_data(self, project_id):
+        """Delete project data from both Neo4j and Qdrant."""
+        # Neo4j cleanup (parent method)
+        counts = super().delete_project_data(project_id)
+        # Qdrant cleanup — delete the entire collection for this project
+        if self._qdrant:
+            collection = self._get_collection_name(project_id)
+            try:
+                self._qdrant.delete_collection(collection_name=collection)
+                counts["vectors_deleted"] = True
+                logger.info("Deleted Qdrant collection: %s", collection)
+            except Exception as e:
+                counts["vectors_deleted"] = False
+                logger.warning("Qdrant collection delete failed for %s: %s",
+                               collection, e)
+        return counts
+
 
 class Neo4jPineconeAdapter(Neo4jBaseAdapter):
     """Concrete adapter wrapping Neo4j + Pinecone (managed/cloud).
@@ -3714,22 +3731,42 @@ class Neo4jPineconeAdapter(Neo4jBaseAdapter):
 
     v1.0 — Z1134 (2026-03-07)
     v1.1 — Z1336: Inherits shared graph ops from Neo4jBaseAdapter.
+    v1.2 — Z2004: Use fastembed (bge-small-en-v1.5, 384-dim) instead of
+           Pinecone inference API (llama-text-embed-v2, 1024-dim) for
+           compatibility with migrated Qdrant data. Default index: merkraum.
     """
 
+    DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+
     def __init__(self, neo4j_uri=None, neo4j_user=None, neo4j_password=None,
-                 pinecone_api_key=None, pinecone_index="vsg-memory"):
+                 pinecone_api_key=None, pinecone_index="merkraum",
+                 embed_model=None):
         self._neo4j_uri = neo4j_uri
         self._neo4j_user = neo4j_user
         self._neo4j_password = neo4j_password
         self._pinecone_api_key = pinecone_api_key
         self._pinecone_index = pinecone_index
+        self._embed_model_name = embed_model or self.DEFAULT_EMBED_MODEL
         self._pinecone_host = None
         self._driver = None
+        self._embedder = None
 
     def connect(self):
         self._load_credentials()
         self._connect_neo4j()
         self._resolve_pinecone_host()
+        self._init_embedder()
+
+    def _init_embedder(self):
+        try:
+            from fastembed import TextEmbedding
+            self._embedder = TextEmbedding(model_name=self._embed_model_name)
+            logger.info("FastEmbed initialized: %s", self._embed_model_name)
+        except ImportError:
+            logger.warning("fastembed not installed — vector operations will fail. "
+                           "Install with: pip install fastembed")
+        except Exception as e:
+            logger.warning("FastEmbed init failed: %s", e)
 
     def _load_credentials(self):
         env = self._load_neo4j_credentials()
@@ -3760,6 +3797,7 @@ class Neo4jPineconeAdapter(Neo4jBaseAdapter):
         if self._driver:
             self._driver.close()
             self._driver = None
+        self._embedder = None
 
     def is_healthy(self) -> bool:
         neo4j_ok = False
@@ -3878,28 +3916,42 @@ class Neo4jPineconeAdapter(Neo4jBaseAdapter):
             logger.warning("Pinecone delete failed: %s", e)
             return False
 
+    def delete_project_data(self, project_id):
+        """Delete project data from both Neo4j and Pinecone."""
+        # Neo4j cleanup (parent method)
+        counts = super().delete_project_data(project_id)
+        # Pinecone cleanup — delete all vectors in the knowledge namespace
+        if self._pinecone_host and self._pinecone_api_key:
+            ns = "knowledge"
+            try:
+                headers = {
+                    "Api-Key": self._pinecone_api_key,
+                    "Content-Type": "application/json",
+                }
+                body = json.dumps({"deleteAll": True, "namespace": ns})
+                req = urllib.request.Request(
+                    f"https://{self._pinecone_host}/vectors/delete",
+                    data=body.encode(),
+                    headers=headers,
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    json.loads(resp.read())
+                counts["vectors_deleted"] = True
+                logger.info("Deleted Pinecone vectors for project %s", project_id)
+            except Exception as e:
+                counts["vectors_deleted"] = False
+                logger.warning("Pinecone delete failed for project %s: %s",
+                               project_id, e)
+        return counts
+
     def _embed_text(self, text):
-        """Embed text using Pinecone's inference API (llama-text-embed-v2)."""
+        """Embed text using local fastembed (bge-small-en-v1.5, 384-dim)."""
+        if not self._embedder:
+            logger.warning("No embedder available")
+            return None
         try:
-            headers = {
-                "Api-Key": self._pinecone_api_key,
-                "X-Pinecone-API-Version": "2025-04",
-                "Content-Type": "application/json",
-            }
-            body = json.dumps({
-                "model": "llama-text-embed-v2",
-                "inputs": [{"text": text}],
-                "parameters": {"input_type": "query", "truncate": "END"},
-            })
-            req = urllib.request.Request(
-                "https://api.pinecone.io/embed",
-                data=body.encode(),
-                headers=headers,
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-            return data["data"][0]["values"]
+            embeddings = list(self._embedder.embed([text]))
+            return embeddings[0].tolist()
         except Exception as e:
             logger.warning("Embedding failed: %s", e)
             return None
