@@ -3704,6 +3704,215 @@ def submit_feedback():
     return jsonify(response), 201
 
 
+# ---------------------------------------------------------------------------
+# Admin endpoints (SUP-183/184/186)
+# ---------------------------------------------------------------------------
+
+def _require_admin():
+    """Check if current user is in ADMIN_GROUPS. Returns error response or None."""
+    if not _is_auth_required():
+        return None  # Dev mode — allow
+    groups = set(getattr(request, "groups", []) or [])
+    admin_groups = _split_csv_env("ADMIN_GROUPS")
+    if not admin_groups or not groups.intersection(admin_groups):
+        return _error("Admin access required", 403)
+    return None
+
+
+@app.route("/api/admin/users", methods=["GET"])
+@require_auth
+def admin_list_users():
+    """List all Cognito users with their project/tier info.
+
+    Requires: Admin group membership.
+
+    Returns: list of user objects with sub, email, status, created,
+             and their projects with tier/usage info.
+    """
+    denied = _require_admin()
+    if denied:
+        return denied
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+
+    try:
+        import boto3
+        region = os.environ.get("COGNITO_AWS_REGION", "eu-central-1")
+        pool_id = os.environ.get("COGNITO_USER_POOL_ID", "")
+        if not pool_id:
+            return _error("Cognito not configured", 503)
+
+        client = boto3.client("cognito-idp", region_name=region)
+        users = []
+        pagination_token = None
+
+        while True:
+            kwargs = {
+                "UserPoolId": pool_id,
+                "Limit": 60,
+                "AttributesToGet": ["sub", "email", "email_verified"],
+            }
+            if pagination_token:
+                kwargs["PaginationToken"] = pagination_token
+            resp = client.list_users(**kwargs)
+
+            for u in resp.get("Users", []):
+                attrs = {a["Name"]: a["Value"] for a in u.get("Attributes", [])}
+                user_sub = attrs.get("sub", "")
+                # Look up projects owned by this user
+                user_projects = adp.list_projects(owner=user_sub)
+                projects_info = []
+                for proj in user_projects:
+                    pid = proj.get("project_id", "")
+                    try:
+                        usage = adp.get_usage(project_id=pid)
+                    except Exception:
+                        usage = {"nodes": 0, "edges": 0}
+                    projects_info.append({
+                        "project_id": pid,
+                        "name": proj.get("name", ""),
+                        "tier": proj.get("tier", "free"),
+                        "nodes": usage.get("nodes", 0),
+                        "edges": usage.get("edges", 0),
+                        "node_limit": TIER_LIMITS.get(proj.get("tier", "free"), 100),
+                    })
+
+                users.append({
+                    "sub": user_sub,
+                    "email": attrs.get("email", ""),
+                    "email_verified": attrs.get("email_verified", "false") == "true",
+                    "status": u.get("UserStatus", ""),
+                    "enabled": u.get("Enabled", False),
+                    "created": u.get("UserCreateDate", "").isoformat()
+                        if hasattr(u.get("UserCreateDate", ""), "isoformat")
+                        else str(u.get("UserCreateDate", "")),
+                    "last_modified": u.get("UserLastModifiedDate", "").isoformat()
+                        if hasattr(u.get("UserLastModifiedDate", ""), "isoformat")
+                        else str(u.get("UserLastModifiedDate", "")),
+                    "projects": projects_info,
+                    "project_count": len(projects_info),
+                    "total_nodes": sum(p["nodes"] for p in projects_info),
+                })
+
+            pagination_token = resp.get("PaginationToken")
+            if not pagination_token:
+                break
+
+        return jsonify(users)
+    except Exception as exc:
+        logger.exception("admin_list_users failed")
+        return _error(str(exc))
+
+
+@app.route("/api/admin/stats", methods=["GET"])
+@require_auth
+def admin_stats():
+    """Aggregate platform statistics for admin dashboard.
+
+    Requires: Admin group membership.
+
+    Returns: total users, projects, nodes, edges, breakdown by tier.
+    """
+    denied = _require_admin()
+    if denied:
+        return denied
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+
+    try:
+        # Get all projects (no owner filter = admin view)
+        all_projects = adp.list_projects(owner=None)
+
+        tier_breakdown = {}
+        total_nodes = 0
+        total_edges = 0
+        for proj in all_projects:
+            pid = proj.get("project_id", "")
+            tier = proj.get("tier", "free")
+            try:
+                usage = adp.get_usage(project_id=pid)
+            except Exception:
+                usage = {"nodes": 0, "edges": 0}
+            nodes = usage.get("nodes", 0)
+            edges = usage.get("edges", 0)
+            total_nodes += nodes
+            total_edges += edges
+
+            if tier not in tier_breakdown:
+                tier_breakdown[tier] = {"projects": 0, "nodes": 0, "edges": 0}
+            tier_breakdown[tier]["projects"] += 1
+            tier_breakdown[tier]["nodes"] += nodes
+            tier_breakdown[tier]["edges"] += edges
+
+        # Count distinct owners
+        owners = {p.get("owner", "") for p in all_projects if p.get("owner")}
+
+        return jsonify({
+            "total_users": len(owners),
+            "total_projects": len(all_projects),
+            "total_nodes": total_nodes,
+            "total_edges": total_edges,
+            "tier_breakdown": tier_breakdown,
+        })
+    except Exception as exc:
+        logger.exception("admin_stats failed")
+        return _error(str(exc))
+
+
+@app.route("/api/admin/users/<path:user_id>/tier", methods=["PATCH"])
+@require_auth
+def admin_update_user_tier(user_id):
+    """Update the tier for all projects owned by a user.
+
+    Requires: Admin group membership.
+
+    Body (JSON):
+        tier: new tier (free, pro, team, enterprise)
+
+    Returns: updated project list for the user.
+    """
+    denied = _require_admin()
+    if denied:
+        return denied
+    adp = adapter
+    if adp is None:
+        return _error("Adapter not initialized", 503)
+
+    body = request.get_json(silent=True) or {}
+    new_tier = body.get("tier", "")
+    if new_tier not in TIER_LIMITS:
+        return _error(
+            f"Invalid tier: {new_tier}. Valid: {list(TIER_LIMITS.keys())}", 400
+        )
+
+    try:
+        user_projects = adp.list_projects(owner=user_id)
+        if not user_projects:
+            return _error(f"No projects found for user: {user_id}", 404)
+
+        updated = []
+        for proj in user_projects:
+            pid = proj.get("project_id", "")
+            result = adp.update_project(pid, tier=new_tier)
+            updated.append(result)
+
+        logger.info(
+            "Admin %s updated tier to '%s' for user %s (%d projects)",
+            _actor(), new_tier, user_id, len(updated),
+        )
+        return jsonify({
+            "user_id": user_id,
+            "tier": new_tier,
+            "projects_updated": len(updated),
+            "projects": updated,
+        })
+    except Exception as exc:
+        logger.exception("admin_update_user_tier failed")
+        return _error(str(exc))
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Merkraum REST API server",
