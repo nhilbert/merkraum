@@ -1098,14 +1098,14 @@ def projects():
             return jsonify(project_list)
 
         # Legacy mode: just project_id strings
+        # Always filter by ownership — never leak other users' project IDs
         with adp._driver.session() as session:
             records = session.run(
                 "MATCH (n) WHERE n.project_id IS NOT NULL "
                 "RETURN DISTINCT n.project_id AS pid ORDER BY pid"
             )
-            project_ids = [rec["pid"] for rec in records]
-            if _is_auth_required():
-                project_ids = [pid for pid in project_ids if _is_project_allowed(pid)]
+            project_ids = [rec["pid"] for rec in records
+                           if _is_project_allowed(pid=rec["pid"])]
 
         # Auto-provision in legacy mode too
         if not project_ids and _is_auth_required():
@@ -2527,6 +2527,8 @@ def search():
         return _error("Query parameter 'q' is required", 400)
 
     project = _project_id()
+    if not project or project == "default":
+        return _error("Query parameter 'project' is required", 400)
     denied = _deny_if_project_forbidden(project)
     if denied:
         return denied
@@ -2574,6 +2576,8 @@ def chat():
         return _error("'query' must not exceed 2000 characters", 400)
 
     project = body.get("project") or _project_id()
+    if not project or project == "default":
+        return _error("'project' is required — specify a valid project ID", 400)
     denied = _deny_if_project_forbidden(project)
     if denied:
         return denied

@@ -463,7 +463,12 @@ class Neo4jBaseAdapter(BackendAdapter):
             else:
                 name = (metadata.get("name") or "").strip().lower()
                 node_type = (metadata.get("node_type") or "").strip() or "Concept"
-                metadata_project = (metadata.get("project_id") or project_id).strip()
+                metadata_project = (metadata.get("project_id") or "").strip()
+                if not metadata_project:
+                    # Skip vectors missing project_id in payload — they are
+                    # legacy/orphaned data that should not be attributed to the
+                    # requesting project (SUP-192 cross-project source fix).
+                    continue
                 if name:
                     key = ("fallback", metadata_project, node_type, name)
                 else:

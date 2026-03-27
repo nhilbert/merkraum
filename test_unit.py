@@ -4512,5 +4512,108 @@ class TestDreamV2Legacy(unittest.TestCase):
         self.assertIn("ttl_scale_factor", config)
 
 
+class TestSUP192CrossProjectIsolation(unittest.TestCase):
+    """SUP-192: Chat must not display sources from other projects."""
+
+    def _make_adapter(self):
+        """Create a mock Neo4jQdrantAdapter for testing."""
+        with patch("merkraum_backend.Neo4jQdrantAdapter.__init__", return_value=None):
+            adapter = Neo4jQdrantAdapter.__new__(Neo4jQdrantAdapter)
+        adapter._driver = MagicMock()
+        adapter._qdrant = MagicMock()
+        adapter._embedder = MagicMock()
+        adapter._pii_gateway = None
+        return adapter
+
+    def test_dedupe_skips_vectors_without_project_id(self):
+        """Vectors missing project_id in payload must not be attributed to
+        the requesting project — they should be skipped entirely."""
+        adapter = self._make_adapter()
+        results = [
+            {
+                "id": "vec-1",
+                "score": 0.95,
+                "content": "Some content",
+                "metadata": {
+                    "name": "Entity A",
+                    "node_type": "Concept",
+                    # NOTE: no project_id in metadata
+                },
+            },
+            {
+                "id": "vec-2",
+                "score": 0.85,
+                "content": "Other content",
+                "metadata": {
+                    "name": "Entity B",
+                    "node_type": "Concept",
+                    "project_id": "user123:my-project",
+                },
+            },
+        ]
+        deduped = adapter._dedupe_vector_results(
+            results, project_id="user123:my-project", top_k=10
+        )
+        # Only the vector with matching project_id should remain
+        names = [r["metadata"]["name"] for r in deduped]
+        self.assertNotIn("Entity A", names)
+        self.assertIn("Entity B", names)
+
+    def test_dedupe_keeps_vectors_with_correct_project_id(self):
+        """Vectors with the correct project_id should be kept."""
+        adapter = self._make_adapter()
+        results = [
+            {
+                "id": "vec-1",
+                "score": 0.95,
+                "content": "Content A",
+                "metadata": {
+                    "name": "Entity A",
+                    "node_type": "Concept",
+                    "project_id": "user123:project-a",
+                },
+            },
+            {
+                "id": "vec-2",
+                "score": 0.85,
+                "content": "Content B",
+                "metadata": {
+                    "name": "Entity B",
+                    "node_type": "Concept",
+                    "project_id": "user456:project-b",
+                },
+            },
+        ]
+        deduped = adapter._dedupe_vector_results(
+            results, project_id="user123:project-a", top_k=10
+        )
+        # Both should be kept — dedup is by key, project_id is part of key
+        # so different projects create different keys
+        names = [r["metadata"]["name"] for r in deduped]
+        self.assertIn("Entity A", names)
+        self.assertIn("Entity B", names)
+        self.assertEqual(len(deduped), 2)
+
+    def test_dedupe_with_node_id_bypasses_project_check(self):
+        """Vectors with node_id use that as the dedup key, not project_id."""
+        adapter = self._make_adapter()
+        results = [
+            {
+                "id": "vec-1",
+                "score": 0.95,
+                "content": "Content",
+                "metadata": {
+                    "node_id": "unique-node-123",
+                    "name": "Entity A",
+                    "project_id": "user123:proj",
+                },
+            },
+        ]
+        deduped = adapter._dedupe_vector_results(
+            results, project_id="user123:proj", top_k=10
+        )
+        self.assertEqual(len(deduped), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
