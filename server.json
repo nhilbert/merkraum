@@ -2,20 +2,19 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.nhilbert/merkraum",
   "title": "Merkraum",
-  "description": "Auditable knowledge memory for AI agents with belief tracking, contradiction detection, and full audit trail. Structured knowledge graph (Neo4j) + semantic/vector search with hybrid semantic-text retrieval, provenance, confidence scoring, and reindex support for reliable search.",
-  "version": "1.0.0",
+  "description": "Auditable knowledge memory for AI agents. 26 MCP tools: belief tracking, managed forgetting, PII detection (EN+DE), certainty governance, full audit trail. Neo4j graph + Qdrant semantic search. EU-hosted.",
+  "version": "1.2.0",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "merkraum",
-      "version": "1.0.0",
+      "version": "1.2.0",
       "transport": {
         "type": "streamable-http",
-        "url": "https://mcp.merkraum.de/mcp/merkraum/"
+        "url": "https://mcp.merkraum.de/mcp"
       },
       "environmentVariables": [
-        { "name": "MERKRAUM_AUTH_DOMAIN", "description": "Cognito OAuth domain for authentication (default: merkraum.auth.eu-central-1.amazoncognito.com)", "required": false },
-        { "name": "MERKRAUM_CLIENT_ID", "description": "OAuth client ID for PKCE flow", "required": true }
+        { "name": "MERKRAUM_PAT", "description": "Personal Access Token for authentication (get from app.merkraum.de → Settings → API Access)", "required": true }
       ]
     }
   ]
